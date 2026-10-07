@@ -25,6 +25,14 @@ Borrows shapes from R1–R4 (arenas, windows, GPU, UI, grammars) to build;
 owns no OS/window/memory management itself. Standalone-capable or
 Kernel-registered.
 
+**Unfinished application:** this is an editor blueprint, not a finished IDE.
+R2 comprises Vexspoke CPU computation/behavior and Relational Engine
+memory/storage, stable rows, bindings and native C search. Migration is staged;
+existing Vexspoke memory/container ABI and default allocator remain. R1 owns
+lifetimes/residency; GPU shaders/dispatch remain Graphvex R3. No C/Rust atomic
+layout equivalence, automatic schema migration or implemented app integration is
+implied. See the ecosystem readiness wiki for granular scope and gaps.
+
 ## Layout
 - `src/oop/` — editor object model (reserved).
 - `src/cli/` — command-line entry surface (reserved).
@@ -33,7 +41,7 @@ Kernel-registered.
   source directories (the Test Segregation Law).
 
 ## Laws that govern work here
-- Constitution: the universal [`preferences.md`](../../ecosystem/vexspoke/preferences.md) (canonical file; the workspace root links to it).
+- Constitution: the [canonical preferences.md Gist](https://gist.github.com/vex-graph/4132a6c45cb6d3797c3e8eff2e94035a); real, Git-ignored workspace-root `../../../preferences.md`, not a Vexspoke file or symlink.
 - Commits land in THIS repo root, one cohesive unit each; never push unless asked.
 - One public class per `.h`/`.c` pair, `(*ptr).field` (never `->`), dest-last
   params, `-Wall -Wextra -Werror`.
