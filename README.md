@@ -31,7 +31,7 @@ memory/storage, stable rows, bindings and native C search. Migration is staged;
 existing Vexspoke memory/container ABI and default allocator remain. R1 owns
 lifetimes/residency; GPU shaders/dispatch remain Graphvex R3. No C/Rust atomic
 layout equivalence, automatic schema migration or implemented app integration is
-implied. See the ecosystem readiness wiki for granular scope and gaps.
+implied. See the ecosystem readiness Gist for granular scope and gaps.
 
 ## Layout
 - `src/oop/` — editor object model (reserved).
