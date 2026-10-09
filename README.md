@@ -11,9 +11,19 @@ wired into it. IDE appearance is user-verified.
 Future builds belong to [b](https://github.com/vex-graph/b). No runnable editor
 target or standalone runtime build is claimed by this metadata entry.
 
-**Role:** R5 Interactable — jGRASP/Zed-class mini IDE: shell-out toolchains,
+## Current State
+
+**Draft — not finalized.** Every contract below is a design goal.
+
+**Role:** R5 interactable — jGRASP/Zed-class mini IDE: shell-out toolchains,
 xlsx viewer, grammar highlighting via `language`.
-**Status:** early shell (`src/oop/`, `src/cli/` reserved, empty).
+
+**Implemented and proven:** nothing. `LICENSE`, `CONTRIBUTING.md`, `README.md`,
+`.gitignore` and an IDE-only `LANGUAGES NONE` `CMakeLists.txt` only; no tracked
+`src/`, no editor code and no test partition (`src/oop/` and `src/cli/` are
+reserved and empty).
+
+**Platforms proven:** none.
 
 ## What it is
 `semicolon` is the end-user code editor of the ecosystem: panes and editing
@@ -25,13 +35,22 @@ Borrows shapes from R1–R4 (arenas, windows, GPU, UI, grammars) to build;
 owns no OS/window/memory management itself. Standalone-capable or
 Kernel-registered.
 
-**Unfinished application:** this is an editor blueprint, not a finished IDE.
-R2 comprises Vexspoke CPU computation/behavior and Relational Engine
-memory/storage, stable rows, bindings and native C search. Migration is staged;
-existing Vexspoke memory/container ABI and default allocator remain. R1 owns
-lifetimes/residency; GPU shaders/dispatch remain Graphvex R3. No C/Rust atomic
-layout equivalence, automatic schema migration or implemented app integration is
-implied. See the ecosystem readiness Gist for granular scope and gaps.
+## Scope and Limitations
+
+**Scope (intended):** the end-user code editor — panes and editing surfaces on
+`darling-framework`, syntax from `language` dylibs, builds driven through
+`hotcwap` process supervision; supervised as an R1 `Application`.
+
+**Deliberately not covered:** no OS/window/memory management (borrowed from
+R1–R4); no grammar engine of its own (`language` owns grammars); no ecosystem
+contract is owned here.
+
+**Known limits and gaps:** this is an editor blueprint, not a finished IDE. R2 is
+split between Vexspoke CPU computation/behavior and Relational Engine
+memory/storage/native C search; migration is staged with the retained Vexspoke
+ABI/default allocator. No C/Rust atomic-layout equivalence, automatic schema
+migration or implemented app integration is implied. See the ecosystem readiness
+Gist for granular scope and gaps.
 
 ## Layout
 - `src/oop/` — editor object model (reserved).
