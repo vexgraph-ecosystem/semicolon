@@ -38,7 +38,10 @@ R1–R5); no grammar engine of its own (`language` owns grammars); no lower-tier
 contract is owned here. GPU shaders, dispatch and graphics composition remain
 Graphvex R3, not a second superapp graphics implementation.
 
-**Known limits and gaps:** this is an unfinished superapp/editor blueprint, not a finished IDE. R2 is
+**Known limits and gaps:** this is an unfinished superapp/editor blueprint, not a finished IDE. No local
+lawbook (`semicolon-preferences.md`) exists yet; that missing repo-local preferences file is an explicit
+gap until this repository gains source, and the universal constitution plus applicable test laws still
+bind (the Per-Repo Preferences Extension Law). R2 is
 split between Vexspoke CPU computation/behavior and Relational Engine
 memory/storage/native C search; migration is staged with the retained Vexspoke
 ABI/default allocator. No C/Rust atomic-layout equivalence, automatic schema
