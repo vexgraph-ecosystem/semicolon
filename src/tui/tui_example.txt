@@ -1,0 +1,33 @@
+--[;]-[vexgraph (project name)]-[<][>]-------------------------------------------[> run]--[settings]---
+| v [] vexgraph             | [helloWorld.c  x] [placehodler.txt  x] [ide settings  x]                |
+|   v [] src                |--------------------------------------------------------------------------
+|       {} opencode.json    | xxx  |   Hello *h = Hello();                               [no errors!] |
+|       Aa hello.txt        |      |                                                                  |
+|        J example.java     |      |                                                                  |
+|        C whatever.c       |      |                                                                  |
+|       C+ whatever.cpp     |      |                                                                  |
+|       oC shim.m           |      |                                                                  |
+|   > [] new folder         |      |                                                                  |
+|   > [] another folder     |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+|                           |      |                                                                  |
+--[vexgraph > folder > folder > text.c > toString()]----------------[c23/java]-[ln:ch]-[time]-[utf-8]--
+ {} - json
+ <> - html, xml, yaml, whatever
+ Aa - text file
+ [] - folder
+ J - java
+ Go
+ Sw
+
+
+
