@@ -28,6 +28,39 @@
  J - java
  Go
  Sw
+ C#
+ C+
+ C
+
+ Java things or things that may be needed...
+
+ @@ - @interface / annotation class
+ !c - final class
+ :c - abstract class
+  c - class (regulat)
+  r - record
+  e - enum
+ h+ - cpp header
+  h - c header
+ oC - objective c header..
+ md - markdown
+ db - sql file, or any database file..
+ cm - cmakeslist.txt
+ x! - .gitignore
+
+ () - function
+ v: - variable
+ f: - field
+
+ {} - json, jsonc, parser...
+ py - python file
+ ts - typescript
+ rs - rust
+ js - javascript
+ ph - php file
+ gh - .github, .gitkeep or any github related folder
+ 
+
 
 
 
