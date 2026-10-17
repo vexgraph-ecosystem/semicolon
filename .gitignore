@@ -59,3 +59,8 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Semicolon terminal shell build output and Python bytecode
+.build/
+__pycache__/
+*.pyc

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Resolve this checkout without relying on the caller's cwd or on the shell
+# following a symlink into another directory. Builds the binary on first use, then
+# replaces this process with it. No shell configuration is edited, nothing is
+# fetched, and no program other than the shell itself is run.
+set -eu
+launcher=$0
+if [ "${launcher#*/}" = "$launcher" ]; then
+    launcher=$(command -v "$launcher") || exit 1
+fi
+while [ -L "$launcher" ]; do
+    target=$(readlink "$launcher") || exit 1
+    case "$target" in
+        /*) launcher=$target ;;
+        *) launcher=$(dirname -- "$launcher")/$target ;;
+    esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd) || exit 1
+binary=$root/.build/semicolon-tui
+if [ ! -x "$binary" ]; then
+    printf '%s\n' 'semicolon: first run, building the terminal shell...' >&2
+    python3 "$root/build.py" >&2 || exit 1
+fi
+exec "$binary" "$@"
