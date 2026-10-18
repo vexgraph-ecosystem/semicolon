@@ -115,6 +115,9 @@
 #define TUI_RAIL_MIN 12u
 #define TUI_RAIL_MARGIN 24u
 #define TUI_SCROLL_ROWS 3u
+// Events handled before a paint. A drag floods motion events, so an unbounded
+// drain never lets the frame update; a bound keeps the screen live.
+#define TUI_EVENTS_PER_FRAME 32u
 
 #define COL_TEXT   TERMINAL_RGB(0xE6, 0xE6, 0xE6)
 #define COL_MUTED  TERMINAL_RGB(0x77, 0x77, 0x88)
@@ -166,7 +169,10 @@ typedef struct Scene {
 
 typedef struct Interaction {
     TerminalInput input;
-    bool grabbing;
+    bool grabbing;          // the divider is held
+    size_t grabX;           // pointer cell where the grab began
+    size_t grabWidth;       // rail width when the grab began
+    bool pressed;           // any button is currently down
     bool havePointer;
     size_t pointerX;
     size_t pointerY;
@@ -667,6 +673,9 @@ static attr_t attrsFor(uint8_t style) {
 
 static bool blitRun(void *context, TerminalRun run) {
     (void) context;
+    bool haveAttrs = false;
+    attr_t currentAttrs = A_NORMAL;
+    short currentPair = 0;
     for (size_t i = 0; i < run.length; ++i) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
         if (glyph == 0)
@@ -674,7 +683,16 @@ static bool blitRun(void *context, TerminalRun run) {
         uint8_t style = run.styles != nullptr ? run.styles[i] : 0;
         uint32_t fg = run.fg != nullptr ? run.fg[i] : TERMINAL_COLOR_DEFAULT;
         uint32_t bg = run.bg != nullptr ? run.bg[i] : TERMINAL_COLOR_DEFAULT;
-        wattr_set(stdscr, attrsFor(style), pairFor(fg, bg), nullptr);
+        attr_t attrs = attrsFor(style);
+        short pair = pairFor(fg, bg);
+        // A run usually shares one pen, so set the attributes once and only touch
+        // them again at a boundary: one wattr_set per cell is pure overhead.
+        if (!haveAttrs || attrs != currentAttrs || pair != currentPair) {
+            wattr_set(stdscr, attrs, pair, nullptr);
+            currentAttrs = attrs;
+            currentPair = pair;
+            haveAttrs = true;
+        }
         char encoded[8];
         size_t bytes = 0;
         if (glyph < 0x80u) {
@@ -856,8 +874,17 @@ static int runTerminal(FileText *file) {
         }
         // All input arrives here: keys, and the mouse bytes the decoder turns into
         // normalized events.
+        // One read may wait up to the poll timeout, so an idle shell sleeps
+        // instead of spinning. Every later read in this frame is NON-BLOCKING:
+        // with a timeout still set, the read that finds the buffer empty would
+        // stall the paint by the whole timeout, which is exactly the lag a drag
+        // exposes.
+        timeout(TUI_POLL_MS);
         int key = getch();
-        while (key != ERR) {
+        timeout(0);
+        size_t handled = 0;
+        while (key != ERR && handled < TUI_EVENTS_PER_FRAME) {
+            ++handled;
             if (key == 17 || key == 'q') {
                 gQuit = 1;
                 break;
@@ -878,32 +905,46 @@ static int runTerminal(FileText *file) {
                         scrollBy(&scrollTop, file, (int) TUI_SCROLL_ROWS, visible);
                         break;
                     case TERMINAL_POINTER_PRESS:
-                        interaction.grabbing = event.x + 1u >= divider && event.x <= divider + 1u;
+                        interaction.pressed = true;
+                        // Three cells of tolerance, and the rail follows the pointer
+                        // RELATIVE to where the grab began. Resizing to the absolute
+                        // pointer cell made the divider jump whenever the grab
+                        // landed a cell off centre.
+                        if (event.x + 1u >= divider && event.x <= divider + 1u) {
+                            interaction.grabbing = true;
+                            interaction.grabX = event.x;
+                            interaction.grabWidth = scene.railWidth;
+                        }
                         break;
                     case TERMINAL_POINTER_RELEASE:
                         interaction.grabbing = false;
+                        interaction.pressed = false;
                         break;
-                    case TERMINAL_POINTER_DRAG:
-                        if (interaction.grabbing && (int) event.x + 1 < columns - (int) TUI_RAIL_MARGIN)
-                            sceneSetRailWidth(&scene, event.x + 1u);
-                        /* fall through: a drag near an edge also scrolls */
-                        /* FALLTHROUGH */
-                    case TERMINAL_POINTER_MOVE:
-                        // One-cell edge autoscroll, driven by motion events — so a
-                        // pointer that stops moving stops scrolling.
+                    case TERMINAL_POINTER_DRAG: {
+                        if (interaction.grabbing) {
+                            long moved = (long) event.x - (long) interaction.grabX;
+                            long wanted = (long) interaction.grabWidth + moved;
+                            if (wanted >= (long) TUI_RAIL_MIN
+                                && wanted <= (long) columns - (long) TUI_RAIL_MARGIN)
+                                sceneSetRailWidth(&scene, (size_t) wanted);
+                        }
+                        // Edge autoscroll belongs to a DRAG, not to hovering: acting
+                        // on plain motion made the view scroll whenever the pointer
+                        // passed over the first or last editor row.
                         if (event.y == editorFirstRow())
                             scrollBy(&scrollTop, file, -1, visible);
                         else if (event.y == height - 2u)
                             scrollBy(&scrollTop, file, 1, visible);
                         break;
+                    }
+                    case TERMINAL_POINTER_MOVE:
+                        break;   // hover is reported and deliberately does nothing yet
                     default:
                         break;
                 }
             }
             key = getch();
         }
-        if (gQuit)
-            break;
 
         TerminalCanvas back = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
         TerminalCanvas front = TerminalCanvas(gFrontCells, gFrontStyles, gFrontFg, gFrontBg,
