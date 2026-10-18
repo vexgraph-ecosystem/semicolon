@@ -28,8 +28,13 @@ divider meets the bottom border.
 Scrolling is **two-axis**, and both axes scroll *past* the content: 10 empty lines
 follow the last line and 20 empty columns follow the longest one, so there is always
 somewhere to type at the bottom and at the right edge instead of the caret being
-pinned against the frame. A wheel-right pans, Shift+wheel pans, and a drag at the
-code area's first or last column pans. The rail divider is **draggable**. No panel
+pinned against the frame. Arrows are the primary input: **←/→ pan, ↑/↓ scroll, PageUp/PageDown page, Home/End
+jump** (both the CSI and SS3 cursor-key forms are bound, because terminfo entries
+often list only one). A wheel-right pans, Shift+wheel pans, and a drag at the code
+area's first or last column pans — but those are conveniences: a horizontal wheel
+is a pair most terminals never send and Shift+wheel is routinely eaten by the
+terminal's own scrollback, so the keys are the path that always exists. The rail
+divider is **draggable**. No panel
 sets a background, so the terminal's own theme shows through.
 
 Scrolling is free because text is addressable: the editor's rows are created once
