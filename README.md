@@ -16,21 +16,39 @@ Primeagen remains independently buildable R5, never dependent on Semicolon.
 
 **Implemented and proven:** a **terminal shell** (`src/main/tui-main.c`) that
 draws the hand-made design on a real terminal, on Determinant's component tree of
-panels and texts. It is a fixed mock-up, not a working editor: the file tree, the
-tab strip and the single code line are literals, nothing is read from disk and
-nothing is edited. The window chrome (the rail verticals and the right edge) is
-drawn by the shell with the canvas primitive, because the toolkit has no vertical
-rule widget yet.
+panels and texts, over a **real file**. It reads `vexspoke`'s `oop/type.h` by
+default (`--file PATH` overrides) and shows it in a **scrollable editor** with live
+line numbers. The rail divider is **draggable** and the editor scrolls with the
+wheel and with a one-cell edge autoscroll. No panel sets a background, so the
+terminal's own theme shows through.
 
-`--dump WxH` prints one frame as plain text, which is how the owner checks the
-layout with no terminal involved. `tests/semicolon/tui_main_test.py` compares the
-rendered title and rail rows against `src/tui/tui_example.txt` byte for byte,
-checks the status row's structure, proves a non-tty launch is refused with a
-diagnostic instead of a corrupt screen, and launches the shell under a real pty
-to confirm it paints and leaves on `q`.
+Scrolling is free because text is addressable: the editor's rows are created once
+and re-pointed with `TerminalText_setText`, so no row is allocated, freed or
+rebuilt while scrolling. The divider is dragged by moving an **anchor** — the same
+layer gets a new extent through `TerminalPanel_setAnchor` — so resizing a pane and
+scrolling a file are both ordinary state changes, not scene surgery.
+
+It is still a mock-up in every other respect: the file tree and tab strip are
+literals, nothing is edited, and there is no syntax highlighting. `--dump WxH`
+prints one frame as plain text, which is how the owner checks the layout without a
+terminal. `tests/semicolon/tui_main_test.py` asserts the frame's measured geometry
+(columns 1/31/36/112), the non-tty refusal, and — under a real pty — that mouse
+reporting is enabled and switched off again, that a wheel event scrolls, and that
+a divider drag survives.
 
 Also present: `build.py` (explicit, strict, no fetch and no program run), the
 `semicolon` launcher, and `install-command.sh` for a per-user command link.
+
+The window chrome (the rail verticals and the right edge) is drawn by the shell
+with the canvas primitive, because the toolkit has no vertical-rule widget yet.
+
+`tests/semicolon/tui_main_test.py` asserts the frame's measured geometry, the
+non-tty refusal, and — under a real pty — that mouse reporting is enabled and
+switched off again, that a wheel event scrolls, and that a divider drag survives.
+It asserts the frame's *shape* rather than comparing rows against
+`src/tui/tui_example.txt`, because that file is a notebook as much as a design:
+rows 1 and 13 there carry trailing annotations past the frame, so no row of it is
+a 112-cell row any more.
 
 **Platforms proven:** macOS arm64 only, from the owner's pty run. The shell is
 plain POSIX plus ncurses, but it has not been run anywhere else.
@@ -56,14 +74,16 @@ R1–R5); no grammar engine of its own (`language` owns grammars); no lower-tier
 contract is owned here. GPU shaders, dispatch and graphics composition remain
 Graphvex R3, not a second superapp graphics implementation.
 
-**The terminal shell is a mock-up, and that is all it claims.** It draws a fixed
-scene: no file is opened, no tab is switched, no key edits anything, and there is
-no syntax highlighting, no build integration and no agent. Resizing re-lays the
-whole tree because every rectangle is recomputed from the canvas on each paint.
-There is no hover, no click and no focus: the pointer primitives exist in
-Determinant but nothing routes events through them yet, and the chip bars are
-texts rather than the segment widget they will become. Vertical rules are drawn
-by this shell with the canvas primitive instead of by a toolkit widget.
+**The terminal shell is a viewer, not an editor.** One real file is read and
+displayed; nothing is written, no tab is switched, no key edits a buffer, and
+there is no syntax highlighting, no build integration and no agent. Resizing
+re-lays the whole tree because every rectangle is recomputed from the canvas on
+each paint. There is no hover, no click and no focus: Determinant decodes the
+mouse and can resolve a cell to the child under it, but nothing routes events
+between the two, so the only interactions are the wheel, the one-cell edge
+autoscroll and the divider drag. The chip bars are texts rather than the segment
+widget they will become, and vertical rules are drawn by this shell instead of by
+a toolkit widget.
 
 **Known limits and gaps:** this is an unfinished superapp/editor blueprint, not a finished IDE. No local
 lawbook (`semicolon-preferences.md`) exists yet; that missing repo-local preferences file is an explicit
@@ -79,8 +99,11 @@ Gist for granular scope and gaps.
 - `src/oop` — editor object model (reserved).
 - `src/cli` — command-line entry surface (reserved).
 - `src/main/tui-main.c` — the terminal shell: the host (tty, alternate screen,
-  keys, resize) plus the scene, built on Determinant's panels, texts and anchors.
-- `src/tui/tui_example.txt` — the design the shell reproduces.
+  mouse byte feed, keys, resize, file read) plus the scene, built on Determinant's
+  panels, texts, anchors and mouse decoder.
+- `src/tui/tui_example.txt` — the design the shell follows, and the author's notes,
+  glyph vocabulary and reference palette. Not machine-parsed: its rows carry
+  annotations.
 - `semicolon`, `build.py`, `install-command.sh` — launcher, explicit build and
   per-user command installation.
 - Tests live in the shared `../../tests` repo at `tests/semicolon/`, mirrored per
