@@ -20,6 +20,9 @@ panels and texts, over a **real file**. It reads `vexspoke`'s `oop/type.h` by
 default (`--file PATH` overrides) and shows it in a **scrollable editor** with live
 line numbers.
 
+Output is quit with **Ctrl-C** only — there is deliberately no letter shortcut,
+because a keystroke is input and `q` is a legitimate thing to want to type.
+
 The layout is the compact one: the chrome row carries the rail's top border (brand,
 mode chip, undo/redo) AND the tab strip, so the whole frame costs two rows and the
 editor gets the rest. Real box corners are drawn, with a tee where the rail's

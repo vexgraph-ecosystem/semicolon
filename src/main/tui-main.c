@@ -944,6 +944,8 @@ static int runInputProbe(void) {
     SCREEN *screen = newterm(nullptr, stdout, stdin);
     if (screen == nullptr)
         return 1;
+    signal(SIGINT, onSignal);
+    signal(SIGTERM, onSignal);
     (void) cbreak();
     (void) noecho();
     (void) curs_set(0);
@@ -958,7 +960,7 @@ static int runInputProbe(void) {
     (void) define_key("\033[D", KEY_LEFT);
     (void) mouseReporting(true);
     erase();
-    mvaddstr(0, 0, "input probe: wheel, swipe sideways, drag, press keys. q quits.");
+    mvaddstr(0, 0, "input probe: wheel, swipe sideways, drag, press keys. Ctrl-C quits.");
     mvaddstr(1, 0, "a horizontal swipe shows wheel-left / wheel-right if the terminal sends it.");
     refresh();
     TerminalInput input = TerminalInput_0();
@@ -967,8 +969,6 @@ static int runInputProbe(void) {
         int key = getch();
         if (key == ERR)
             continue;
-        if (key == 'q' || key == 17)
-            break;
         bool havePointer = false;
         if (key == TUI_MOUSE_SGR)
             havePointer = readMouseSuffix(&input, true);
@@ -1108,9 +1108,7 @@ static int runTerminal(FileText *file) {
             mvaddstr(0, 0, "terminal too small");
             refresh();
             timeout(TUI_POLL_MS);
-            int small = getch();
-            if (small == 'q' || small == 17)
-                break;
+            (void) getch();
             continue;
         }
         // All input arrives here: keys, and the mouse bytes the decoder turns into
@@ -1126,10 +1124,10 @@ static int runTerminal(FileText *file) {
         size_t handled = 0;
         while (key != ERR && handled < TUI_EVENTS_PER_FRAME) {
             ++handled;
-            if (key == 17 || key == 'q') {
-                gQuit = 1;
-                break;
-            }
+            // Ctrl-C (SIGINT) is the only way out; there is deliberately no letter
+            // shortcut, because a keystroke is input and 'q' is a legitimate thing
+            // to want to type.
+
             bool havePointer = false;
             if (key == KEY_RESIZE) {
                 (void) clear();
@@ -1278,7 +1276,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) {
             puts("semicolon [--dump [WxH]] [--file PATH] [--help]");
-            puts("  no arguments  draw the IDE shell on this terminal (Ctrl-Q or q quits)");
+            puts("  no arguments  draw the IDE shell on this terminal (Ctrl-C quits)");
             puts("  --file PATH   show PATH in the editor (default: vexspoke's oop/type.h)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
             puts("  --input-probe print the mouse and key events this terminal actually sends");
