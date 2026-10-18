@@ -817,6 +817,60 @@ static size_t editorVisibleRows(int height) {
     return rows > TUI_MAX_ROWS ? TUI_MAX_ROWS : rows;
 }
 
+#define TUI_MOUSE_SGR (KEY_MAX + 1)
+#define TUI_MOUSE_X10 (KEY_MAX + 2)
+
+// One normalized key-scroll step, as a value (the Value Return Law: no destination
+// parameters).
+//
+// SLOT RECORD: ScrollStep
+typedef struct ScrollStep {
+    bool keyed;    // the key was a scroll key at all
+    int rows;      // vertical cells
+    int columns;   // horizontal cells
+} ScrollStep;
+
+// Arrow keys are the point: the horizontal wheel is a pair most terminals never
+// send, Shift+wheel is routinely eaten by the terminal's own scrollback, and a
+// one-column drag edge is unhittable. The arrows exist on every keyboard.
+static ScrollStep scrollStepFor(int key) {
+    switch (key) {
+        case KEY_UP: return (ScrollStep) { true, -1, 0 };
+        case KEY_DOWN: return (ScrollStep) { true, 1, 0 };
+        case KEY_LEFT: return (ScrollStep) { true, 0, -(int) TUI_SCROLL_COLS };
+        case KEY_RIGHT: return (ScrollStep) { true, 0, (int) TUI_SCROLL_COLS };
+        case KEY_SLEFT: return (ScrollStep) { true, 0, -(int) TUI_SCROLL_COLS };
+        case KEY_SRIGHT: return (ScrollStep) { true, 0, (int) TUI_SCROLL_COLS };
+        case KEY_PPAGE: return (ScrollStep) { true, -((int) TUI_SCROLL_ROWS * 4), 0 };
+        case KEY_NPAGE: return (ScrollStep) { true, (int) TUI_SCROLL_ROWS * 4, 0 };
+        case KEY_HOME: return (ScrollStep) { true, -1000000, 0 };
+        case KEY_END: return (ScrollStep) { true, 1000000, 0 };
+        default: return (ScrollStep) { false, 0, 0 };
+    }
+}
+
+// ncurses matches the mouse introducer itself (it is registered with define_key),
+// so the bytes it consumed are re-injected before the suffix is read. This keeps
+// ncurses as the KEY decoder and Determinant as the MOUSE decoder, which is the
+// layering the toolkit's lawbook asks for.
+static bool readMouseSuffix(TerminalInput *input, bool sgr) {
+    static const char *sgrPrefix = "\x1b[<";
+    static const char *x10Prefix = "\x1b[M";
+    const char *prefix = sgr ? sgrPrefix : x10Prefix;
+    for (size_t i = 0; prefix[i] != '\0'; ++i)
+        (void) TerminalInput_feed(input, (unsigned char) prefix[i]);
+    for (size_t i = 0; i < 24; ++i) {
+        int byte = getch();
+        if (byte == ERR)
+            return false;
+        if (TerminalInput_feed(input, byte))
+            return true;
+        if (!sgr && i == 2)
+            return false;   // X10 is exactly three bytes; anything else is malformed
+    }
+    return false;
+}
+
 static bool mouseReporting(bool enabled) {
     return fputs(enabled ? "\033[?1003h\033[?1006h" : "\033[?1003l\033[?1006l", stdout) >= 0
         && fflush(stdout) == 0;
@@ -896,7 +950,27 @@ static int runTerminal(FileText *file) {
     (void) nonl();
     (void) curs_set(0);
     (void) mousemask(0, nullptr);   // ncurses' own mouse ABI is not used here
-    (void) notimeout(stdscr, true);  // ESC must not wait for a suffix
+    // keypad decodes the arrow and page keys; without it a keypress is just bytes
+    // and there is no way to scroll from the keyboard at all.
+    (void) keypad(stdscr, true);
+    (void) notimeout(stdscr, false);
+    set_escdelay(25);
+    // Bind the two mouse introducers so ncurses hands them over as one code instead
+    // of trying to match the whole sequence against terminfo.
+    (void) define_key("\033[<", TUI_MOUSE_SGR);
+    (void) define_key("\033[M", TUI_MOUSE_X10);
+    // The cursor keys need binding too. A terminal in its normal mode sends CSI
+    // (ESC [ C), but many terminfo entries only list the application-mode SS3 form
+    // (ESC O C), so ncurses failed to match the arrows it actually receives and they
+    // fell through as raw bytes. Both forms are bound to the same key codes.
+    (void) define_key("\033[A", KEY_UP);
+    (void) define_key("\033[B", KEY_DOWN);
+    (void) define_key("\033[C", KEY_RIGHT);
+    (void) define_key("\033[D", KEY_LEFT);
+    (void) define_key("\033OA", KEY_UP);
+    (void) define_key("\033OB", KEY_DOWN);
+    (void) define_key("\033OC", KEY_RIGHT);
+    (void) define_key("\033OD", KEY_LEFT);
     timeout(TUI_POLL_MS);
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
@@ -980,9 +1054,25 @@ static int runTerminal(FileText *file) {
                 gQuit = 1;
                 break;
             }
+            bool havePointer = false;
             if (key == KEY_RESIZE) {
                 (void) clear();
-            } else if (TerminalInput_feed(&interaction.input, key)) {
+            } else if (key == TUI_MOUSE_SGR) {
+                havePointer = readMouseSuffix(&interaction.input, true);
+            } else if (key == TUI_MOUSE_X10) {
+                havePointer = readMouseSuffix(&interaction.input, false);
+            } else {
+                // Deliberately NOT fed to TerminalInput: it owns "ESC [", so an arrow
+                // it did not recognise would be swallowed as a malformed mouse
+                // sequence instead of reaching the scroll step below.
+
+                ScrollStep step = scrollStepFor(key);
+                if (step.keyed) {
+                    scrollTop = applyScroll(scrollTop, step.rows, maxTop);
+                    scrollLeft = applyScroll(scrollLeft, step.columns, maxLeft);
+                }
+            }
+            if (havePointer) {
                 TerminalPointerEvent event = TerminalInput_getEvent(&interaction.input);
                 interaction.havePointer = true;
                 interaction.pointerX = event.x;
