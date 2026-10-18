@@ -1158,9 +1158,15 @@ static int runTerminal(FileText *file) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
-                        // Shift turns a vertical wheel into a horizontal pan, which
-                        // is how a plain mouse can reach the columns at all.
-                        if (event.shift)
+                        // ANY modified wheel pans sideways, because terminals differ
+                        // over which modifier they let through: Shift is the one most
+                        // often stolen for the terminal's own scrollback, while
+                        // Alt/Option usually is not. Accepting all three means a
+                        // trackpad reaches the columns on whichever modifier the
+                        // emulator happens to forward - and a modifier is the user
+                        // asking for something other than a plain scroll.
+                        bool sideways = event.shift || event.meta || event.ctrl;
+                        if (sideways)
                             scrollLeft = applyScroll(scrollLeft,
                                                      down ? (int) TUI_SCROLL_COLS : -(int) TUI_SCROLL_COLS,
                                                      maxLeft);
