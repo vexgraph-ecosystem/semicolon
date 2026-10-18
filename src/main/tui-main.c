@@ -5,7 +5,7 @@
 #include "terminal/terminal_color.h"
 #include "terminal/terminal_style.h"
 #include "terminal/terminal_surface.h"
-#include "terminal/terminal_image.h"
+#include "terminal/terminal_input.h"
 #include "exception/throw.h"
 #include "annotation/definition.h"
 #include "annotation/overview.h"
@@ -16,78 +16,111 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 #include <ncurses.h>
 
 ;;DEFINITION
-/** The semicolon IDE shell: the design from src/tui/tui_example.txt, drawn on
- * Determinant's component tree and put on a real terminal.
+/** The semicolon IDE shell: the design from src/tui/tui_example.txt, drawing a
+ * real file on a real terminal, with the rail draggable and the editor scrolling.
  *
  * This file is the HOST, not the toolkit. Determinant owns cells, placement,
- * panels and text and knows nothing about a tty; acquiring the terminal, owning
- * the alternate screen, decoding keys and honouring a resize are this program's
- * job, exactly as the toolkit's lawbook requires. That is why the scene is built
- * here and ncurses is named only here.
+ * panels, text and the mouse byte grammar and knows nothing about a tty;
+ * acquiring the terminal, owning the alternate screen, deciding which mouse
+ * events exist, reading a file and driving the whole thing are this program's
+ * job. That is why ncurses is named only here.
  *
- * The rendering chain is the whole point of the toolkit, end to end: the tree is
- * painted into a back canvas, TerminalSurface diffs that against the record of
- * what the terminal was last told, and only the changed same-row runs are handed
- * to the ncurses sink. A frame that changes nothing sends nothing.
+ * Two things are worth reading this file for.
  *
- * The design itself is a fixed mock-up, not a working editor: the file tree is a
- * literal list, the tab strip is static, and the code area shows one sample line.
- * Nothing is read from disk and no file is edited. */
+ * First, SCROLLING IS FREE BECAUSE TEXT IS ADDRESSABLE. The editor's rows are
+ * created once and then re-pointed at different lines each frame with
+ * TerminalText_setText. No row is allocated, freed or rebuilt while scrolling,
+ * which is the entire argument for a text being an object rather than a string
+ * handed to a draw call.
+ *
+ * Second, THE DIVIDER IS DRAGGED BY MOVING AN ANCHOR. The rail's width is not
+ * rebuilt into the tree when the pointer moves; the same layer gets a new
+ * extent through TerminalPanel_setAnchor, and the next paint lays out around it.
+ * Resizing a pane and scrolling a file are therefore both ordinary state changes,
+ * not scene surgery.
+ *
+ * Nothing is transparent-by-accident: no panel sets a background, so every cell
+ * the app does not paint keeps the terminal's own background. That is deliberate
+ * — the theme belongs to whoever owns the terminal.
+ *
+ * The design itself is still a mock-up: the tree is a literal list, the tab strip
+ * is static, and nothing is edited. The one real thing is the file in the editor. */
 ;;OVERVIEW
 /** ============================================================================
  * MODULE: semicolon terminal entry (src/main/tui-main.c)
  * ============================================================================
  * OWNED STATE (file-local):
- *   gQuit          signal-safe shutdown request only.
- *   gCells/gStyles/gFg/gBg        static canvas planes, MAXW x MAXH.
- *   gFrontCells/...              static last-paint mirror for the surface diff.
- *   gRule          static dash run used for the rule textures.
- *   gPairColors[]  registered ncurses colour pairs (fg,bg) -> pair index.
+ *   gQuit         signal-safe shutdown request only.
+ *   gCells/gStyles/gFg/gBg          static canvas planes, TUI_MAX_W x TUI_MAX_H.
+ *   gFrontCells/...                 static last-paint mirror for the surface diff.
+ *   gRule/gSpaces/emptyLine         static textures: the rule run, blank runs.
+ *   gGutter[TUI_MAX_ROWS][16]       per-row line-number text buffers.
+ *   gLineChip[16]                   the status bar's line-position text buffer.
+ *   gPairs[]                        registered ncurses colour pairs.
+ * STRUCTS:
+ *   FileText  owned file bytes, line table, and the display name.
+ *   TuiRow    one editor row: its gutter text and its code text.
+ *   Scene     the tree plus the handles the host mutates at runtime.
+ *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
  * Private helpers:
- *   static void onSignal(int)            flag a shutdown request; no terminal call.
- *   static void initRule(void)           fill gRule with dashes.
- *   static TerminalText *chip(const char *)            bracketed [label] text.
- *   static TerminalText *plain(const char *, uint8_t)  styled text.
- *   static bool putText(parent, text, anchor)          adopt a text or free it.
- *   static bool putPanel(parent, child, anchor)        adopt a panel or free it.
- *   static TerminalPanel *buildTitleBar(void)          the chip bar in row 0.
- *   static TerminalPanel *buildStatusBar(void)         the chip bar in the last row.
- *   static TerminalPanel *buildRail(void)              the file tree column.
- *   static TerminalPanel *buildCentre(void)            tabs + separator + editor.
- *   static TerminalPanel *buildScene(void)             the whole tree.
- *   static short colorIndex(uint32_t)                  RGB -> ncurses colour.
- *   static short pairFor(uint32_t, uint32_t)           registered (fg,bg) pair.
- *   static attr_t attrsFor(uint8_t)                    cell style -> ncurses attrs.
- *   static bool blitRun(void *, TerminalRun)           the run sink.
- *   static int dumpFrame(int, int)                     one frame as plain text.
- *   static int runTerminal(void)                       the interactive loop.
+ *   static void onSignal(int)
+ *   static void initTextures(void)
+ *   static bool fileLoad(FileText *, const char *)
+ *   static void fileFree(FileText *)
+ *   static TerminalText *chip(const char *)
+ *   static TerminalText *plain(const char *, uint32_t)
+ *   static bool putText(parent, text, anchor) / putPanel(parent, panel, anchor)
+ *   static TerminalPanel *buildTitleBar(void) / buildStatusBar(FileText *)
+ *   static TerminalPanel *buildRail(void)
+ *   static TerminalPanel *buildEditor(Scene *, size_t)
+ *   static TerminalPanel *buildCentre(Scene *, size_t)
+ *   static void sceneBuild(Scene *, FileText *, size_t)
+ *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t visible)
+ *   static size_t editorTop(const Scene *) / editorRows(width, height)
+ *   static void sceneSetRailWidth(Scene *, size_t width)
+ *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
+ *   static bool blitRun(void *, TerminalRun)
+ *   static void drawChrome(canvas, width, height, size_t railWidth)
+ *   static void handlePointer(Scene *, Interaction *, int width, int height)
+ *   static int dumpFrame(int, int, FileText *)
+ *   static int runTerminal(FileText *)
  * Entry:
- *   int main(int, char **)   --help / --dump [WxH] / interactive.
+ *   int main(int, char **)   --help / --dump [WxH] / --file PATH / interactive.
  * Contracts:
  *   The interactive path REQUIRES a tty on stdin and stdout and refuses before
- *   ncurses otherwise. Ctrl-Q or q quits; KEY_RESIZE re-lays the whole tree
- *   because every rectangle is recomputed from the canvas size each paint.
- *   The terminal is restored on every normal exit and on SIGINT/SIGTERM; SIGKILL
- *   or a crash cannot promise restoration. No file, network or provider call.
+ *   ncurses otherwise. Ctrl-Q or q quits; the terminal is restored on every
+ *   normal exit and on SIGINT/SIGTERM (SIGKILL or a crash cannot promise that).
+ *   Mouse reporting is enabled for ANY-MOTION plus SGR encoding, so hover and
+ *   drag both arrive; it is disabled again on exit, which hands the mouse back to
+ *   the terminal's own selection. Wheel scrolls three lines, a pointer resting on
+ *   the top or bottom editor row scrolls one line per motion event, and a press
+ *   within one cell of the divider begins a drag that resizes the rail. No file
+ *   is written, no network is touched and no program is executed.
  * ============================================================================ */
 
 #define TUI_MAX_W 400
-#define TUI_MAX_H 160
-#define TUI_DEFAULT_W 103
-#define TUI_DEFAULT_H 23
+#define TUI_MAX_H 200
+#define TUI_MAX_ROWS 160
+#define TUI_MAX_FILE_BYTES (4u * 1024u * 1024u)
+#define GUTTER_WIDTH 5u
+#define TUI_POLL_MS 100
+#define TUI_RAIL_MIN 12u
+#define TUI_RAIL_MARGIN 24u
+#define TUI_SCROLL_ROWS 3u
 
-#define COL_TEXT  TERMINAL_RGB(0xE6, 0xE6, 0xE6)
-#define COL_MUTED TERMINAL_RGB(0x88, 0x88, 0x88)
+#define COL_TEXT   TERMINAL_RGB(0xE6, 0xE6, 0xE6)
+#define COL_MUTED  TERMINAL_RGB(0x77, 0x77, 0x88)
 #define COL_ACCENT TERMINAL_RGB(0x7A, 0xC8, 0xFF)
-#define COL_ERROR TERMINAL_RGB(0xFF, 0x6B, 0x6B)
-#define COL_BG    TERMINAL_RGB(0x11, 0x11, 0x18)
-#define COL_RAIL  TERMINAL_RGB(0x18, 0x18, 0x22)
+#define COL_ERROR  TERMINAL_RGB(0xFF, 0x6B, 0x6B)
+#define COL_GUTTER TERMINAL_RGB(0x55, 0x55, 0x66)
 
 static volatile sig_atomic_t gQuit;
 static uint32_t gCells[TUI_MAX_W * TUI_MAX_H];
@@ -99,19 +132,141 @@ static uint8_t gFrontStyles[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontFg[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontBg[TUI_MAX_W * TUI_MAX_H];
 static char gRule[512];
+static char gGutter[TUI_MAX_ROWS][16];
+static char gLineChip[16];
+static char gBreadcrumb[192];
+static const char *gEmptyLine = "";
+
+// ---------------------------------------------------------------- file text
+
+typedef struct FileText {
+    char *bytes;             // owned file bytes, NUL-terminated
+    size_t length;
+    const char **lines;      // owned pointers into `bytes`
+    size_t *lineLengths;     // owned per-line lengths
+    size_t lineCount;
+    size_t lineCapacity;
+    char name[64];           // display name for the breadcrumb
+} FileText;
+
+typedef struct TuiRow {
+    TerminalText *gutter;
+    TerminalText *code;
+} TuiRow;
+
+typedef struct Scene {
+    TerminalPanel *root;
+    TerminalPanel *rail;
+    TerminalChildId railId;
+    TuiRow rows[TUI_MAX_ROWS];
+    size_t rowCount;
+    TerminalText *lineChip;
+    size_t railWidth;
+} Scene;
+
+typedef struct Interaction {
+    TerminalInput input;
+    bool grabbing;
+    bool havePointer;
+    size_t pointerX;
+    size_t pointerY;
+} Interaction;
 
 static void onSignal(int signalNumber) {
     (void) signalNumber;
     gQuit = 1;
 }
 
-static void initRule(void) {
+static void initTextures(void) {
     memset(gRule, '-', sizeof gRule - 1);
     gRule[sizeof gRule - 1] = '\0';
+    memset(gLineChip, 0, sizeof gLineChip);
 }
 
-// A bracketed chip: the whole reason text is an object is so this can be hovered
-// and recoloured later without the bar knowing anything about it.
+static void fileFree(FileText *file) {
+    free(file->lines);
+    free(file->lineLengths);
+    free(file->bytes);
+    *file = (FileText) {0};
+}
+
+// Read the whole file, replace every control byte with a space (a cell cannot
+// draw one), then split on newlines. Tabs become spaces rather than '?' because
+// the canvas refuses control codepoints and a file full of '?' is worse than one
+// whose indentation is approximate.
+static bool fileLoad(FileText *file, const char *path) {
+    *file = (FileText) {0};
+    const char *slash = strrchr(path, '/');
+    const char *base = slash != nullptr ? slash + 1 : path;
+    (void) snprintf(file->name, sizeof file->name, "%s", base);
+    FILE *handle = fopen(path, "rb");
+    if (handle == nullptr)
+        return false;
+    char *bytes = malloc(TUI_MAX_FILE_BYTES + 1u);
+    if (bytes == nullptr) {
+        (void) fclose(handle);
+        return false;
+    }
+    size_t length = fread(bytes, 1, TUI_MAX_FILE_BYTES, handle);
+    (void) fclose(handle);
+    bytes[length] = '\0';
+    size_t lineCapacity = 64;
+    const char **lines = malloc(lineCapacity * sizeof *lines);
+    size_t *lineLengths = malloc(lineCapacity * sizeof *lineLengths);
+    if (lines == nullptr || lineLengths == nullptr) {
+        free(bytes);
+        free(lines);
+        free(lineLengths);
+        return false;
+    }
+    size_t count = 0;
+    size_t start = 0;
+    bool grew = true;
+    for (size_t at = 0; at <= length; ++at) {
+        unsigned char current = at < length ? (unsigned char) bytes[at] : '\n';
+        if (current != '\n') {
+            if (current < 32u || current == 127u)
+                bytes[at] = ' ';
+            continue;
+        }
+        if (count == lineCapacity) {
+            size_t next = lineCapacity * 2u;
+            const char **grownLines = realloc(lines, next * sizeof *lines);
+            size_t *grownLengths = realloc(lineLengths, next * sizeof *lineLengths);
+            if (grownLines == nullptr || grownLengths == nullptr) {
+                grew = false;
+                break;
+            }
+            lines = grownLines;
+            lineLengths = grownLengths;
+            lineCapacity = next;
+        }
+        size_t end = at;
+        if (end > start && bytes[end - 1] == '\r')
+            --end;                                   // CRLF: the carriage is not a cell
+        bytes[at] = '\0';
+        lines[count] = bytes + start;
+        lineLengths[count] = end - start;
+        ++count;
+        start = at + 1;
+    }
+    if (!grew) {
+        free(bytes);
+        free(lines);
+        free(lineLengths);
+        return false;
+    }
+    file->bytes = bytes;
+    file->length = length;
+    file->lines = lines;
+    file->lineLengths = lineLengths;
+    file->lineCount = count;
+    file->lineCapacity = lineCapacity;
+    return true;
+}
+
+// ---------------------------------------------------------------- scene
+
 static TerminalText *chip(const char *label) {
     TerminalText *text = TerminalText(label);
     if (text == nullptr)
@@ -128,8 +283,6 @@ static TerminalText *plain(const char *label, uint32_t color) {
     return text;
 }
 
-// Adopt a child, or free it when the parent refused it. Keeps the scene builder
-// free of ownership bookkeeping at every call site.
 static bool putText(TerminalPanel *parent, TerminalText *text, TerminalAnchor anchor) {
     if (text == nullptr)
         return false;
@@ -150,20 +303,18 @@ static bool putPanel(TerminalPanel *parent, TerminalPanel *child, TerminalAnchor
     return true;
 }
 
-// --[;]-[vexgraph (project name)]-[<][>]------------------[> run]--[settings]---
 static TerminalPanel *buildTitleBar(void) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
+    static const char *labels[] = { ";", ">w< agents", "<", ">" };
+    static const size_t extents[] = { 3, 12, 3, 3 };
     // The rule texture paints first and reserves nothing, so every chip lands on
     // top of it and the gaps read as the run between chips.
     if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    static const char *labels[] = { ";", "vexgraph (project name)", "<", ">" };
-    static const size_t extents[] = { 3, 25, 3, 3 };
-    // A two-dash margin, then the chips one dash apart, exactly as sketched.
     if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 2))) {
         TerminalPanel_free(bar);
         return nullptr;
@@ -175,63 +326,67 @@ static TerminalPanel *buildTitleBar(void) {
             TerminalPanel_free(bar);
             return nullptr;
         }
-        if (i < 2)   // [;]-[name]-[<][>]: the two arrows sit together
+        if (i < 2)
             (void) putText(bar, plain(gRule, COL_MUTED),
                            TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1));
     }
-    // From the right edge: a three-dash margin, [settings], two dashes, [> run].
-    static const size_t rightExtents[] = { 3, 10, 2, 7 };
-    static const char *rightLabels[] = { nullptr, "settings", nullptr, "> run" };
+    static const size_t rightExtents[] = { 1, 10, 2 };
+    static const char *rightLabels[] = { nullptr, "settings", nullptr };
     for (size_t i = 0; i < sizeof rightExtents / sizeof rightExtents[0]; ++i) {
-        TerminalText *child = rightLabels[i] != nullptr ? chip(rightLabels[i]) : plain(gRule, COL_MUTED);
+        TerminalText *child = rightLabels[i] != nullptr ? chip(rightLabels[i])
+                                                        : plain(gRule, COL_MUTED);
         if (!putText(bar, child, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, rightExtents[i]))) {
             TerminalPanel_free(bar);
             return nullptr;
         }
     }
     (void) TerminalPanel_setForegroundColor(bar, COL_TEXT);
-    (void) TerminalPanel_setBackgroundColor(bar, COL_BG);
     return bar;
 }
 
-// --[vexgraph > src > main > tui-main.c]----[c23/java]-[ln:1]-[utf-8]--
-static TerminalPanel *buildStatusBar(void) {
+static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
-        TerminalPanel_free(bar);
-        return nullptr;
-    }
     if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 2))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    TerminalText *breadcrumb = chip("vexgraph > src > main > tui-main.c");
-    size_t breadcrumbExtent = TerminalText_measure(breadcrumb);
-    (void) TerminalText_setForegroundColor(breadcrumb, COL_TEXT);
-    if (!putText(bar, breadcrumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, breadcrumbExtent))) {
+    // The chip BORROWS this string for the life of the tree, so it must outlive
+    // this function: a stack buffer here renders as garbage.
+    (void) snprintf(gBreadcrumb, sizeof gBreadcrumb, "vexgraph>src>%s", file->name);
+    TerminalText *crumb = chip(gBreadcrumb);
+    (void) TerminalText_setForegroundColor(crumb, COL_TEXT);
+    if (!putText(bar, crumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                             TerminalText_measure(crumb)))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    // From the right edge: two dashes, then [utf-8] - [ln:1] - [c23/java].
-    static const size_t rightExtents[] = { 2, 7, 1, 6, 1, 6, 1, 10 };
-    static const char *rightLabels[] = { nullptr, "utf-8", nullptr, "time", nullptr, "ln:1", nullptr, "c23/java" };
+    static const size_t rightExtents[] = { 2, 7, 1, 6, 1, 8, 1, 10 };
+    static const char *rightLabels[] = { nullptr, "utf-8", nullptr, "time", nullptr, nullptr, nullptr, "c23/java" };
     for (size_t i = 0; i < sizeof rightExtents / sizeof rightExtents[0]; ++i) {
-        TerminalText *child = rightLabels[i] != nullptr ? chip(rightLabels[i]) : plain(gRule, COL_MUTED);
-        (void) TerminalText_setForegroundColor(child, COL_MUTED);
+        TerminalText *child = nullptr;
+        if (rightLabels[i] != nullptr) {
+            child = chip(rightLabels[i]);
+        } else if (i == 5) {
+            // The line-position chip: its text is re-pointed every frame, so its
+            // extent is fixed and the number is always formatted to fit.
+            (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%3zu]", (size_t) 1);
+            child = TerminalText_1(gLineChip);
+            (void) TerminalText_setForegroundColor(child, COL_MUTED);
+            scene->lineChip = child;
+        } else {
+            child = plain(gRule, COL_MUTED);
+        }
         if (!putText(bar, child, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, rightExtents[i]))) {
             TerminalPanel_free(bar);
             return nullptr;
         }
     }
     (void) TerminalPanel_setForegroundColor(bar, COL_TEXT);
-    (void) TerminalPanel_setBackgroundColor(bar, COL_BG);
     return bar;
 }
 
-// The file tree: a literal list, one row per line, with the type glyphs the
-// design uses ({} json, <> markup, Aa text, [] folder, C/C+/oC sources).
 static TerminalPanel *buildRail(void) {
     static const char *rows[] = {
         "  v [] vexgraph", "    v [] src", "        {} opencode.json", "        Aa hello.txt",
@@ -250,77 +405,72 @@ static TerminalPanel *buildRail(void) {
         }
     }
     (void) TerminalPanel_setForegroundColor(rail, COL_TEXT);
-    (void) TerminalPanel_setBackgroundColor(rail, COL_BG);
     return rail;
 }
 
-// The editor: a line-number gutter, then the code column whose first row also
-// carries a right-aligned diagnostics chip.
-static TerminalPanel *buildEditor(void) {
+// The editor: a gutter column, then the code column whose first row also carries
+// the right-aligned action chips. Every row is a text that gets re-pointed rather
+// than rebuilt, which is what makes scrolling allocation-free.
+static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     TerminalPanel *editor = TerminalPanel();
-    if (editor == nullptr)
-        return nullptr;
     TerminalPanel *gutter = TerminalPanel();
-    if (gutter == nullptr) {
+    TerminalPanel *code = TerminalPanel();
+    TerminalPanel *rows = TerminalPanel();
+    TerminalPanel *actions = TerminalPanel();
+    if (editor == nullptr || gutter == nullptr || code == nullptr || rows == nullptr || actions == nullptr) {
         TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
+        TerminalPanel_free(code);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
         return nullptr;
     }
-    static const char *numbers[] = { "    1 |", "      |", "      |", "      |", "      |"
-                                   , "      |", "      |", "      |" };
-    for (size_t i = 0; i < sizeof numbers / sizeof numbers[0]; ++i) {
-        TerminalText *number = plain(numbers[i], COL_MUTED);
-        if (!putText(gutter, number, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
-            TerminalPanel_free(gutter);
+    for (size_t i = 0; i < rowCount; ++i) {
+        TerminalText *number = plain(gEmptyLine, COL_GUTTER);
+        TerminalText *line = plain(gEmptyLine, COL_TEXT);
+        if (!putText(gutter, number, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))
+            || !putText(rows, line, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
             TerminalPanel_free(editor);
+            TerminalPanel_free(gutter);
+            TerminalPanel_free(code);
+            TerminalPanel_free(rows);
+            TerminalPanel_free(actions);
             return nullptr;
         }
+        scene->rows[i].gutter = number;
+        scene->rows[i].code = line;
     }
-    (void) TerminalPanel_setBackgroundColor(gutter, COL_RAIL);
-    if (!putPanel(editor, gutter, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 7))) {
+    scene->rowCount = rowCount;
+    // The action chips are a LAYERED sibling of the rows, so they paint on top of
+    // the first editor row without taking a row of their own.
+    if (!putText(actions, plain(" ", COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))
+        || !putText(actions, chip("20!!, 20!"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 11))
+        || !putText(actions, chip("> run"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 8))) {
         TerminalPanel_free(editor);
-        return nullptr;
-    }
-    TerminalPanel *code = TerminalPanel();
-    if (code == nullptr) {
-        TerminalPanel_free(editor);
-        return nullptr;
-    }
-    // Row 0 stacks the code text and the diagnostics chip on the SAME row, which
-    // is what LAYERED is for: one child aligns left, the other right.
-    TerminalPanel *firstRow = TerminalPanel();
-    if (firstRow == nullptr) {
+        TerminalPanel_free(gutter);
         TerminalPanel_free(code);
-        TerminalPanel_free(editor);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
         return nullptr;
     }
-    (void) TerminalPanel_setLayout(firstRow, TERMINAL_PANEL_LAYERED);
-    TerminalText *codeText = plain("  Hello *h = Hello();", COL_TEXT);
-    TerminalText *diagnostics = chip("no errors!");
-    (void) TerminalText_setAlign(diagnostics, TERMINAL_TEXT_ALIGN_RIGHT);
-    (void) TerminalText_setForegroundColor(diagnostics, COL_MUTED);
-    if (!putText(firstRow, codeText, TerminalAnchor_0())
-        || !putText(firstRow, diagnostics, TerminalAnchor_0())) {
-        TerminalPanel_free(firstRow);
+    (void) TerminalPanel_setForegroundColor(actions, COL_MUTED);
+    if (!putPanel(code, rows, TerminalAnchor_0()) || !putPanel(code, actions, TerminalAnchor_0())) {
+        TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
         TerminalPanel_free(code);
+        return nullptr;
+    }
+    (void) TerminalPanel_setLayout(code, TERMINAL_PANEL_LAYERED);
+    // The run chip sits left of the diagnostics chip in the same row.
+    if (!putPanel(editor, gutter, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, GUTTER_WIDTH))
+        || !putPanel(editor, code, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
         return nullptr;
     }
-    if (!putPanel(code, firstRow, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
-        TerminalPanel_free(code);
-        TerminalPanel_free(editor);
-        return nullptr;
-    }
-    if (!putPanel(editor, code, TerminalAnchor_0())) {
-        TerminalPanel_free(editor);
-        return nullptr;
-    }
-    (void) TerminalPanel_setForegroundColor(editor, COL_TEXT);
     return editor;
 }
 
-// [helloWorld.c  x] [placehodler.txt  x] [ide settings  x] over a rule, then the
-// separator row, then the editor.
-static TerminalPanel *buildCentre(void) {
+static TerminalPanel *buildCentre(Scene *scene, size_t rowCount) {
     TerminalPanel *centre = TerminalPanel();
     if (centre == nullptr)
         return nullptr;
@@ -329,16 +479,12 @@ static TerminalPanel *buildCentre(void) {
         TerminalPanel_free(centre);
         return nullptr;
     }
-    static const char *tabLabels[] = { "helloWorld.c  x", "placehodler.txt  x", "ide settings  x" };
-    if (!putText(tabs, plain(" ", COL_TEXT), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
-        TerminalPanel_free(tabs);
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
+    static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
         TerminalText *tab = chip(tabLabels[i]);
-        (void) TerminalText_setForegroundColor(tab, i == 0 ? COL_TEXT : COL_MUTED);
-        if (!putText(tabs, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TerminalText_measure(tab) + 1))) {
+        (void) TerminalText_setForegroundColor(tab, i == 3 ? COL_TEXT : COL_MUTED);
+        if (!putText(tabs, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                                 TerminalText_measure(tab) + 1))) {
             TerminalPanel_free(tabs);
             TerminalPanel_free(centre);
             return nullptr;
@@ -349,11 +495,7 @@ static TerminalPanel *buildCentre(void) {
         return nullptr;
     }
     TerminalPanel *separator = TerminalPanel();
-    if (separator == nullptr) {
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
-    if (!putText(separator, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
+    if (separator == nullptr || !putText(separator, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
         TerminalPanel_free(separator);
         TerminalPanel_free(centre);
         return nullptr;
@@ -362,44 +504,107 @@ static TerminalPanel *buildCentre(void) {
         TerminalPanel_free(centre);
         return nullptr;
     }
-    if (!putPanel(centre, buildEditor(), TerminalAnchor_0())) {
+    if (!putPanel(centre, buildEditor(scene, rowCount), TerminalAnchor_0())) {
         TerminalPanel_free(centre);
         return nullptr;
     }
     return centre;
 }
 
-static TerminalPanel *buildScene(void) {
-    TerminalPanel *root = TerminalPanel();
-    if (root == nullptr)
-        return nullptr;
-    if (!putPanel(root, buildTitleBar(), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
-        TerminalPanel_free(root);
-        return nullptr;
+static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t visible);
+
+// Build the whole tree. Every child is built first and handed over afterwards, so
+// a refusal is detected before anything is partially wired. A failure here ends
+// the process with a diagnostic, which is why the not-yet-handed-over locals are
+// simply reclaimed by exit rather than untangled.
+static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
+    *scene = (Scene) {0};
+    scene->railWidth = 31;
+    TerminalPanel *title = buildTitleBar();
+    TerminalPanel *status = buildStatusBar(scene, file);
+    TerminalPanel *rail = buildRail();
+    TerminalPanel *centre = buildCentre(scene, rowCount);
+    TerminalText *border = plain(gRule, COL_MUTED);
+    scene->root = TerminalPanel();
+    if (title == nullptr || status == nullptr || rail == nullptr || centre == nullptr
+        || border == nullptr || scene->root == nullptr) {
+        TerminalPanel_free(scene->root);
+        TerminalPanel_free(title);
+        TerminalPanel_free(status);
+        TerminalPanel_free(rail);
+        TerminalPanel_free(centre);
+        TerminalText_free(border);
+        *scene = (Scene) {0};
+        return;
     }
-    if (!putPanel(root, buildStatusBar(), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_BOTTOM, 1))) {
-        TerminalPanel_free(root);
-        return nullptr;
+    if (!putPanel(scene->root, title, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))
+        || !putPanel(scene->root, status, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_BOTTOM, 1))) {
+        TerminalPanel_free(scene->root);
+        TerminalPanel_free(rail);
+        TerminalPanel_free(centre);
+        TerminalText_free(border);
+        *scene = (Scene) {0};
+        return;
     }
-    if (!putPanel(root, buildRail(), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 29))) {
-        TerminalPanel_free(root);
-        return nullptr;
+    scene->rail = rail;
+    scene->railId = TerminalPanel_addPanel(scene->root, rail,
+                                          TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->railWidth));
+    if (!TerminalPanel_isChildId(scene->railId)) {
+        TerminalPanel_free(scene->root);
+        TerminalPanel_free(rail);
+        TerminalPanel_free(centre);
+        TerminalText_free(border);
+        *scene = (Scene) {0};
+        return;
     }
-    // A one-column reservation for the panel's right edge, so the chrome drawn
-    // over the tree never overwrites the last cell of real content.
-    if (!putText(root, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))) {
-        TerminalPanel_free(root);
-        return nullptr;
+    if (!putText(scene->root, border, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))
+        || !putPanel(scene->root, centre, TerminalAnchor_0())) {
+        TerminalPanel_free(scene->root);
+        *scene = (Scene) {0};
+        return;
     }
-    if (!putPanel(root, buildCentre(), TerminalAnchor_0())) {
-        TerminalPanel_free(root);
-        return nullptr;
-    }
-    (void) TerminalPanel_setBackgroundColor(root, COL_BG);
-    return root;
+    sceneSyncRows(scene, file, 0, rowCount);
 }
 
-// --- The ncurses side: this host owns the tty, Determinant never names it ---
+// Point every visible row at the line it should show. No allocation, no tree
+// change: this is the whole of scrolling.
+static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t visible) {
+    for (size_t i = 0; i < scene->rowCount; ++i) {
+        TuiRow *row = &scene->rows[i];
+        if (i >= visible || first + i >= file->lineCount) {
+            (void) TerminalText_setText(row->gutter, gEmptyLine, 0);
+            (void) TerminalText_setText(row->code, gEmptyLine, 0);
+            continue;
+        }
+        size_t line = first + i;
+        int written = snprintf(gGutter[i], sizeof gGutter[i], "%4zu|", line + 1);
+        if (written < 0)
+            written = 0;
+        (void) TerminalText_setText(row->gutter, gGutter[i], (size_t) written);
+        (void) TerminalText_setText(row->code, file->lines[line], file->lineLengths[line]);
+    }
+    if (scene->lineChip != nullptr) {
+        (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%3zu]", first + 1);
+        (void) TerminalText_setText(scene->lineChip, gLineChip, strlen(gLineChip));
+    }
+}
+
+static void sceneSetRailWidth(Scene *scene, size_t width) {
+    if (width < TUI_RAIL_MIN)
+        width = TUI_RAIL_MIN;
+    if (width == scene->railWidth)
+        return;
+    scene->railWidth = width;
+    (void) TerminalPanel_setAnchor(scene->root, scene->railId,
+                                   TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width));
+}
+
+static void sceneFree(Scene *scene) {
+    TerminalPanel_free(scene->root);   // frees every child, text and panel alike
+    scene->root = nullptr;
+}
+
+// ---------------------------------------------------------------- ncurses side
 
 #define TUI_PAIR_MAX 96
 typedef struct TermPair {
@@ -410,8 +615,6 @@ typedef struct TermPair {
 static TermPair gPairs[TUI_PAIR_MAX];
 static size_t gPairCount;
 
-// Map a packed 0xRRGGBBAA colour onto the terminal's own palette. TERMINAL_COLOR
-// _DEFAULT (unset) becomes -1, the terminal's default colour.
 static short colorIndex(uint32_t color) {
     if (!TERMINAL_COLOR_IS_SET(color))
         return -1;
@@ -428,14 +631,12 @@ static short colorIndex(uint32_t color) {
     if (luminance < 64)
         return COLOR_BLACK;
     if (luminance < 128)
-        return (r > b) ? COLOR_RED : COLOR_BLUE;
+        return COLOR_BLUE;
     if (luminance < 200)
-        return (r > 200 && g > 200) ? COLOR_CYAN : COLOR_WHITE;
+        return COLOR_CYAN;
     return COLOR_WHITE;
 }
 
-// One ncurses colour pair per (fg,bg) the application actually uses, registered
-// on first sight and reused after that.
 static short pairFor(uint32_t fg, uint32_t bg) {
     for (size_t i = 0; i < gPairCount; ++i)
         if (gPairs[i].fg == fg && gPairs[i].bg == bg)
@@ -464,15 +665,12 @@ static attr_t attrsFor(uint8_t style) {
     return attrs;
 }
 
-// The run sink: Determinant hands over the cells that changed since the last
-// paint, and this writes them. A 0 glyph is a wide glyph's continuation cell and
-// is skipped because the wide glyph already occupied it.
 static bool blitRun(void *context, TerminalRun run) {
     (void) context;
     for (size_t i = 0; i < run.length; ++i) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
         if (glyph == 0)
-            continue;
+            continue;                                  // wide glyph continuation
         uint8_t style = run.styles != nullptr ? run.styles[i] : 0;
         uint32_t fg = run.fg != nullptr ? run.fg[i] : TERMINAL_COLOR_DEFAULT;
         uint32_t bg = run.bg != nullptr ? run.bg[i] : TERMINAL_COLOR_DEFAULT;
@@ -500,63 +698,89 @@ static bool blitRun(void *context, TerminalRun run) {
     return true;
 }
 
-// The window chrome the toolkit has no widget for yet: the rail's two verticals
-// and the panel's right edge, drawn with the canvas primitive over the painted
-// tree. A real vertical rule/segment widget is the next toolkit item; until it
-// lands the host owns these three lines.
-static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height) {
-    if (height < 3)
+// The chrome the toolkit has no widget for yet: the rail's two verticals and the
+// panel's right edge, drawn over the painted tree. The divider moves with the
+// rail, which is why it takes the width rather than a constant.
+static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size_t railWidth) {
+    if (height < 3 || width < 4)
         return;
-    TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_MUTED);
     size_t rows = height - 2;
+    TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_MUTED);
     TerminalCanvas left = TerminalCanvas_sub(canvas, 0, 1, 1, rows);
     TerminalCanvas_vline(&left, 0, '|', pen);
-    TerminalCanvas divider = TerminalCanvas_sub(canvas, 28, 1, 1, rows);
+    TerminalCanvas divider = TerminalCanvas_sub(canvas, railWidth - 1, 1, 1, rows);
     TerminalCanvas_vline(&divider, 0, '|', pen);
     TerminalCanvas right = TerminalCanvas_sub(canvas, width - 1, 1, 1, rows);
     TerminalCanvas_vline(&right, 0, '|', pen);
 }
 
-// One frame as plain text, with no tty and no ncurses. This is the test/inspection
-// affordance: it proves the layout and content of the scene deterministically.
+// Row 0 is the title, row 1 the tab strip, row 2 the separator, and the last row
+// is the status bar; everything between is editor.
+static size_t editorFirstRow(void) { return 3; }
+
+static size_t editorRowCount(int height) {
+    if (height < (int) (editorFirstRow() + 2u))
+        return 0;
+    return (size_t) height - editorFirstRow() - 1u;
+}
+
+// The scene owns at most TUI_MAX_ROWS row texts, so a very tall terminal shows
+// the rows it has rather than reaching past them.
+static size_t editorVisibleRows(int height) {
+    size_t rows = editorRowCount(height);
+    return rows > TUI_MAX_ROWS ? TUI_MAX_ROWS : rows;
+}
+
+static bool mouseReporting(bool enabled) {
+    return fputs(enabled ? "\033[?1003h\033[?1006h" : "\033[?1003l\033[?1006l", stdout) >= 0
+        && fflush(stdout) == 0;
+}
+
+static void scrollBy(size_t *scrollTop, const FileText *file, int delta, size_t visible) {
+    if (delta < 0) {
+        size_t amount = (size_t) (-delta);
+        *scrollTop = amount > *scrollTop ? 0 : *scrollTop - amount;
+        return;
+    }
+    size_t maximum = file->lineCount > visible ? file->lineCount - visible : 0;
+    size_t next = *scrollTop + (size_t) delta;
+    *scrollTop = next > maximum ? maximum : next;
+}
+
 ;;TEST
-static int dumpFrame(int width, int height) {
+static int dumpFrame(int width, int height, const FileText *file) {
     if (width < 1 || height < 1 || width > TUI_MAX_W || height > TUI_MAX_H) {
         fprintf(stderr, "[vex] semicolon: dump size %dx%d out of range (max %dx%d)\n",
                 width, height, TUI_MAX_W, TUI_MAX_H);
         return 1;
     }
-    TerminalPanel *root = buildScene();
-    if (root == nullptr) {
+    Scene scene;
+    sceneBuild(&scene, file, TUI_MAX_ROWS);
+    if (scene.root == nullptr) {
         fprintf(stderr, "[vex] semicolon: scene construction failed\n");
         return 1;
     }
+    sceneSyncRows(&scene, file, 0, editorVisibleRows(height));
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
-    TerminalPanel_paint(root, &canvas);
-    drawChrome(&canvas, (size_t) width, (size_t) height);
+    TerminalPanel_paint(scene.root, &canvas);
+    drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth);
     for (int y = 0; y < height; ++y) {
         TerminalCanvasTextRow row = TerminalCanvas_copyRow(&canvas, (size_t) y);
         fwrite(row.data, 1, row.bytes, stdout);
         fputc('\n', stdout);
     }
-    TerminalPanel_free(root);
+    sceneFree(&scene);
     return 0;
 }
 
-static int runTerminal(void) {
+static int runTerminal(FileText *file) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         THROW("semicolon requires terminal stdin and stdout (use --dump for a plain render)");
         return 1;
     }
-    TerminalPanel *root = buildScene();
-    if (root == nullptr) {
-        THROW("semicolon: scene construction failed");
-        return 1;
-    }
     SCREEN *screen = newterm(nullptr, stdout, stdin);
     if (screen == nullptr) {
-        TerminalPanel_free(root);
         THROW("semicolon: terminal initialization failed");
         return 1;
     }
@@ -567,30 +791,120 @@ static int runTerminal(void) {
     }
     (void) cbreak();
     (void) noecho();
-    (void) keypad(stdscr, true);
+    (void) nonl();
     (void) curs_set(0);
+    (void) mousemask(0, nullptr);   // ncurses' own mouse ABI is not used here
+    (void) notimeout(stdscr, true);  // ESC must not wait for a suffix
+    timeout(TUI_POLL_MS);
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
+    (void) mouseReporting(true);
 
-    TerminalSurface surface = TerminalSurface_0();
-    int width = 0;
     int height = 0;
-    bool ok = true;
+    int width = 0;
+    getmaxyx(stdscr, height, width);
+    if (width > TUI_MAX_W)
+        width = TUI_MAX_W;
+    if (height > TUI_MAX_H)
+        height = TUI_MAX_H;
+    Scene scene;
+    sceneBuild(&scene, file, TUI_MAX_ROWS);
+    bool ok = scene.root != nullptr;
+    Interaction interaction = { .input = TerminalInput_0() };
+    TerminalSurface surface = TerminalSurface_0();
+    size_t scrollTop = 0;
+    int knownRows = height;
+    int knownColumns = width;
+    if (!ok)
+        THROW("semicolon: scene construction failed");
+
     while (ok && !gQuit) {
-        getmaxyx(stdscr, height, width);
-        if (width > TUI_MAX_W)
-            width = TUI_MAX_W;
-        if (height > TUI_MAX_H)
-            height = TUI_MAX_H;
-        if (width < 20 || height < 5) {
+        // ncurses caches the screen size and only refreshes it on resizeterm - and
+        // resizeterm(0, 0) is not accepted, while KEY_RESIZE is not guaranteed to
+        // arrive at all. So the size is read from the tty directly. It is applied
+        // ONLY when it actually changed: calling resizeterm unconditionally dirties
+        // the screen every pass and ncurses repaints forever, which is a busy loop
+        // disguised as housekeeping.
+        struct winsize terminalSize;
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &terminalSize) == 0 && terminalSize.ws_row > 0
+            && terminalSize.ws_col > 0
+            && ((int) terminalSize.ws_row != knownRows || (int) terminalSize.ws_col != knownColumns)) {
+            knownRows = (int) terminalSize.ws_row;
+            knownColumns = (int) terminalSize.ws_col;
+            (void) resizeterm(knownRows, knownColumns);
+            (void) clear();
+        }
+        int rows = 0;
+        int columns = 0;
+        getmaxyx(stdscr, rows, columns);
+        if (columns > TUI_MAX_W)
+            columns = TUI_MAX_W;
+        if (rows > TUI_MAX_H)
+            rows = TUI_MAX_H;
+        width = columns;
+        height = rows;
+        size_t visible = editorVisibleRows(height);
+        if (visible == 0) {
             erase();
             mvaddstr(0, 0, "terminal too small");
             refresh();
-            int key = getch();
-            if (key == 'q' || key == 17)
+            timeout(TUI_POLL_MS);
+            int small = getch();
+            if (small == 'q' || small == 17)
                 break;
             continue;
         }
+        // All input arrives here: keys, and the mouse bytes the decoder turns into
+        // normalized events.
+        int key = getch();
+        while (key != ERR) {
+            if (key == 17 || key == 'q') {
+                gQuit = 1;
+                break;
+            }
+            if (key == KEY_RESIZE) {
+                (void) clear();
+            } else if (TerminalInput_feed(&interaction.input, key)) {
+                TerminalPointerEvent event = TerminalInput_getEvent(&interaction.input);
+                interaction.havePointer = true;
+                interaction.pointerX = event.x;
+                interaction.pointerY = event.y;
+                size_t divider = scene.railWidth - 1u;
+                switch (event.kind) {
+                    case TERMINAL_POINTER_WHEEL_UP:
+                        scrollBy(&scrollTop, file, -(int) TUI_SCROLL_ROWS, visible);
+                        break;
+                    case TERMINAL_POINTER_WHEEL_DOWN:
+                        scrollBy(&scrollTop, file, (int) TUI_SCROLL_ROWS, visible);
+                        break;
+                    case TERMINAL_POINTER_PRESS:
+                        interaction.grabbing = event.x + 1u >= divider && event.x <= divider + 1u;
+                        break;
+                    case TERMINAL_POINTER_RELEASE:
+                        interaction.grabbing = false;
+                        break;
+                    case TERMINAL_POINTER_DRAG:
+                        if (interaction.grabbing && (int) event.x + 1 < columns - (int) TUI_RAIL_MARGIN)
+                            sceneSetRailWidth(&scene, event.x + 1u);
+                        /* fall through: a drag near an edge also scrolls */
+                        /* FALLTHROUGH */
+                    case TERMINAL_POINTER_MOVE:
+                        // One-cell edge autoscroll, driven by motion events — so a
+                        // pointer that stops moving stops scrolling.
+                        if (event.y == editorFirstRow())
+                            scrollBy(&scrollTop, file, -1, visible);
+                        else if (event.y == height - 2u)
+                            scrollBy(&scrollTop, file, 1, visible);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            key = getch();
+        }
+        if (gQuit)
+            break;
+
         TerminalCanvas back = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
         TerminalCanvas front = TerminalCanvas(gFrontCells, gFrontStyles, gFrontFg, gFrontBg,
                                              (size_t) width, (size_t) height);
@@ -598,16 +912,15 @@ static int runTerminal(void) {
         if (!TerminalSurface_isBound(&surface)
             || TerminalSurface_getBack(&surface).gridWidth != (size_t) width
             || TerminalSurface_getBack(&surface).gridHeight != (size_t) height) {
-            // A resize invalidates the record of the old frame: start the mirror
-            // blank so the whole new screen is sent once.
             TerminalCanvas_fill(&front, ' ', TerminalPen());
             if (!TerminalSurface_bind(&surface, &back, &front, blitRun, nullptr)) {
                 ok = false;
                 break;
             }
         }
-        TerminalPanel_paint(root, &back);
-        drawChrome(&back, (size_t) width, (size_t) height);
+        sceneSyncRows(&scene, file, scrollTop, visible);
+        TerminalPanel_paint(scene.root, &back);
+        drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);
         TerminalPresentResult presented = TerminalSurface_present(&surface);
         if (!presented.ok)
             ok = false;
@@ -615,32 +928,30 @@ static int runTerminal(void) {
             ok = refresh() != ERR;
         if (!ok)
             break;
-        int key = getch();
-        if (key == 17 || key == 'q')
-            break;
-        if (key == KEY_RESIZE) {
-            (void) clear();
-            continue;
-        }
     }
+    (void) mouseReporting(false);
     (void) curs_set(1);
     (void) endwin();
     (void) delscreen(screen);
-    TerminalPanel_free(root);
+    sceneFree(&scene);
     if (!ok)
         THROW("semicolon: terminal operation failed; terminal restored");
     return ok ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
-    initRule();
+    initTextures();
     bool dump = false;
-    int width = TUI_DEFAULT_W;
-    int height = TUI_DEFAULT_H;
+    bool fileGiven = false;
+    int width = 0;
+    int height = 0;
+    char path[1024];
+    path[0] = '\0';
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) {
-            puts("semicolon [--dump [WxH]] [--help]");
+            puts("semicolon [--dump [WxH]] [--file PATH] [--help]");
             puts("  no arguments  draw the IDE shell on this terminal (Ctrl-Q or q quits)");
+            puts("  --file PATH   show PATH in the editor (default: vexspoke's oop/type.h)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
             return 0;
         }
@@ -649,13 +960,9 @@ int main(int argc, char **argv) {
             if (i + 1 < argc && strchr(argv[i + 1], 'x') != nullptr) {
                 char *end = nullptr;
                 long parsedWidth = strtol(argv[++i], &end, 10);
-                if (end == nullptr || *end != 'x') {
-                    THROW("semicolon: --dump size must look like 103x23");
-                    return 1;
-                }
                 char *heightEnd = nullptr;
-                long parsedHeight = strtol(end + 1, &heightEnd, 10);
-                if (heightEnd == nullptr || *heightEnd != '\0'
+                long parsedHeight = end != nullptr ? strtol(end + 1, &heightEnd, 10) : 0;
+                if (end == nullptr || *end != 'x' || heightEnd == nullptr || *heightEnd != '\0'
                     || parsedWidth < 1 || parsedHeight < 1) {
                     THROW("semicolon: --dump size must look like 103x23");
                     return 1;
@@ -665,10 +972,38 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
+            (void) snprintf(path, sizeof path, "%s", argv[++i]);
+            fileGiven = true;
+            continue;
+        }
         THROW("semicolon: unknown argument");
         return 1;
     }
-    if (dump)
-        return dumpFrame(width, height);
-    return runTerminal();
+    if (!fileGiven) {
+        char directory[1000];
+        (void) snprintf(directory, sizeof directory, "%s", argv[0]);
+        char *slash = strrchr(directory, '/');
+        if (slash != nullptr)
+            *slash = '\0';
+        (void) snprintf(path, sizeof path,
+                        "%s/../../../../suite/ecosystem/vexspoke/src/oop/type.h", directory);
+    }
+    FileText file;
+    if (!fileLoad(&file, path)) {
+        fprintf(stderr, "[vex] semicolon: cannot read %s\n", path);
+        return 1;
+    }
+    int status = 0;
+    if (dump) {
+        if (width < 1)
+            width = 103;
+        if (height < 1)
+            height = 23;
+        status = dumpFrame(width, height, &file);
+    } else {
+        status = runTerminal(&file);
+    }
+    fileFree(&file);
+    return status;
 }
