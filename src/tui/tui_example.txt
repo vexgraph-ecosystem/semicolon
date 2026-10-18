@@ -1,26 +1,158 @@
---[;]-[vexgraph (project name)]-[<][>]-------------------------------------------[> run]--[settings]---
-| v [] vexgraph             | [helloWorld.c  x] [placehodler.txt  x] [ide settings  x]                |
-|   v [] src                |--------------------------------------------------------------------------
-|       {} opencode.json    | xxx  |   Hello *h = Hello();                               [no errors!] |
-|       Aa hello.txt        |      |                                                                  |
-|        J example.java     |      |                                                                  |
-|        C whatever.c       |      |                                                                  |
-|       C+ whatever.cpp     |      |                                                                  |
-|       oC shim.m           |      |                                                                  |
-|   > [] new folder         |      |                                                                  |
-|   > [] another folder     |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
-|                           |      |                                                                  |
---[vexgraph > folder > folder > text.c > toString()]----------------[c23/java]-[ln:ch]-[time]-[utf-8]--
+┌-[;]-[>w< agents]-----[<-|->]┐[helloworld.c  x][placeholder.txt  x][terminal  x][cmakelists.txt  x][another...┐ <- three dots needed when it is being warped
+| v [] vexgraph               |   1|#include "whatever.h"                                  [> run] [20!!, 20!] |
+|   v [] src                  |   2|int main() {                                                               |
+|       {} opencode.json      |   3|    Hello *h = Hello();                                                    |
+|       Aa hello.txt          |   4|    return 0;                                                              |
+|        J example.java       |   5|}                                                                          |
+|        C whatever.c         |   6|                                                                           |
+|       C+ whatever.cpp       |   7|                                                                           |
+|       oC shim.m             |   8|                                                                           |
+|   > [] new folder           |   9|                                                                           |
+|   > [] another folder       |  10|                                                                           |
+|                             |  11| <- this thin line is not highlighted                                      |
+|                             |  12|                                                                           |<- borders like this is not highlighted
+|                             |  13|                                                                           |
+|                             |  14|                                                                           |
+|                             |  15|                                                                           |
+|                             |  16|                                                                           |
+|                             |  17|                                                                           |
+|         draggable btw... -> |  18|                                                                           |
+|                             |  19|                                                                           |
+|                             |  20|                                                                           |
+|                             |  21|                                                                           |
+└--[vexgraph>folder>folder>text.c::toString()]-------------------------------[c23/java]-[ln:ch]-[time]-[utf-8]-┘
+              ^
+              ^
+              breadcrumbs, the >s are not highlighted... it would be nice if it looked like rainbow but it depends
+
+
+
+[>w< agents] or [<;> code]
+[;;] is like the icon of the semicolon lol
+the undo/redo is being anchored with the left panel at top right. the | shouldnt be the highlight.. only the arrows
+there should be a concept of
+
+also this is un-nerd version, a nerd version one will be assessed in the future
+
+i wish theres also transparency allowed on highlights and text (foreground) too, that would be nice...
+reference characters:
+## Lines
+
+```
+light     ─  │
+heavy      ━ ┃
+double     ═ ║
+dashed     ┄ ┅ ┆ ┇ ┈ ┉ ┊ ┋
+double-dash ╌ ╍ ╎ ╏
+rounded    ╭ ╮ ╰ ╯
+```
+
+## Corners
+
+```
+light      ┌ ┐ └ ┘
+heavy      ┏ ┓ ┗ ┛
+double     ╔ ╗ ╚ ╝
+mixed      ╒ ╓ ╕ ╖ ╘ ╙ ╛ ╜
+```
+
+## Tees & crosses
+
+```
+light      ├ ┤ ┬ ┴ ┼
+heavy      ┣ ┫ ┳ ┻ ╋
+double     ╠ ╣ ╦ ╩ ╬
+mixed      ╞ ╟ ╡ ╢ ╤ ╥ ╧ ╨ ╪ ╫
+```
+
+## End caps / cut ends
+
+```
+╴ ╵ ╶ ╷ ╸ ╹ ╺ ╻
+```
+
+## Block fills & shading
+
+```
+full       █ ▉ ▊ ▋ ▌ ▍ ▎ ▏ ▐
+halves     ▀ ▄ ▌ ▐
+shades     ░ ▒ ▓
+quadrants  ▖ ▗ ▘ ▙ ▚ ▛ ▜ ▝ ▞ ▟
+checker    ▣ ▤ ▥ ▦ ▧ ▨ ▩
+bars       ▁ ▂ ▃ ▄ ▅ ▆ ▇ █
+```
+
+## Dots, bullets, circles
+
+```
+• ◦ ∙ · ○ ◌ ◍ ◎ ● ◉ ⊙ ⊚ ⊛ ⊝
+◐ ◑ ◒ ◓ ◔ ◕ ◖ ◗ ◯ ◡ ◠
+```
+
+## Shapes
+
+```
+◆ ◇ ◈ ▪ ▫ ■ □ ▬ ▭ ▮ ▯ ▰ ▱
+▲ ▼ ◀ ▶ △ ▽ ◁ ▷ ◤ ◥ ◢ ◣
+★ ☆ ✦ ✧ ✩ ✪ ✫ ✬ ✭ ✮ ✯ ✰
+⬟ ⬠ ⬢ ⭓ ⬣
+```
+
+## Arrows
+
+```
+← → ↑ ↓ ↔ ↕    ⇐ ⇒ ⇑ ⇓ ⇔ ⇕
+↖ ↗ ↘ ↙ ⤴ ⤵ ⟵ ⟶ ➜ ➔ ➙ ➛ ➝ ➞ ➟
+```
+
+## Icons / status
+
+```
+check    ✓ ✔ ✕ ✖ ✗ ✘ ☑ ☒ ☐ ☓
+warn     ⚠ ☠ ⛔
+info     ⓘ ℹ
+star     ★ ☆ ✩ ✪
+misc     ♥ ❤ ♠ ♣ ♦ ♪ ♫ ⚡ ⚙ ☂ ☀ ☁ ❄ ✈ ☕ ⌛ ⌘ ⌥ ⇧ ⌃
+keys     ⏎ ⌫ ⌦ ⇥ ⎋ ␣ ␛ ␈ ⏏ ⌂ ⌤ ⎇
+bullets  ⁃ ‣ ⁍ ⁌ ※ ‼ ⁉ ⁇ ⁈
+```
+
+```
+quotes   “ ” ‘ ’ « » ‹ › „
+dashes   – — ‒ ― …
+math     ± × ÷ ≈ ≠ ≤ ≥ ∞ √ ∑ ∏ ∫ ∂ ∆ ∇ ∈ ∉ ∀ ∃
+currency € £ ¥ ¢ ₿ ₹ ₽
+degrees  ° ′ ″ ℃ ℉
+```
+
+## Spinners (braille)
+
+```
+⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷
+⣄ ⣆ ⣇ ⣧ ⣷ ⣿ ⣿ ⣷ ⣧ ⣇ ⣆ ⣄
+```
+
+## ASCII fallback (whenever box drawing won't render)
+
+```
+light      + - | =
+heavy      # # | #
+double     + = | =
+vertical   | : ¦ ‖
+arrows     <- -> ^ v <->
+bullets    * o . :
+check      v x ! ? i
+blocks     # % @
+```
+
+Two notes that matter for this workspace:
+
+- Cells in Determinant are **codepoints**, not bytes, so any of the above drops straight into `TerminalCanvas_glyph` / `TerminalRule` fields. The `CP_*` defines in `terminal_appearance.c` are just where the current presets spell their five or six glyphs.
+- The wide stuff (`★`, `⚡`, emoji) reports `wcwidth == 2`, so `TerminalCanvas_glyph` burns a continuation cell on it — fine for a badge, risky inside a 1-column rail.
+
+Want me to drop this in as a `terminal_glyph.h` table of named codepoint constants (a real snippet, not prose) alongside the existing rule presets? That's determinant's `src/terminal` tree — the sibling session `eb5d02cb` is editing it, so I'd coordinate with them first.
+
  {} - json
  <> - html, xml, yaml, whatever
  Aa - text file
@@ -49,7 +181,7 @@
  x! - .gitignore
 
  () - function
- v: - variable
+ v: - variable, v_ - referenced variable
  f: - field
 
  {} - json, jsonc, parser...
@@ -59,7 +191,18 @@
  js - javascript
  ph - php file
  gh - .github, .gitkeep or any github related folder
+
+ ad - arduino .ino
+ hk - haskell
+ as - assembly
+ od - odin
+ >_ - shell script (.sh, .zsh, any)
+ xc - app/.exe
+
+ bf - brainfuck idk
+ im - any image format or anything...
  
+
 
 
 
