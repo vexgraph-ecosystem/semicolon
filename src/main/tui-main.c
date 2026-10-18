@@ -10,6 +10,7 @@
 #include "annotation/definition.h"
 #include "annotation/overview.h"
 #include "annotation/test.h"
+#include "annotation/debug.h"
 #include <locale.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -93,6 +94,7 @@
  *   static void drawChrome(canvas, width, height, size_t railWidth)
  *   static void handlePointer(Scene *, Interaction *, int width, int height)
  *   static int dumpFrame(int, int, FileText *)
+ *   static int runInputProbe(void)   DEBUG: print what the terminal sends
  *   static int runTerminal(FileText *)
  * Entry:
  *   int main(int, char **)   --help / --dump [WxH] / --file PATH / interactive.
@@ -930,6 +932,80 @@ static int dumpFrame(int width, int height, const FileText *file) {
     return 0;
 }
 
+// A diagnostic that prints what the terminal ACTUALLY sends. Whether a trackpad
+// emits a horizontal wheel (buttons 66/67) is a property of the terminal emulator,
+// not of this program, so arguing about it is pointless: swipe and read the answer.
+;;DEBUG
+static int runInputProbe(void) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        THROW("semicolon --input-probe requires a terminal");
+        return 1;
+    }
+    SCREEN *screen = newterm(nullptr, stdout, stdin);
+    if (screen == nullptr)
+        return 1;
+    (void) cbreak();
+    (void) noecho();
+    (void) curs_set(0);
+    (void) keypad(stdscr, true);
+    set_escdelay(25);
+    (void) mousemask(0, nullptr);
+    (void) define_key("\033[<", TUI_MOUSE_SGR);
+    (void) define_key("\033[M", TUI_MOUSE_X10);
+    (void) define_key("\033[A", KEY_UP);
+    (void) define_key("\033[B", KEY_DOWN);
+    (void) define_key("\033[C", KEY_RIGHT);
+    (void) define_key("\033[D", KEY_LEFT);
+    (void) mouseReporting(true);
+    erase();
+    mvaddstr(0, 0, "input probe: wheel, swipe sideways, drag, press keys. q quits.");
+    mvaddstr(1, 0, "a horizontal swipe shows wheel-left / wheel-right if the terminal sends it.");
+    refresh();
+    TerminalInput input = TerminalInput_0();
+    int line = 3;
+    while (!gQuit) {
+        int key = getch();
+        if (key == ERR)
+            continue;
+        if (key == 'q' || key == 17)
+            break;
+        bool havePointer = false;
+        if (key == TUI_MOUSE_SGR)
+            havePointer = readMouseSuffix(&input, true);
+        else if (key == TUI_MOUSE_X10)
+            havePointer = readMouseSuffix(&input, false);
+        if (line >= LINES - 1)
+            line = 3;
+        if (havePointer) {
+            TerminalPointerEvent event = TerminalInput_getEvent(&input);
+            const char *kind = "?";
+            switch (event.kind) {
+                case TERMINAL_POINTER_MOVE: kind = "move"; break;
+                case TERMINAL_POINTER_DRAG: kind = "drag"; break;
+                case TERMINAL_POINTER_PRESS: kind = "press"; break;
+                case TERMINAL_POINTER_RELEASE: kind = "release"; break;
+                case TERMINAL_POINTER_WHEEL_UP: kind = "wheel-up"; break;
+                case TERMINAL_POINTER_WHEEL_DOWN: kind = "wheel-down"; break;
+                case TERMINAL_POINTER_WHEEL_LEFT: kind = "wheel-left"; break;
+                case TERMINAL_POINTER_WHEEL_RIGHT: kind = "wheel-right"; break;
+                default: break;
+            }
+            mvprintw(line++, 0, "%-12s x=%-4zu y=%-4zu button=%d %s%s%s        ",
+                     kind, event.x, event.y, (int) event.button,
+                     event.shift ? "shift " : "", event.meta ? "meta " : "",
+                     event.ctrl ? "ctrl" : "");
+        } else {
+            mvprintw(line++, 0, "key %-5d (no mouse event)        ", key);
+        }
+        refresh();
+    }
+    (void) mouseReporting(false);
+    (void) curs_set(1);
+    (void) endwin();
+    (void) delscreen(screen);
+    return 0;
+}
+
 static int runTerminal(FileText *file) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         THROW("semicolon requires terminal stdin and stdout (use --dump for a plain render)");
@@ -1199,6 +1275,7 @@ int main(int argc, char **argv) {
             puts("  no arguments  draw the IDE shell on this terminal (Ctrl-Q or q quits)");
             puts("  --file PATH   show PATH in the editor (default: vexspoke's oop/type.h)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
+            puts("  --input-probe print the mouse and key events this terminal actually sends");
             return 0;
         }
         if (strcmp(argv[i], "--dump") == 0) {
@@ -1217,6 +1294,10 @@ int main(int argc, char **argv) {
                 height = (int) parsedHeight;
             }
             continue;
+        }
+        if (strcmp(argv[i], "--input-probe") == 0) {
+            initTextures();
+            return runInputProbe();
         }
         if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
             (void) snprintf(path, sizeof path, "%s", argv[++i]);

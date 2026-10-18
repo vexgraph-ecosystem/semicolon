@@ -57,6 +57,10 @@ Also present: `build.py` (explicit, strict, no fetch and no program run), the
 The window chrome (the rail verticals and the right edge) is drawn by the shell
 with the canvas primitive, because the toolkit has no vertical-rule widget yet.
 
+`semicolon --input-probe` is a diagnostic: it prints the mouse and key events the
+terminal actually sends, so whether a trackpad reports a horizontal wheel (buttons
+66/67) is a measurement rather than a guess.
+
 `tests/semicolon/tui_main_test.py` asserts the frame's measured geometry, the
 non-tty refusal, and — under a real pty — that mouse reporting is enabled and
 switched off again, that a wheel event scrolls, and that a divider drag survives.
