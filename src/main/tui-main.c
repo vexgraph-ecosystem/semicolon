@@ -78,13 +78,15 @@
  *   static TerminalText *chip(const char *)
  *   static TerminalText *plain(const char *, uint32_t)
  *   static bool putText(parent, text, anchor) / putPanel(parent, panel, anchor)
- *   static TerminalPanel *buildTitleBar(void) / buildStatusBar(FileText *)
+ *   static TerminalPanel *buildChromeRow(void) / buildStatusBar(Scene *, FileText *)
  *   static TerminalPanel *buildRail(void)
  *   static TerminalPanel *buildEditor(Scene *, size_t)
  *   static TerminalPanel *buildCentre(Scene *, size_t)
  *   static void sceneBuild(Scene *, FileText *, size_t)
- *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t visible)
- *   static size_t editorTop(const Scene *) / editorRows(width, height)
+ *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
+ *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
+ *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
+ *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
  *   static bool blitRun(void *, TerminalRun)
@@ -115,6 +117,12 @@
 #define TUI_RAIL_MIN 12u
 #define TUI_RAIL_MARGIN 24u
 #define TUI_SCROLL_ROWS 3u
+#define TUI_SCROLL_COLS 4u
+// Scroll-past padding: how far the view may travel BEYOND the last line and the
+// last column, so there is always somewhere to type at the bottom and at the right
+// edge instead of the caret being pinned against it.
+#define TUI_SCROLL_PAST_BOTTOM 10u
+#define TUI_SCROLL_PAST_RIGHT 20u
 // Events handled before a paint. A drag floods motion events, so an unbounded
 // drain never lets the frame update; a bound keeps the screen live.
 #define TUI_EVENTS_PER_FRAME 32u
@@ -149,6 +157,7 @@ typedef struct FileText {
     size_t *lineLengths;     // owned per-line lengths
     size_t lineCount;
     size_t lineCapacity;
+    size_t longestCells;     // widest line in CELLS, so horizontal scroll has a bound
     char name[64];           // display name for the breadcrumb
 } FileText;
 
@@ -187,6 +196,42 @@ static void initTextures(void) {
     memset(gRule, '-', sizeof gRule - 1);
     gRule[sizeof gRule - 1] = '\0';
     memset(gLineChip, 0, sizeof gLineChip);
+}
+
+// Cells a byte span occupies, using the canvas's own locale-free width rule so a
+// wide glyph counts two and the horizontal offset lands on a cell boundary.
+static size_t cellsOf(const char *bytes, size_t length) {
+    size_t cells = 0;
+    size_t at = 0;
+    while (at < length) {
+        TerminalCanvasDecodedScalar decoded = TerminalCanvas_utf8Decode(bytes + at, length - at);
+        if (decoded.bytes == 0) {
+            ++cells;
+            ++at;
+            continue;
+        }
+        cells += TerminalCanvas_widthOf(decoded.codepoint);
+        at += decoded.bytes;
+    }
+    return cells;
+}
+
+// Byte offset of a CELL offset inside a line. Cutting on a byte offset would split
+// a UTF-8 sequence in half and render two pieces of one glyph.
+static size_t bytesForCells(const char *bytes, size_t length, size_t cells) {
+    size_t consumed = 0;
+    size_t at = 0;
+    while (at < length && consumed < cells) {
+        TerminalCanvasDecodedScalar decoded = TerminalCanvas_utf8Decode(bytes + at, length - at);
+        if (decoded.bytes == 0) {
+            ++consumed;
+            ++at;
+            continue;
+        }
+        consumed += TerminalCanvas_widthOf(decoded.codepoint);
+        at += decoded.bytes;
+    }
+    return at;
 }
 
 static void fileFree(FileText *file) {
@@ -268,6 +313,13 @@ static bool fileLoad(FileText *file, const char *path) {
     file->lineLengths = lineLengths;
     file->lineCount = count;
     file->lineCapacity = lineCapacity;
+    size_t longest = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t cells = cellsOf(lines[i], lineLengths[i]);
+        if (cells > longest)
+            longest = cells;
+    }
+    file->longestCells = longest;
     return true;
 }
 
@@ -309,12 +361,12 @@ static bool putPanel(TerminalPanel *parent, TerminalPanel *child, TerminalAnchor
     return true;
 }
 
-static TerminalPanel *buildTitleBar(void) {
+static TerminalPanel *buildChromeRow(void) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    static const char *labels[] = { ";", ">w< agents", "<", ">" };
-    static const size_t extents[] = { 3, 12, 3, 3 };
+    static const char *labels[] = { ";", ">w< agents", "<-|->" };
+    static const size_t extents[] = { 3, 12, 7 };
     // The rule texture paints first and reserves nothing, so every chip lands on
     // top of it and the gaps read as the run between chips.
     if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
@@ -336,12 +388,20 @@ static TerminalPanel *buildTitleBar(void) {
             (void) putText(bar, plain(gRule, COL_MUTED),
                            TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1));
     }
-    static const size_t rightExtents[] = { 1, 10, 2 };
-    static const char *rightLabels[] = { nullptr, "settings", nullptr };
-    for (size_t i = 0; i < sizeof rightExtents / sizeof rightExtents[0]; ++i) {
-        TerminalText *child = rightLabels[i] != nullptr ? chip(rightLabels[i])
-                                                        : plain(gRule, COL_MUTED);
-        if (!putText(bar, child, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, rightExtents[i]))) {
+    // Dashes out to the rail's right border, so the chrome row's left group ends
+    // exactly where the rail ends and the tab strip starts in the centre's columns.
+    // The count is what puts the tabs at the centre's first column.
+    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 5))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    // The compact trick: the tab strip shares the chrome row, so it costs no row.
+    static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
+    for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
+        TerminalText *tab = chip(tabLabels[i]);
+        (void) TerminalText_setForegroundColor(tab, i == 3 ? COL_TEXT : COL_MUTED);
+        if (!putText(bar, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                                TerminalText_measure(tab)))) {
             TerminalPanel_free(bar);
             return nullptr;
         }
@@ -354,6 +414,12 @@ static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
+    // The rule underlay runs the full width; the chips and the breadcrumb paint over
+    // it, so the gaps read as the bottom border's run.
+    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
     if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 2))) {
         TerminalPanel_free(bar);
         return nullptr;
@@ -476,40 +542,12 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     return editor;
 }
 
+// The centre is only the editor: the tab strip and its separator moved into the
+// chrome row, which is the compaction.
 static TerminalPanel *buildCentre(Scene *scene, size_t rowCount) {
     TerminalPanel *centre = TerminalPanel();
     if (centre == nullptr)
         return nullptr;
-    TerminalPanel *tabs = TerminalPanel();
-    if (tabs == nullptr) {
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
-    static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
-    for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
-        TerminalText *tab = chip(tabLabels[i]);
-        (void) TerminalText_setForegroundColor(tab, i == 3 ? COL_TEXT : COL_MUTED);
-        if (!putText(tabs, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
-                                                 TerminalText_measure(tab) + 1))) {
-            TerminalPanel_free(tabs);
-            TerminalPanel_free(centre);
-            return nullptr;
-        }
-    }
-    if (!putPanel(centre, tabs, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
-    TerminalPanel *separator = TerminalPanel();
-    if (separator == nullptr || !putText(separator, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
-        TerminalPanel_free(separator);
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
-    if (!putPanel(centre, separator, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
-        TerminalPanel_free(centre);
-        return nullptr;
-    }
     if (!putPanel(centre, buildEditor(scene, rowCount), TerminalAnchor_0())) {
         TerminalPanel_free(centre);
         return nullptr;
@@ -517,7 +555,8 @@ static TerminalPanel *buildCentre(Scene *scene, size_t rowCount) {
     return centre;
 }
 
-static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t visible);
+static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t left,
+                          size_t visible);
 
 // Build the whole tree. Every child is built first and handed over afterwards, so
 // a refusal is detected before anything is partially wired. A failure here ends
@@ -526,7 +565,7 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
 static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
     *scene = (Scene) {0};
     scene->railWidth = 31;
-    TerminalPanel *title = buildTitleBar();
+    TerminalPanel *title = buildChromeRow();
     TerminalPanel *status = buildStatusBar(scene, file);
     TerminalPanel *rail = buildRail();
     TerminalPanel *centre = buildCentre(scene, rowCount);
@@ -569,15 +608,18 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
         *scene = (Scene) {0};
         return;
     }
-    sceneSyncRows(scene, file, 0, rowCount);
+    sceneSyncRows(scene, file, 0, 0, rowCount);
 }
 
 // Point every visible row at the line it should show. No allocation, no tree
 // change: this is the whole of scrolling.
-static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t visible) {
+static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t left,
+                          size_t visible) {
     for (size_t i = 0; i < scene->rowCount; ++i) {
         TuiRow *row = &scene->rows[i];
         if (i >= visible || first + i >= file->lineCount) {
+            // Past the end: the gutter goes blank with the code, so the scroll-past
+            // space reads as empty rather than as a continuation of the last line.
             (void) TerminalText_setText(row->gutter, gEmptyLine, 0);
             (void) TerminalText_setText(row->code, gEmptyLine, 0);
             continue;
@@ -587,7 +629,10 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
         if (written < 0)
             written = 0;
         (void) TerminalText_setText(row->gutter, gGutter[i], (size_t) written);
-        (void) TerminalText_setText(row->code, file->lines[line], file->lineLengths[line]);
+        const char *bytes = file->lines[line];
+        size_t length = file->lineLengths[line];
+        size_t skip = bytesForCells(bytes, length, left);
+        (void) TerminalText_setText(row->code, bytes + skip, length - skip);
     }
     if (scene->lineChip != nullptr) {
         (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%3zu]", first + 1);
@@ -730,11 +775,23 @@ static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size
     TerminalCanvas_vline(&divider, 0, '|', pen);
     TerminalCanvas right = TerminalCanvas_sub(canvas, width - 1, 1, 1, rows);
     TerminalCanvas_vline(&right, 0, '|', pen);
+    // The four corners. The horizontal runs are the panels' own content (the chips
+    // and the rule texture), so only the corners are left to draw — and the corner
+    // at the rail's border is what closes the left panel's top and bottom edges.
+    uint32_t dividerColumn = (uint32_t) (railWidth - 1);
+    uint32_t lastColumn = (uint32_t) (width - 1);
+    uint32_t lastRow = (uint32_t) (height - 1);
+    TerminalCanvas_glyph(canvas, 0, 0, 0x250Cu, pen);                       // top-left
+    TerminalCanvas_glyph(canvas, dividerColumn, 0, 0x2510u, pen);           // rail's top-right
+    TerminalCanvas_glyph(canvas, lastColumn, 0, 0x2510u, pen);              // top-right
+    TerminalCanvas_glyph(canvas, 0, lastRow, 0x2514u, pen);                 // bottom-left
+    TerminalCanvas_glyph(canvas, dividerColumn, lastRow, 0x2534u, pen);     // the tee the rail makes
+    TerminalCanvas_glyph(canvas, lastColumn, lastRow, 0x2518u, pen);        // bottom-right
 }
 
-// Row 0 is the title, row 1 the tab strip, row 2 the separator, and the last row
-// is the status bar; everything between is editor.
-static size_t editorFirstRow(void) { return 3; }
+// Row 0 is the chrome (title, undo/redo and the tab strip together) and the last
+// row is the status border; everything between is editor.
+static size_t editorFirstRow(void) { return 1; }
 
 static size_t editorRowCount(int height) {
     if (height < (int) (editorFirstRow() + 2u))
@@ -744,6 +801,17 @@ static size_t editorRowCount(int height) {
 
 // The scene owns at most TUI_MAX_ROWS row texts, so a very tall terminal shows
 // the rows it has rather than reaching past them.
+// The code area's columns, derived from the same layout the anchors produce: the
+// centre starts at the rail's border, the gutter takes GUTTER_WIDTH, and the frame's
+// right edge column is never content.
+static size_t codeLeftColumn(size_t railWidth) { return railWidth + GUTTER_WIDTH; }
+
+static size_t codeColumns(size_t railWidth, int width) {
+    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth) + 1u)
+        return 0;
+    return (size_t) width - codeLeftColumn(railWidth) - 1u;
+}
+
 static size_t editorVisibleRows(int height) {
     size_t rows = editorRowCount(height);
     return rows > TUI_MAX_ROWS ? TUI_MAX_ROWS : rows;
@@ -754,15 +822,31 @@ static bool mouseReporting(bool enabled) {
         && fflush(stdout) == 0;
 }
 
-static void scrollBy(size_t *scrollTop, const FileText *file, int delta, size_t visible) {
+// Vertical bound: the last line may sit anywhere down to the last row, and
+// TUI_SCROLL_PAST_BOTTOM lines of empty space follow it, so there is always
+// somewhere below the end to work.
+static size_t maxScrollTop(const FileText *file, size_t visible) {
+    size_t total = file->lineCount + TUI_SCROLL_PAST_BOTTOM;
+    return total > visible ? total - visible : 0;
+}
+
+// Horizontal bound: the longest line may sit anywhere left of the last column, and
+// TUI_SCROLL_PAST_RIGHT columns of empty space follow it.
+static size_t maxScrollLeft(const FileText *file, size_t codeWidth) {
+    size_t total = file->longestCells + TUI_SCROLL_PAST_RIGHT;
+    return total > codeWidth ? total - codeWidth : 0;
+}
+
+static size_t clampScroll(size_t value, size_t maximum) {
+    return value > maximum ? maximum : value;
+}
+
+static size_t applyScroll(size_t value, int delta, size_t maximum) {
     if (delta < 0) {
         size_t amount = (size_t) (-delta);
-        *scrollTop = amount > *scrollTop ? 0 : *scrollTop - amount;
-        return;
+        return amount > value ? 0 : value - amount;
     }
-    size_t maximum = file->lineCount > visible ? file->lineCount - visible : 0;
-    size_t next = *scrollTop + (size_t) delta;
-    *scrollTop = next > maximum ? maximum : next;
+    return clampScroll(value + (size_t) delta, maximum);
 }
 
 ;;TEST
@@ -778,7 +862,7 @@ static int dumpFrame(int width, int height, const FileText *file) {
         fprintf(stderr, "[vex] semicolon: scene construction failed\n");
         return 1;
     }
-    sceneSyncRows(&scene, file, 0, editorVisibleRows(height));
+    sceneSyncRows(&scene, file, 0, 0, editorVisibleRows(height));
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
@@ -831,6 +915,7 @@ static int runTerminal(FileText *file) {
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
     size_t scrollTop = 0;
+    size_t scrollLeft = 0;
     int knownRows = height;
     int knownColumns = width;
     if (!ok)
@@ -862,7 +947,13 @@ static int runTerminal(FileText *file) {
         width = columns;
         height = rows;
         size_t visible = editorVisibleRows(height);
-        if (visible == 0) {
+        size_t codeLeft = codeLeftColumn(scene.railWidth);
+        size_t codeRight = width > 0 ? (size_t) width - 2u : 0;
+        size_t maxTop = maxScrollTop(file, visible);
+        size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, width));
+        scrollTop = clampScroll(scrollTop, maxTop);
+        scrollLeft = clampScroll(scrollLeft, maxLeft);
+        if (visible == 0 || codeRight <= codeLeft) {
             erase();
             mvaddstr(0, 0, "terminal too small");
             refresh();
@@ -899,10 +990,25 @@ static int runTerminal(FileText *file) {
                 size_t divider = scene.railWidth - 1u;
                 switch (event.kind) {
                     case TERMINAL_POINTER_WHEEL_UP:
-                        scrollBy(&scrollTop, file, -(int) TUI_SCROLL_ROWS, visible);
+                    case TERMINAL_POINTER_WHEEL_DOWN: {
+                        bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
+                        // Shift turns a vertical wheel into a horizontal pan, which
+                        // is how a plain mouse can reach the columns at all.
+                        if (event.shift)
+                            scrollLeft = applyScroll(scrollLeft,
+                                                     down ? (int) TUI_SCROLL_COLS : -(int) TUI_SCROLL_COLS,
+                                                     maxLeft);
+                        else
+                            scrollTop = applyScroll(scrollTop,
+                                                    down ? (int) TUI_SCROLL_ROWS : -(int) TUI_SCROLL_ROWS,
+                                                    maxTop);
                         break;
-                    case TERMINAL_POINTER_WHEEL_DOWN:
-                        scrollBy(&scrollTop, file, (int) TUI_SCROLL_ROWS, visible);
+                    }
+                    case TERMINAL_POINTER_WHEEL_LEFT:
+                        scrollLeft = applyScroll(scrollLeft, -(int) TUI_SCROLL_COLS, maxLeft);
+                        break;
+                    case TERMINAL_POINTER_WHEEL_RIGHT:
+                        scrollLeft = applyScroll(scrollLeft, (int) TUI_SCROLL_COLS, maxLeft);
                         break;
                     case TERMINAL_POINTER_PRESS:
                         interaction.pressed = true;
@@ -925,16 +1031,25 @@ static int runTerminal(FileText *file) {
                             long moved = (long) event.x - (long) interaction.grabX;
                             long wanted = (long) interaction.grabWidth + moved;
                             if (wanted >= (long) TUI_RAIL_MIN
-                                && wanted <= (long) columns - (long) TUI_RAIL_MARGIN)
+                                && wanted <= (long) columns - (long) TUI_RAIL_MARGIN) {
                                 sceneSetRailWidth(&scene, (size_t) wanted);
+                                // The code area moved with the rail, so its bounds did.
+                                codeLeft = codeLeftColumn(scene.railWidth);
+                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, columns));
+                                scrollLeft = clampScroll(scrollLeft, maxLeft);
+                            }
                         }
                         // Edge autoscroll belongs to a DRAG, not to hovering: acting
                         // on plain motion made the view scroll whenever the pointer
                         // passed over the first or last editor row.
                         if (event.y == editorFirstRow())
-                            scrollBy(&scrollTop, file, -1, visible);
+                            scrollTop = applyScroll(scrollTop, -1, maxTop);
                         else if (event.y == height - 2u)
-                            scrollBy(&scrollTop, file, 1, visible);
+                            scrollTop = applyScroll(scrollTop, 1, maxTop);
+                        if (event.x <= codeLeft)
+                            scrollLeft = applyScroll(scrollLeft, -1, maxLeft);
+                        else if (event.x >= codeRight)
+                            scrollLeft = applyScroll(scrollLeft, 1, maxLeft);
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
@@ -959,7 +1074,7 @@ static int runTerminal(FileText *file) {
                 break;
             }
         }
-        sceneSyncRows(&scene, file, scrollTop, visible);
+        sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         TerminalPanel_paint(scene.root, &back);
         drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);
         TerminalPresentResult presented = TerminalSurface_present(&surface);
