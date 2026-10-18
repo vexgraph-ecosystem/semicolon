@@ -86,7 +86,7 @@
  *   static void sceneBuild(Scene *, FileText *, size_t)
  *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
  *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
- *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
+ *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll/sliderScroll)
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
@@ -181,6 +181,7 @@ typedef struct Scene {
 typedef struct Interaction {
     TerminalInput input;
     bool grabbing;          // the divider is held
+    bool tracking;          // the bottom editor row's horizontal slider is held
     size_t grabX;           // pointer cell where the grab began
     size_t grabWidth;       // rail width when the grab began
     bool pressed;           // any button is currently down
@@ -897,6 +898,20 @@ static size_t clampScroll(size_t value, size_t maximum) {
     return value > maximum ? maximum : value;
 }
 
+// The tracking line: the bottom editor row is one long horizontal slider. A drag on
+// it maps the pointer's position straight onto the offset, so dragging to either end
+// reaches that end of the document rather than nudging by a step. Clicking there does
+// nothing at all - press and drag are separable gestures, and only the drag pans.
+static size_t sliderScroll(size_t pointerX, size_t left, size_t right, size_t maximum) {
+    if (maximum == 0 || right <= left)
+        return 0;
+    if (pointerX <= left)
+        return 0;
+    if (pointerX >= right)
+        return maximum;
+    return (pointerX - left) * maximum / (right - left);
+}
+
 static size_t applyScroll(size_t value, int delta, size_t maximum) {
     if (delta < 0) {
         size_t amount = (size_t) (-delta);
@@ -1182,6 +1197,12 @@ static int runTerminal(FileText *file) {
                         break;
                     case TERMINAL_POINTER_PRESS:
                         interaction.pressed = true;
+                        // The last editor row is the tracking line, and it wins there:
+                        // the divider is still grabbable on every row above it.
+                        if (event.y == height - 2u) {
+                            interaction.tracking = true;
+                            break;
+                        }
                         // Three cells of tolerance, and the rail follows the pointer
                         // RELATIVE to where the grab began. Resizing to the absolute
                         // pointer cell made the divider jump whenever the grab
@@ -1194,9 +1215,14 @@ static int runTerminal(FileText *file) {
                         break;
                     case TERMINAL_POINTER_RELEASE:
                         interaction.grabbing = false;
+                        interaction.tracking = false;
                         interaction.pressed = false;
                         break;
                     case TERMINAL_POINTER_DRAG: {
+                        if (interaction.tracking) {
+                            scrollLeft = sliderScroll(event.x, codeLeft, codeRight, maxLeft);
+                            break;
+                        }
                         if (interaction.grabbing) {
                             long moved = (long) event.x - (long) interaction.grabX;
                             long wanted = (long) interaction.grabWidth + moved;
@@ -1212,9 +1238,11 @@ static int runTerminal(FileText *file) {
                         // Edge autoscroll belongs to a DRAG, not to hovering: acting
                         // on plain motion made the view scroll whenever the pointer
                         // passed over the first or last editor row.
+                        // The bottom editor row belongs to the tracking line, so the
+                        // vertical edge zone sits one row above it.
                         if (event.y == editorFirstRow())
                             scrollTop = applyScroll(scrollTop, -1, maxTop);
-                        else if (event.y == height - 2u)
+                        else if (event.y == height - 3u)
                             scrollTop = applyScroll(scrollTop, 1, maxTop);
                         if (event.x <= codeLeft)
                             scrollLeft = applyScroll(scrollLeft, -1, maxLeft);

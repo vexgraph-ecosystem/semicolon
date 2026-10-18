@@ -36,8 +36,16 @@ jump** (both the CSI and SS3 cursor-key forms are bound, because terminfo entrie
 often list only one). A wheel-right pans, Shift+wheel pans, and a drag at the code
 area's first or last column pans — but those are conveniences: a horizontal wheel
 is a pair most terminals never send and Shift+wheel is routinely eaten by the
-terminal's own scrollback, so the keys are the path that always exists. The rail
-divider is **draggable**. No panel
+terminal's own scrollback, so the keys are the path that always exists.
+
+**The tracking line** is the answer for a terminal that never reports horizontal
+scrolling — macOS Terminal.app, for one. The bottom editor row is a horizontal
+slider with no drawn chrome: a drag on it maps the pointer straight onto the
+offset, so dragging to an end reaches that end of the line. A *click* there does
+nothing, because press and drag are separable gestures. It needs only drag events,
+which every terminal sends. The vertical edge zone sits one row above it.
+
+The rail divider is **draggable**. No panel
 sets a background, so the terminal's own theme shows through.
 
 Scrolling is free because text is addressable: the editor's rows are created once
