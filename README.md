@@ -18,9 +18,19 @@ Primeagen remains independently buildable R5, never dependent on Semicolon.
 draws the hand-made design on a real terminal, on Determinant's component tree of
 panels and texts, over a **real file**. It reads `vexspoke`'s `oop/type.h` by
 default (`--file PATH` overrides) and shows it in a **scrollable editor** with live
-line numbers. The rail divider is **draggable** and the editor scrolls with the
-wheel and with a one-cell edge autoscroll. No panel sets a background, so the
-terminal's own theme shows through.
+line numbers.
+
+The layout is the compact one: the chrome row carries the rail's top border (brand,
+mode chip, undo/redo) AND the tab strip, so the whole frame costs two rows and the
+editor gets the rest. Real box corners are drawn, with a tee where the rail's
+divider meets the bottom border.
+
+Scrolling is **two-axis**, and both axes scroll *past* the content: 10 empty lines
+follow the last line and 20 empty columns follow the longest one, so there is always
+somewhere to type at the bottom and at the right edge instead of the caret being
+pinned against the frame. A wheel-right pans, Shift+wheel pans, and a drag at the
+code area's first or last column pans. The rail divider is **draggable**. No panel
+sets a background, so the terminal's own theme shows through.
 
 Scrolling is free because text is addressable: the editor's rows are created once
 and re-pointed with `TerminalText_setText`, so no row is allocated, freed or
@@ -76,7 +86,9 @@ Graphvex R3, not a second superapp graphics implementation.
 
 **The terminal shell is a viewer, not an editor.** One real file is read and
 displayed; nothing is written, no tab is switched, no key edits a buffer, and
-there is no syntax highlighting, no build integration and no agent. Resizing
+there is no syntax highlighting, no build integration and no agent. There is no
+caret: the scroll-past padding reserves the space a caret would need, but nothing
+inserts yet. Resizing
 re-lays the whole tree because every rectangle is recomputed from the canvas on
 each paint. There is no hover, no click and no focus: Determinant decodes the
 mouse and can resolve a cell to the child under it, but nothing routes events
