@@ -20,6 +20,15 @@ panels and texts, over a **real file**. It reads `vexspoke`'s `oop/type.h` by
 default (`--file PATH` overrides) and shows it in a **scrollable editor** with live
 line numbers.
 
+**A present is a transaction.** Determinant brackets every frame that carries a
+change — the bracket opens only when there is something to send and closes even if a
+sink refused part-way, so the device is never left inside a half-finished frame. The
+shell maps that onto DEC private mode **2026** (synchronized output), which asks the
+terminal to apply the update as one step, so a divider drag or a resize is never
+caught half-drawn. Terminals that don't know the mode ignore it — and **Terminal.app
+is one of them**, so this is invisible there; kitty, WezTerm, iTerm2, Alacritty and
+Ghostty honour it.
+
 Output is quit with **Ctrl-C** only — there is deliberately no letter shortcut,
 because a keystroke is input and `q` is a legitimate thing to want to type.
 

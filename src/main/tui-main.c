@@ -94,6 +94,7 @@
  *   static void drawChrome(canvas, width, height, size_t railWidth)
  *   static void handlePointer(Scene *, Interaction *, int width, int height)
  *   static int dumpFrame(int, int, FileText *)
+ *   static void frameBracket(void *, TerminalPresentPhase)  the frame transaction
  *   static int runInputProbe(void)   DEBUG: print what the terminal sends
  *   static int runTerminal(FileText *)
  * Entry:
@@ -874,6 +875,28 @@ static bool readMouseSuffix(TerminalInput *input, bool sgr) {
     return false;
 }
 
+// The frame transaction, mapped onto the terminal.
+//
+// DEC private mode 2026 ("synchronized output") asks the device to hold an update and
+// apply it as ONE step, which is the terminal's counterpart of a compositor
+// transaction: a divider drag or a resize repaints a great many cells, and without this
+// the device is free to show the middle of that work. Terminals that do not know the
+// mode ignore it, so this needs no probe and no capability gate.
+static void frameBracket(void *frameContext, TerminalPresentPhase phase) {
+    (void) frameContext;
+    if (phase == TERMINAL_PRESENT_BEGIN) {
+        (void) fputs("\033[?2026h", stdout);
+        (void) fflush(stdout);
+        return;
+    }
+    // The cells are still sitting in ncurses' buffer, so they must be flushed BEFORE
+    // the transaction closes - otherwise the close arrives ahead of the content it is
+    // supposed to bracket, and the bracket means nothing.
+    (void) refresh();
+    (void) fputs("\033[?2026l", stdout);
+    (void) fflush(stdout);
+}
+
 static bool mouseReporting(bool enabled) {
     return fputs(enabled ? "\033[?1003h\033[?1006h" : "\033[?1003l\033[?1006l", stdout) >= 0
         && fflush(stdout) == 0;
@@ -1081,6 +1104,7 @@ static int runTerminal(FileText *file) {
     bool ok = scene.root != nullptr;
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
+    ok = ok && TerminalSurface_setFrame(&surface, frameBracket, nullptr);
     size_t scrollTop = 0;
     size_t scrollLeft = 0;
     int knownRows = height;
@@ -1282,7 +1306,10 @@ static int runTerminal(FileText *file) {
         TerminalPresentResult presented = TerminalSurface_present(&surface);
         if (!presented.ok)
             ok = false;
-        if (ok)
+        // A changed frame was already flushed inside the transaction by the bracket.
+        // A frame that changed nothing produced no transaction at all, so ncurses may
+        // still be holding a resize's clear() - one flush here covers that case.
+        if (ok && !presented.transactional)
             ok = refresh() != ERR;
         if (!ok)
             break;
