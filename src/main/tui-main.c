@@ -86,8 +86,10 @@
  *   static void sceneBuild(Scene *, FileText *, size_t)
  *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
  *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
- *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll/advanceScroll)
- *   static bool scrollPending(const ScrollQueue *)   a scroll is still in flight
+ *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
+ *   static bool glideActive(const ScrollGlide *)   a scroll is still in flight
+ *   static void glideImpulse/glideHalt/glideClamp(const ScrollGlide *, ...)
+ *   static double glideStep(double *shown, double target)   one frame of easing
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
@@ -124,11 +126,14 @@
 // into dozens of notches, so three each was a screen-and-a-half per flick.
 #define TUI_SCROLL_ROWS 1u
 #define TUI_SCROLL_COLS 1u
-// Rows/columns travelled per frame while a scroll is still in flight, and the frame
-// interval that makes that 60fps. Presenting only when input arrives meant a whole
-// swipe landed in one frame - one big jump, and no cadence to feel.
-#define TUI_SCROLL_STEP 1
+// The frame interval that makes the glide 60fps, and the two numbers that give it
+// friction. Each frame covers TUI_SCROLL_EASE of the distance still to travel, so a
+// burst of notches arrives as a decelerating glide and settles; below
+// TUI_SCROLL_EPSILON of remaining distance it snaps, which is what stops the motion
+// instead of leaving it creeping toward a target forever.
 #define TUI_FRAME_MS 16
+#define TUI_SCROLL_EASE 0.18
+#define TUI_SCROLL_EPSILON 0.4
 // Scroll-past padding: how far the view may travel BEYOND the last line and the
 // last column, so there is always somewhere to type at the bottom and at the right
 // edge instead of the caret being pinned against it.
@@ -943,36 +948,72 @@ static size_t applyScroll(size_t value, int delta, size_t maximum) {
     return clampScroll(value + (size_t) delta, maximum);
 }
 
-// A scroll in flight, per axis. Input only ever ADDS to it; the frame loop spends it a
-// step at a time, which is what turns a burst of wheel notches into motion instead of
-// one jump.
+// A scroll with MOMENTUM, per axis: a position (`shown`), where it is heading
+// (`target`), and the easing between them.
 //
-// SLOT RECORD: ScrollQueue
-typedef struct ScrollQueue {
-    long rows;      // signed rows still to travel
-    long columns;   // signed columns still to travel
-} ScrollQueue;
+// A queue that is spent a fixed step at a time is a conveyor belt - it runs at constant
+// speed until it empties, so there is no friction and nothing to stop. This instead
+// covers a fraction of the remaining distance every frame, which decelerates the closer
+// it gets, and `glideHalt` is what a press does: it drops the target onto the position
+// and the motion is over at once.
+//
+// SLOT RECORD: ScrollGlide
+typedef struct ScrollGlide {
+    double rowShown;      // rows currently displayed, fractional
+    double rowTarget;     // rows headed for
+    double columnShown;
+    double columnTarget;
+} ScrollGlide;
 
-static bool scrollPending(const ScrollQueue *queue) {
-    return (*queue).rows != 0 || (*queue).columns != 0;
+static double clampDouble(double value, double minimum, double maximum) {
+    if (value < minimum)
+        return minimum;
+    if (value > maximum)
+        return maximum;
+    return value;
 }
 
-// Spend one step of the pending travel. `pending` is reduced by the distance actually
-// covered, so a bound stops the axis in its tracks instead of leaving it asking forever.
-static size_t advanceScroll(size_t value, long *pending, long step, size_t maximum) {
-    if (*pending == 0 || step <= 0)
-        return value;
-    long want = *pending > 0 ? step : -step;
-    if (*pending > 0 && want > *pending)
-        want = *pending;
-    if (*pending < 0 && want < *pending)
-        want = *pending;
-    size_t next = applyScroll(value, (int) want, maximum);
-    long moved = (long) next - (long) value;
-    *pending -= moved;
-    if (moved == 0)
-        *pending = 0;
-    return next;
+static double glideGap(double shown, double target) {
+    double difference = target - shown;
+    return difference < 0.0 ? -difference : difference;
+}
+
+// Still travelling? Drives the frame cadence: 60fps while true, a long sleep once false,
+// so a settled view costs nothing at all.
+static bool glideActive(const ScrollGlide *glide) {
+    return glideGap((*glide).rowShown, (*glide).rowTarget) >= TUI_SCROLL_EPSILON
+        || glideGap((*glide).columnShown, (*glide).columnTarget) >= TUI_SCROLL_EPSILON;
+}
+
+// Input only ever moves the TARGET. Clamping it here means the glide can never aim past
+// a bound and grind against it.
+static void glideImpulse(ScrollGlide *glide, long rows, long columns,
+                         size_t maxTop, size_t maxLeft) {
+    (*glide).rowTarget = clampDouble((*glide).rowTarget + (double) rows, 0.0, (double) maxTop);
+    (*glide).columnTarget = clampDouble((*glide).columnTarget + (double) columns, 0.0, (double) maxLeft);
+}
+
+// Stop where we are: a press does this, which is why a running scroll can be caught.
+static void glideHalt(ScrollGlide *glide) {
+    (*glide).rowTarget = (*glide).rowShown;
+    (*glide).columnTarget = (*glide).columnShown;
+}
+
+static void glideClamp(ScrollGlide *glide, size_t maxTop, size_t maxLeft) {
+    (*glide).rowTarget = clampDouble((*glide).rowTarget, 0.0, (double) maxTop);
+    (*glide).rowShown = clampDouble((*glide).rowShown, 0.0, (double) maxTop);
+    (*glide).columnTarget = clampDouble((*glide).columnTarget, 0.0, (double) maxLeft);
+    (*glide).columnShown = clampDouble((*glide).columnShown, 0.0, (double) maxLeft);
+}
+
+// Cover TUI_SCROLL_EASE of what is left, and snap once the rest is imperceptible.
+static double glideStep(double *shown, double target) {
+    if (glideGap(*shown, target) < TUI_SCROLL_EPSILON) {
+        *shown = target;
+        return target;
+    }
+    *shown += (target - *shown) * TUI_SCROLL_EASE;
+    return *shown;
 }
 
 ;;TEST
@@ -1135,9 +1176,7 @@ static int runTerminal(FileText *file) {
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
     ok = ok && TerminalSurface_setFrame(&surface, frameBracket, nullptr);
-    size_t scrollTop = 0;
-    size_t scrollLeft = 0;
-    ScrollQueue queue = {0};
+    ScrollGlide glide = {0};
     int knownRows = height;
     int knownColumns = width;
     if (!ok)
@@ -1173,8 +1212,7 @@ static int runTerminal(FileText *file) {
         size_t codeRight = width > 0 ? (size_t) width - 2u : 0;
         size_t maxTop = maxScrollTop(file, visible);
         size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, width));
-        scrollTop = clampScroll(scrollTop, maxTop);
-        scrollLeft = clampScroll(scrollLeft, maxLeft);
+        glideClamp(&glide, maxTop, maxLeft);
         if (visible == 0 || codeRight <= codeLeft) {
             erase();
             mvaddstr(0, 0, "terminal too small");
@@ -1192,7 +1230,7 @@ static int runTerminal(FileText *file) {
         // exposes.
         // 60fps while a scroll is in flight, and a long sleep when nothing is moving.
         // Present-on-demand is preserved: an idle shell still emits nothing at all.
-        timeout(scrollPending(&queue) ? TUI_FRAME_MS : TUI_POLL_MS);
+        timeout(glideActive(&glide) ? TUI_FRAME_MS : TUI_POLL_MS);
         int key = getch();
         timeout(0);
         size_t handled = 0;
@@ -1215,10 +1253,8 @@ static int runTerminal(FileText *file) {
                 // sequence instead of reaching the scroll step below.
 
                 ScrollStep step = scrollStepFor(key);
-                if (step.keyed) {
-                    queue.rows += step.rows;
-                    queue.columns += step.columns;
-                }
+                if (step.keyed)
+                    glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
             }
             if (havePointer) {
                 TerminalPointerEvent event = TerminalInput_getEvent(&interaction.input);
@@ -1230,10 +1266,6 @@ static int runTerminal(FileText *file) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
-                        if (!down)
-                            queue.rows -= (long) TUI_SCROLL_ROWS;
-                        else
-                            queue.rows += (long) TUI_SCROLL_ROWS;
                         // ANY modified wheel pans sideways, because terminals differ
                         // over which modifier they let through: Shift is the one most
                         // often stolen for the terminal's own scrollback, while
@@ -1241,24 +1273,26 @@ static int runTerminal(FileText *file) {
                         // trackpad reaches the columns on whichever modifier the
                         // emulator happens to forward - and a modifier is the user
                         // asking for something other than a plain scroll.
-                        // The modifier decides WHICH axis the notch drives; the ADD
-                        // above already put it on the vertical one, so undo that here
-                        // when the intent was sideways.
-                        bool sideways = event.shift || event.meta || event.ctrl;
-                        if (sideways) {
-                            queue.rows -= down ? (long) TUI_SCROLL_ROWS : -(long) TUI_SCROLL_ROWS;
-                            queue.columns += down ? (long) TUI_SCROLL_COLS : -(long) TUI_SCROLL_COLS;
-                        }
+                        // A modified wheel drives the horizontal axis: terminals differ
+                        // over which modifier they forward, so all three count.
+                        long amount = down ? 1 : -1;
+                        if (event.shift || event.meta || event.ctrl)
+                            glideImpulse(&glide, 0, amount * (long) TUI_SCROLL_COLS, maxTop, maxLeft);
+                        else
+                            glideImpulse(&glide, amount * (long) TUI_SCROLL_ROWS, 0, maxTop, maxLeft);
                         break;
                     }
                     case TERMINAL_POINTER_WHEEL_LEFT:
-                        queue.columns -= (long) TUI_SCROLL_COLS;
+                        glideImpulse(&glide, 0, -(long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         break;
                     case TERMINAL_POINTER_WHEEL_RIGHT:
-                        queue.columns += (long) TUI_SCROLL_COLS;
+                        glideImpulse(&glide, 0, (long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         break;
                     case TERMINAL_POINTER_PRESS:
                         interaction.pressed = true;
+                        // CATCH IT: a press ends any scroll in flight, which is what makes
+                        // momentum safe to have - you can always stop it by touching.
+                        glideHalt(&glide);
                         // The tracking line is the bottom TWO rows: the last editor row
                         // and the frame's bottom border, so the whole floor of the
                         // window is draggable. It wins there; the divider is still
@@ -1266,7 +1300,7 @@ static int runTerminal(FileText *file) {
                         if (event.y + 1u >= (size_t) height - 1u) {
                             interaction.tracking = true;
                             interaction.trackX = event.x;
-                            interaction.trackLeft = scrollLeft;
+                            interaction.trackLeft = (size_t) (glide.columnShown + 0.5);
                             break;
                         }
                         // Three cells of tolerance, and the rail follows the pointer
@@ -1291,9 +1325,11 @@ static int runTerminal(FileText *file) {
                             // wherever the press landed; a drag has to move the content
                             // by as much as the finger moved, so the point under the
                             // finger stays under the finger.
-                            scrollLeft = applyScroll(interaction.trackLeft,
-                                                     (int) event.x - (int) interaction.trackX,
-                                                     maxLeft);
+                            double wanted = (double) applyScroll(interaction.trackLeft,
+                                                                 (int) event.x - (int) interaction.trackX,
+                                                                 maxLeft);
+                            glide.columnShown = wanted;
+                            glide.columnTarget = wanted;
                             break;
                         }
                         if (interaction.grabbing) {
@@ -1305,7 +1341,7 @@ static int runTerminal(FileText *file) {
                                 // The code area moved with the rail, so its bounds did.
                                 codeLeft = codeLeftColumn(scene.railWidth);
                                 maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, columns));
-                                scrollLeft = clampScroll(scrollLeft, maxLeft);
+                                glideClamp(&glide, maxTop, maxLeft);
                             }
                         }
                         // Edge autoscroll belongs to a DRAG, not to hovering: acting
@@ -1314,13 +1350,13 @@ static int runTerminal(FileText *file) {
                         // Both bottom rows belong to the tracking line, so the vertical
                         // edge zone sits two rows above them.
                         if (event.y == editorFirstRow())
-                            queue.rows -= 1;
+                            glideImpulse(&glide, -1, 0, maxTop, maxLeft);
                         else if (event.y == height - 3u)
-                            queue.rows += 1;
+                            glideImpulse(&glide, 1, 0, maxTop, maxLeft);
                         if (event.x <= codeLeft)
-                            queue.columns -= 1;
+                            glideImpulse(&glide, 0, -1, maxTop, maxLeft);
                         else if (event.x >= codeRight)
-                            queue.columns += 1;
+                            glideImpulse(&glide, 0, 1, maxTop, maxLeft);
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
@@ -1345,9 +1381,10 @@ static int runTerminal(FileText *file) {
                 break;
             }
         }
-        // Spend one step of travel this frame.
-        scrollTop = advanceScroll(scrollTop, &queue.rows, TUI_SCROLL_STEP, maxTop);
-        scrollLeft = advanceScroll(scrollLeft, &queue.columns, TUI_SCROLL_STEP, maxLeft);
+        // Cover a fraction of what is left. The position is a whole number of cells, so
+        // the fractional glide is rounded at the moment it is drawn.
+        size_t scrollTop = (size_t) (glideStep(&glide.rowShown, glide.rowTarget) + 0.5);
+        size_t scrollLeft = (size_t) (glideStep(&glide.columnShown, glide.columnTarget) + 0.5);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         TerminalPanel_paint(scene.root, &back);
         drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);

@@ -40,11 +40,13 @@ divider meets the bottom border.
 Scrolling is **two-axis**, and both axes scroll *past* the content: 10 empty lines
 follow the last line and 20 empty columns follow the longest one, so there is always
 somewhere to type at the bottom and at the right edge instead of the caret being
-pinned against the frame. Scrolling is **one line per wheel notch** — a trackpad quantises one gesture into
-dozens of notches, so a larger step jumps. A burst of notches is spent by a small
-scroll queue at about **60fps** while it is in flight, and the shell sleeps the long
-poll once it settles; an idle shell still emits nothing, because a frame that changes
-nothing opens no transaction.
+pinned against the frame. Scrolling is **one line per wheel notch** and carries **momentum**: a burst decelerates
+and settles by itself rather than running at a constant speed until it empties, and a
+**press catches it** — touching anywhere stops the motion, so having momentum is safe.
+It runs at about **60fps** while in flight and sleeps the long poll once it settles; an
+idle shell still emits nothing, because a frame that changes nothing opens no
+transaction. Friction is two named constants (`TUI_SCROLL_EASE`, `TUI_SCROLL_EPSILON`),
+so how much glide it has is a tuning decision rather than a rewrite.
 
 Arrows are the primary input: **←/→ pan, ↑/↓ scroll, PageUp/PageDown page, Home/End
 jump** (both the CSI and SS3 cursor-key forms are bound, because terminfo entries
