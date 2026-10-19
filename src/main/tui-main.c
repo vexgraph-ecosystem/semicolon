@@ -86,7 +86,7 @@
  *   static void sceneBuild(Scene *, FileText *, size_t)
  *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
  *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
- *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll/sliderScroll)
+ *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
@@ -182,7 +182,9 @@ typedef struct Scene {
 typedef struct Interaction {
     TerminalInput input;
     bool grabbing;          // the divider is held
-    bool tracking;          // the bottom editor row's horizontal slider is held
+    bool tracking;          // the bottom editor rows' horizontal slider is held
+    size_t trackX;          // pointer cell where the tracking drag began
+    size_t trackLeft;       // horizontal offset when the tracking drag began
     size_t grabX;           // pointer cell where the grab began
     size_t grabWidth;       // rail width when the grab began
     bool pressed;           // any button is currently down
@@ -925,18 +927,6 @@ static size_t clampScroll(size_t value, size_t maximum) {
 // it maps the pointer's position straight onto the offset, so dragging to either end
 // reaches that end of the document rather than nudging by a step. Clicking there does
 // nothing at all - press and drag are separable gestures, and only the drag pans.
-// Two rows are the handle, so this is deliberately `>=` rather than an equality
-// against one: the last editor row and the status border are the same slider.
-static size_t sliderScroll(size_t pointerX, size_t left, size_t right, size_t maximum) {
-    if (maximum == 0 || right <= left)
-        return 0;
-    if (pointerX <= left)
-        return 0;
-    if (pointerX >= right)
-        return maximum;
-    return (pointerX - left) * maximum / (right - left);
-}
-
 static size_t applyScroll(size_t value, int delta, size_t maximum) {
     if (delta < 0) {
         size_t amount = (size_t) (-delta);
@@ -1229,6 +1219,8 @@ static int runTerminal(FileText *file) {
                         // grabbable on every row above.
                         if (event.y + 1u >= (size_t) height - 1u) {
                             interaction.tracking = true;
+                            interaction.trackX = event.x;
+                            interaction.trackLeft = scrollLeft;
                             break;
                         }
                         // Three cells of tolerance, and the rail follows the pointer
@@ -1248,7 +1240,14 @@ static int runTerminal(FileText *file) {
                         break;
                     case TERMINAL_POINTER_DRAG: {
                         if (interaction.tracking) {
-                            scrollLeft = sliderScroll(event.x, codeLeft, codeRight, maxLeft);
+                            // RELATIVE, by the pointer's own delta. Mapping the absolute
+                            // pointer position onto the offset flung the view to
+                            // wherever the press landed; a drag has to move the content
+                            // by as much as the finger moved, so the point under the
+                            // finger stays under the finger.
+                            scrollLeft = applyScroll(interaction.trackLeft,
+                                                     (int) event.x - (int) interaction.trackX,
+                                                     maxLeft);
                             break;
                         }
                         if (interaction.grabbing) {
