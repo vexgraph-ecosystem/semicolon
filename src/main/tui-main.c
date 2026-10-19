@@ -65,14 +65,16 @@
  *   gQuit         signal-safe shutdown request only.
  *   gCells/gStyles/gFg/gBg          static canvas planes, TUI_MAX_W x TUI_MAX_H.
  *   gFrontCells/...                 static last-paint mirror for the surface diff.
- *   gRule/gSpaces/emptyLine         static textures: the rule run, blank runs.
+ *   gRule/gSpaces/emptyLine         static textures: separators and blank runs.
  *   gGutter[TUI_MAX_ROWS][16]       per-row line-number text buffers.
  *   gLineChip[16]                   the status bar's line-position text buffer.
  *   gPairs[]                        registered ncurses colour pairs.
  * STRUCTS:
  *   FileText  owned file bytes, line table, and the display name.
  *   TuiRow    one editor row: its gutter text and its code text.
- *   Scene     the tree plus the handles the host mutates at runtime.
+ *   Scene     the tree, dynamic line-number field width, and runtime handles.
+ *     root, rail, railId, rows[], rowCount, lineChip, railWidth, numberWidth,
+ *     railRows[], railRowCount, railText[], breadcrumb, activeTab.
  *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
@@ -102,6 +104,7 @@
  *   static void glideImpulse/glideHalt/glideClamp(const ScrollGlide *, ...)
  *   static double glideStep(double *shown, double target)   one frame of easing
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
+ *     codeLeftColumn includes the per-file number field; the period and code gap are fixed.
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static void resolveDeviceBackground(void)   what a fade fades TO
  *   static bool queryDeviceBackground(uint32_t *) / parseDeviceBackground
@@ -150,9 +153,8 @@
 #define TUI_STATE_DIR ".local/state/vexgraph/semicolon"
 #endif
 #define TUI_MAX_FILE_BYTES (4u * 1024u * 1024u)
-#define GUTTER_WIDTH 5u
-// The design puts TWO cells between the gutter's bar and the first code cell, so a row
-// reads as `number |  code` rather than as `number|code`. It is a reserved band in the
+#define GUTTER_MIN_NUMBER_WIDTH 1u
+// The design puts TWO cells between the number field and the first code cell. It is a reserved band in the
 // editor's flow rather than padding copied into every line, which keeps the code text a
 // borrowed pointer into the file instead of a per-frame copy.
 #define TUI_CODE_PAD 2u
@@ -255,6 +257,7 @@ typedef struct Scene {
     size_t rowCount;
     TerminalText *lineChip;
     size_t railWidth;
+    size_t numberWidth;
     // The rail's rows. One Text per VISIBLE row, created once and re-pointed, so folding
     // the tree and scrolling it are both allocation-free - exactly the trick the editor
     // rows use, and the reason the row count is the panel's height rather than the
@@ -483,39 +486,36 @@ static TerminalPanel *buildChromeRow(Scene *scene) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    static const char *labels[] = { ";", ">w< agents", "<-|->" };
-    static const size_t extents[] = { 3, 12, 7 };
-    // The rule texture paints first and reserves nothing, so every chip lands on
-    // top of it and the gaps read as the run between chips.
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
-        TerminalPanel_free(bar);
-        return nullptr;
-    }
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 2))) {
-        TerminalPanel_free(bar);
-        return nullptr;
-    }
-    for (size_t i = 0; i < sizeof labels / sizeof labels[0]; ++i) {
-        TerminalText *label = chip(labels[i]);
-        (void) TerminalText_setForegroundColor(label, i == 0 ? COL_ACCENT : COL_TEXT);
-        if (!putText(bar, label, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, extents[i]))) {
+    // TWO MODES and nothing else: no rule underlay, no dash runs, no undo/redo. The
+    // closed one is dim and the open one carries the shell's one highlight - a tint rather
+    // than a block, so the theme still shows through it.
+    static const char *modes[] = { "(); Code", ">w< agents" };
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
+        TerminalText *mode = chip(modes[i]);
+        (void) TerminalText_setForegroundColor(mode, i == 0 ? COL_ACCENT : COL_MUTED);
+        if (i == 0)
+            (void) TerminalText_setBackgroundColor(mode, COL_SELECT);
+        size_t cells = TerminalText_measure(mode);
+        if (!putText(bar, mode, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, cells))) {
             TerminalPanel_free(bar);
             return nullptr;
         }
-        // The design's runs between the chips: one cell after the brand, then a longer
-        // gap that pushes the last chip flush against the rail's right border.
-        static const size_t rules[] = { 1u, 5u };
-        if (i < 2
-            && !putText(bar, plain(gRule, COL_MUTED),
-                        TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, rules[i]))) {
-            TerminalPanel_free(bar);
-            return nullptr;
+        used += cells;
+        if (i == 0) {
+            if (!putText(bar, plain(" ", COL_TEXT),
+                         TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
+                TerminalPanel_free(bar);
+                return nullptr;
+            }
+            ++used;
         }
     }
-    // The left group reserves the corner's cell too. The frame paints the corner over it,
-    // but reserving it is what starts the tab strip at the centre's first column instead of
-    // on top of the corner, where the strip's own opening bracket would be lost.
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
+    // The tab strip belongs to the CENTRE's columns, so the rest of the rail's width is
+    // reserved here rather than letting the tabs slide under the mode chips.
+    if (used < scene->railWidth
+        && !putText(bar, plain(" ", COL_TEXT),
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->railWidth - used))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
@@ -547,18 +547,10 @@ static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    // The rule underlay runs the full width; the chips and the breadcrumb paint over
-    // it, so the gaps read as the bottom border's run.
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_0())) {
-        TerminalPanel_free(bar);
-        return nullptr;
-    }
-    // Two cells of run between the corner and the breadcrumb, which is what the design
-    // shows - the corner paints over the first of them.
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 3))) {
-        TerminalPanel_free(bar);
-        return nullptr;
-    }
+    // NO RULE and NO DASH RUNS. The footer is the breadcrumb on the left and the chips on
+    // the right, with an otherwise transparent row between them - which is also what keeps
+    // the whole floor of the window draggable without drawing anything to drag.
+
     // The chip BORROWS this string for the life of the tree, so it must outlive
     // this function: a stack buffer here renders as garbage. The crumb describes the file
     // on screen - a header naming a different file is a lie, not a placeholder.
@@ -574,7 +566,7 @@ static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    static const size_t rightExtents[] = { 2, 7, 1, 6, 1, 8, 1, 10 };
+    static const size_t rightExtents[] = { 1, 7, 1, 6, 1, 8, 1, 10 };
     static const char *rightLabels[] = { nullptr, "utf-8", nullptr, "time", nullptr, nullptr, nullptr, "c23/java" };
     for (size_t i = 0; i < sizeof rightExtents / sizeof rightExtents[0]; ++i) {
         TerminalText *child = nullptr;
@@ -794,10 +786,26 @@ static void breadcrumbFor(const char *path, char *out, size_t size) {
     for (const char *source = tail; *source != '\0' && at + 1u < sizeof normalised; ++source)
         normalised[at++] = *source == '/' ? '>' : *source;
     normalised[at] = '\0';
+    // `project > file`: spaced separators, because the crumb is read as words rather than
+    // parsed as a path. The design also shows a trailing `::symbol`; nothing here resolves
+    // a symbol yet, so the crumb stops at the file rather than inventing one.
+    char spaced[512];
+    size_t spacedAt = 0;
+    for (size_t index = 0; normalised[index] != '\0' && spacedAt + 4u < sizeof spaced;
+         ++index) {
+        if (normalised[index] == '>') {
+            spaced[spacedAt++] = ' ';
+            spaced[spacedAt++] = '>';
+            spaced[spacedAt++] = ' ';
+        } else {
+            spaced[spacedAt++] = normalised[index];
+        }
+    }
+    spaced[spacedAt] = '\0';
     if (inside)
-        (void) snprintf(out, size, "%s>%s", rootName, normalised);
+        (void) snprintf(out, size, "%s > %s", rootName, spaced);
     else
-        (void) snprintf(out, size, "…>%s", normalised);
+        (void) snprintf(out, size, "… > %s", spaced);
 }
 
 // Open a file in the editor. The OLD file stays open when the new one cannot be read: a
@@ -995,10 +1003,26 @@ static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width
         out[at++] = ' ';
         out[at++] = ' ';
     }
+    // Disclosure shapes are Unicode in the canvas; blitRun uses ASCII at the narrow-curses
+    // device boundary to avoid locale-dependent glyph loss.
     if (row.folder)
-        (void) snprintf(out + at, size - at, "%c [] %s", row.expanded ? 'v' : '>', row.label);
+        (void) snprintf(out + at, size - at, "%s [] %s", row.expanded ? "⌄" : "›",
+                        row.label);
     else
         (void) snprintf(out + at, size - at, "  %s", row.label);
+    // Truncate on a CELL boundary and say so with one ellipsis: a row that silently loses
+    // its tail cannot be told apart from a row with a shorter name.
+    size_t available = width > 2u ? width - 2u : 0u;
+    size_t length = strlen(out);
+    if (cellsOf(out, length) > available) {
+        size_t keep = available > 1u ? available - 1u : 0u;
+        length = bytesForCells(out, length, keep);
+        if (length + 3u < size) {
+            memcpy(out + length, "…", 3u);
+            length += 3u;
+            out[length] = '\0';
+        }
+    }
 }
 
 // Point every rail row at the tree row it shows. One Text per VISIBLE row is what makes
@@ -1093,7 +1117,7 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     scene->rowCount = rowCount;
     // The action chips are a LAYERED sibling of the rows, so they paint on top of
     // the first editor row without taking a row of their own.
-    if (!putText(actions, plain(" ", COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))
+    if (!putText(actions, plain("  ", COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 2))
         || !putText(actions, chip("20!!, 20!"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 11))
         || !putText(actions, chip("> run"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 8))) {
         TerminalPanel_free(editor);
@@ -1116,7 +1140,8 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     // code's own columns start two cells later and its width is two cells smaller - the
     // scroll bound accounts for exactly that.
     TerminalText *gap = plain("  ", COL_TEXT);
-    if (!putPanel(editor, gutter, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, GUTTER_WIDTH))
+    if (!putPanel(editor, gutter,
+                  TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->numberWidth + 1u))
         || !putText(editor, gap, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CODE_PAD))
         || !putPanel(editor, code, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
@@ -1147,21 +1172,23 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
 // simply reclaimed by exit rather than untangled.
 static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
     *scene = (Scene) {0};
-    scene->railWidth = 31;
+    scene->railWidth = 30;
+    scene->numberWidth = GUTTER_MIN_NUMBER_WIDTH;
+    for (size_t largest = file->lineCount; largest >= 10u; largest /= 10u)
+        ++scene->numberWidth;
     TerminalPanel *title = buildChromeRow(scene);
     TerminalPanel *status = buildStatusBar(scene, file);
     TerminalPanel *rail = buildRail(scene, rowCount);
     TerminalPanel *centre = buildCentre(scene, rowCount);
-    TerminalText *border = plain(gRule, COL_MUTED);
+    TerminalText *border = nullptr;   // borderless: the right edge is not a line
     scene->root = TerminalPanel();
     if (title == nullptr || status == nullptr || rail == nullptr || centre == nullptr
-        || border == nullptr || scene->root == nullptr) {
+        || scene->root == nullptr) {
         TerminalPanel_free(scene->root);
         TerminalPanel_free(title);
         TerminalPanel_free(status);
         TerminalPanel_free(rail);
         TerminalPanel_free(centre);
-        TerminalText_free(border);
         *scene = (Scene) {0};
         return;
     }
@@ -1185,8 +1212,7 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
         *scene = (Scene) {0};
         return;
     }
-    if (!putText(scene->root, border, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))
-        || !putPanel(scene->root, centre, TerminalAnchor_0())) {
+    if (!putPanel(scene->root, centre, TerminalAnchor_0())) {
         TerminalPanel_free(scene->root);
         *scene = (Scene) {0};
         return;
@@ -1208,7 +1234,10 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
             continue;
         }
         size_t line = first + i;
-        int written = snprintf(gGutter[i], sizeof gGutter[i], "%4zu|", line + 1);
+        // Match every number to the largest line number in this file; the period follows
+        // immediately and TUI_CODE_PAD supplies the two-cell gap before code.
+        int written = snprintf(gGutter[i], sizeof gGutter[i], "%*zu.",
+                               (int) scene->numberWidth, line + 1);
         if (written < 0)
             written = 0;
         (void) TerminalText_setText(row->gutter, gGutter[i], (size_t) written);
@@ -1424,6 +1453,12 @@ static bool blitRun(void *context, TerminalRun run) {
     short currentPair = 0;
     for (size_t i = 0; i < run.length; ++i) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
+        // Keep the canvas Unicode; the narrow-curses device boundary uses the
+        // documented one-cell ASCII fallback instead of relying on locale glyph support.
+        if (glyph == 0x2304u)
+            glyph = 'v';
+        else if (glyph == 0x203Au)
+            glyph = '>';
         if (glyph == 0)
             continue;                                  // wide glyph continuation
         uint8_t style = run.styles != nullptr ? run.styles[i] : 0;
@@ -1486,24 +1521,13 @@ static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size
         return;
     size_t rows = height - 2;
     TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_MUTED);
-    TerminalCanvas left = TerminalCanvas_sub(canvas, 0, 1, 1, rows);
-    TerminalCanvas_vline(&left, 0, '|', pen);
+    // BORDERLESS. ONE line survives, and it survives because it is the drag target rather
+    // than decoration: the seam between the rail and the editor. Everything else the frame
+    // used to draw - two full-height verticals, four corners, a tee, and the horizontal
+    // runs - is gone, because decoration in this design is a BACKGROUND (the translucent
+    // highlight), never a glyph.
     TerminalCanvas divider = TerminalCanvas_sub(canvas, railWidth - 1, 1, 1, rows);
     TerminalCanvas_vline(&divider, 0, '|', pen);
-    TerminalCanvas right = TerminalCanvas_sub(canvas, width - 1, 1, 1, rows);
-    TerminalCanvas_vline(&right, 0, '|', pen);
-    // The four corners. The horizontal runs are the panels' own content (the chips
-    // and the rule texture), so only the corners are left to draw — and the corner
-    // at the rail's border is what closes the left panel's top and bottom edges.
-    uint32_t dividerColumn = (uint32_t) (railWidth - 1);
-    uint32_t lastColumn = (uint32_t) (width - 1);
-    uint32_t lastRow = (uint32_t) (height - 1);
-    TerminalCanvas_glyph(canvas, 0, 0, 0x250Cu, pen);                       // top-left
-    TerminalCanvas_glyph(canvas, dividerColumn, 0, 0x2510u, pen);           // rail's top-right
-    TerminalCanvas_glyph(canvas, lastColumn, 0, 0x2510u, pen);              // top-right
-    TerminalCanvas_glyph(canvas, 0, lastRow, 0x2514u, pen);                 // bottom-left
-    TerminalCanvas_glyph(canvas, dividerColumn, lastRow, 0x2534u, pen);     // the tee the rail makes
-    TerminalCanvas_glyph(canvas, lastColumn, lastRow, 0x2518u, pen);        // bottom-right
 }
 
 // Row 0 is the chrome (title, undo/redo and the tab strip together) and the last
@@ -1519,15 +1543,17 @@ static size_t editorRowCount(int height) {
 // The scene owns at most TUI_MAX_ROWS row texts, so a very tall terminal shows
 // the rows it has rather than reaching past them.
 // The code area's columns, derived from the same layout the anchors produce: the
-// centre starts at the rail's border, the gutter takes GUTTER_WIDTH, and the frame's
-// right edge column is never content.
-static size_t codeLeftColumn(size_t railWidth) { return railWidth + GUTTER_WIDTH; }
+// centre starts at the rail seam, the number field follows the file's largest line,
+// and the period and two-cell code gap are reserved before code begins.
+static size_t codeLeftColumn(size_t railWidth, size_t numberWidth) {
+    return railWidth + numberWidth + 1u;
+}
 
-static size_t codeColumns(size_t railWidth, int width) {
-    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth) + 1u + TUI_CODE_PAD)
+static size_t codeColumns(size_t railWidth, size_t numberWidth, int width) {
+    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth, numberWidth) + 1u + TUI_CODE_PAD)
         return 0;
     // The code's own columns, which the gap has already taken two of.
-    return (size_t) width - codeLeftColumn(railWidth) - 1u - TUI_CODE_PAD;
+    return (size_t) width - codeLeftColumn(railWidth, numberWidth) - 1u - TUI_CODE_PAD;
 }
 
 static size_t editorVisibleRows(int height) {
@@ -1987,10 +2013,10 @@ static int runTerminal(FileText *file) {
         width = columns;
         height = rows;
         size_t visible = editorVisibleRows(height);
-        size_t codeLeft = codeLeftColumn(scene.railWidth);
+        size_t codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
         size_t codeRight = width > 0 ? (size_t) width - 2u : 0;
         size_t maxTop = maxScrollTop(file, visible);
-        size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, width));
+        size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, scene.numberWidth, width));
         glideClamp(&glide, maxTop, maxLeft);
         if (visible == 0 || codeRight <= codeLeft) {
             erase();
@@ -2131,8 +2157,10 @@ static int runTerminal(FileText *file) {
                                 && wanted <= (long) columns - (long) TUI_RAIL_MARGIN) {
                                 sceneSetRailWidth(&scene, (size_t) wanted);
                                 // The code area moved with the rail, so its bounds did.
-                                codeLeft = codeLeftColumn(scene.railWidth);
-                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, columns));
+                                codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                         scene.numberWidth,
+                                                                         columns));
                                 glideClamp(&glide, maxTop, maxLeft);
                             }
                         }
