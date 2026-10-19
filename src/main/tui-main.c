@@ -86,7 +86,8 @@
  *   static void sceneBuild(Scene *, FileText *, size_t)
  *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
  *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
- *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
+ *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll/advanceScroll)
+ *   static bool scrollPending(const ScrollQueue *)   a scroll is still in flight
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
@@ -119,8 +120,15 @@
 #define TUI_POLL_MS 100
 #define TUI_RAIL_MIN 12u
 #define TUI_RAIL_MARGIN 24u
-#define TUI_SCROLL_ROWS 3u
-#define TUI_SCROLL_COLS 4u
+// One wheel notch asks for ONE line, not three. A trackpad quantises a single gesture
+// into dozens of notches, so three each was a screen-and-a-half per flick.
+#define TUI_SCROLL_ROWS 1u
+#define TUI_SCROLL_COLS 1u
+// Rows/columns travelled per frame while a scroll is still in flight, and the frame
+// interval that makes that 60fps. Presenting only when input arrives meant a whole
+// swipe landed in one frame - one big jump, and no cadence to feel.
+#define TUI_SCROLL_STEP 1
+#define TUI_FRAME_MS 16
 // Scroll-past padding: how far the view may travel BEYOND the last line and the
 // last column, so there is always somewhere to type at the bottom and at the right
 // edge instead of the caret being pinned against it.
@@ -935,6 +943,38 @@ static size_t applyScroll(size_t value, int delta, size_t maximum) {
     return clampScroll(value + (size_t) delta, maximum);
 }
 
+// A scroll in flight, per axis. Input only ever ADDS to it; the frame loop spends it a
+// step at a time, which is what turns a burst of wheel notches into motion instead of
+// one jump.
+//
+// SLOT RECORD: ScrollQueue
+typedef struct ScrollQueue {
+    long rows;      // signed rows still to travel
+    long columns;   // signed columns still to travel
+} ScrollQueue;
+
+static bool scrollPending(const ScrollQueue *queue) {
+    return (*queue).rows != 0 || (*queue).columns != 0;
+}
+
+// Spend one step of the pending travel. `pending` is reduced by the distance actually
+// covered, so a bound stops the axis in its tracks instead of leaving it asking forever.
+static size_t advanceScroll(size_t value, long *pending, long step, size_t maximum) {
+    if (*pending == 0 || step <= 0)
+        return value;
+    long want = *pending > 0 ? step : -step;
+    if (*pending > 0 && want > *pending)
+        want = *pending;
+    if (*pending < 0 && want < *pending)
+        want = *pending;
+    size_t next = applyScroll(value, (int) want, maximum);
+    long moved = (long) next - (long) value;
+    *pending -= moved;
+    if (moved == 0)
+        *pending = 0;
+    return next;
+}
+
 ;;TEST
 static int dumpFrame(int width, int height, const FileText *file) {
     if (width < 1 || height < 1 || width > TUI_MAX_W || height > TUI_MAX_H) {
@@ -1097,6 +1137,7 @@ static int runTerminal(FileText *file) {
     ok = ok && TerminalSurface_setFrame(&surface, frameBracket, nullptr);
     size_t scrollTop = 0;
     size_t scrollLeft = 0;
+    ScrollQueue queue = {0};
     int knownRows = height;
     int knownColumns = width;
     if (!ok)
@@ -1149,7 +1190,9 @@ static int runTerminal(FileText *file) {
         // with a timeout still set, the read that finds the buffer empty would
         // stall the paint by the whole timeout, which is exactly the lag a drag
         // exposes.
-        timeout(TUI_POLL_MS);
+        // 60fps while a scroll is in flight, and a long sleep when nothing is moving.
+        // Present-on-demand is preserved: an idle shell still emits nothing at all.
+        timeout(scrollPending(&queue) ? TUI_FRAME_MS : TUI_POLL_MS);
         int key = getch();
         timeout(0);
         size_t handled = 0;
@@ -1173,8 +1216,8 @@ static int runTerminal(FileText *file) {
 
                 ScrollStep step = scrollStepFor(key);
                 if (step.keyed) {
-                    scrollTop = applyScroll(scrollTop, step.rows, maxTop);
-                    scrollLeft = applyScroll(scrollLeft, step.columns, maxLeft);
+                    queue.rows += step.rows;
+                    queue.columns += step.columns;
                 }
             }
             if (havePointer) {
@@ -1187,6 +1230,10 @@ static int runTerminal(FileText *file) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
+                        if (!down)
+                            queue.rows -= (long) TUI_SCROLL_ROWS;
+                        else
+                            queue.rows += (long) TUI_SCROLL_ROWS;
                         // ANY modified wheel pans sideways, because terminals differ
                         // over which modifier they let through: Shift is the one most
                         // often stolen for the terminal's own scrollback, while
@@ -1194,22 +1241,21 @@ static int runTerminal(FileText *file) {
                         // trackpad reaches the columns on whichever modifier the
                         // emulator happens to forward - and a modifier is the user
                         // asking for something other than a plain scroll.
+                        // The modifier decides WHICH axis the notch drives; the ADD
+                        // above already put it on the vertical one, so undo that here
+                        // when the intent was sideways.
                         bool sideways = event.shift || event.meta || event.ctrl;
-                        if (sideways)
-                            scrollLeft = applyScroll(scrollLeft,
-                                                     down ? (int) TUI_SCROLL_COLS : -(int) TUI_SCROLL_COLS,
-                                                     maxLeft);
-                        else
-                            scrollTop = applyScroll(scrollTop,
-                                                    down ? (int) TUI_SCROLL_ROWS : -(int) TUI_SCROLL_ROWS,
-                                                    maxTop);
+                        if (sideways) {
+                            queue.rows -= down ? (long) TUI_SCROLL_ROWS : -(long) TUI_SCROLL_ROWS;
+                            queue.columns += down ? (long) TUI_SCROLL_COLS : -(long) TUI_SCROLL_COLS;
+                        }
                         break;
                     }
                     case TERMINAL_POINTER_WHEEL_LEFT:
-                        scrollLeft = applyScroll(scrollLeft, -(int) TUI_SCROLL_COLS, maxLeft);
+                        queue.columns -= (long) TUI_SCROLL_COLS;
                         break;
                     case TERMINAL_POINTER_WHEEL_RIGHT:
-                        scrollLeft = applyScroll(scrollLeft, (int) TUI_SCROLL_COLS, maxLeft);
+                        queue.columns += (long) TUI_SCROLL_COLS;
                         break;
                     case TERMINAL_POINTER_PRESS:
                         interaction.pressed = true;
@@ -1268,13 +1314,13 @@ static int runTerminal(FileText *file) {
                         // Both bottom rows belong to the tracking line, so the vertical
                         // edge zone sits two rows above them.
                         if (event.y == editorFirstRow())
-                            scrollTop = applyScroll(scrollTop, -1, maxTop);
+                            queue.rows -= 1;
                         else if (event.y == height - 3u)
-                            scrollTop = applyScroll(scrollTop, 1, maxTop);
+                            queue.rows += 1;
                         if (event.x <= codeLeft)
-                            scrollLeft = applyScroll(scrollLeft, -1, maxLeft);
+                            queue.columns -= 1;
                         else if (event.x >= codeRight)
-                            scrollLeft = applyScroll(scrollLeft, 1, maxLeft);
+                            queue.columns += 1;
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
@@ -1299,6 +1345,9 @@ static int runTerminal(FileText *file) {
                 break;
             }
         }
+        // Spend one step of travel this frame.
+        scrollTop = advanceScroll(scrollTop, &queue.rows, TUI_SCROLL_STEP, maxTop);
+        scrollLeft = advanceScroll(scrollLeft, &queue.columns, TUI_SCROLL_STEP, maxLeft);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         TerminalPanel_paint(scene.root, &back);
         drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);
