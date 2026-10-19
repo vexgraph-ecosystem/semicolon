@@ -36,11 +36,13 @@ Output is quit with **Ctrl-C** only — there is deliberately no letter shortcut
 because a keystroke is input and `q` is a legitimate thing to want to type.
 
 The layout is now borderless: the header carries `[(); Code]` and `[>w< agents]`
-on the left and the tab strip starts at the rail seam. The seam is the only drawn
-vertical line; it remains the divider and drag target. The footer keeps the file
+on the left and the tab strip starts at the rail seam. The seam/divider is invisible
+at rest and appears only while the pointer hovers its drag target. The footer keeps the file
 breadcrumb and right-side status chips without a dashed rule. Disclosure shapes
-remain Unicode in the canvas and use `v`/`>` at the narrow-curses device boundary
-to avoid locale-dependent glyph loss.
+remain Unicode from the canvas through ncurses' wide-character API; the host selects
+the environment's character locale before initializing curses. The macOS system
+ncurses wide API links through `-lncurses`; Linux uses `-lncursesw`. Editor rows use
+two leading spaces, a right-aligned line number and period, then two spaces before code.
 
 Editor line numbers are right-aligned to the width of the file's largest line
 number, with a period directly after that field and two cells before the code.
@@ -117,7 +119,8 @@ Also present: `build.py` (explicit, strict, no fetch and no program run), the
 `semicolon` launcher, and `install-command.sh` for a per-user command link.
 
 The rail seam is drawn by the shell with the canvas primitive, because the toolkit
-has no vertical-rule widget yet. There are no decorative outer edges.
+has no vertical-rule widget yet. It stays invisible until hovered. There are no
+decorative outer edges.
 
 `semicolon --input-probe` is a diagnostic: it prints the mouse and key events the
 terminal actually sends, so whether a trackpad reports a horizontal wheel (buttons
