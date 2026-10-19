@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE_EXTENDED 1
 #include "terminal/terminal_panel.h"
 #include "terminal/terminal_text.h"
 #include "terminal/terminal_anchor.h"
@@ -13,6 +14,7 @@
 #include "annotation/test.h"
 #include "annotation/debug.h"
 #include <locale.h>
+#include <wchar.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -104,13 +106,13 @@
  *   static void glideImpulse/glideHalt/glideClamp(const ScrollGlide *, ...)
  *   static double glideStep(double *shown, double target)   one frame of easing
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
- *     codeLeftColumn includes the per-file number field; the period and code gap are fixed.
+  *     codeLeftColumn includes the two-cell leading and trailing number gaps.
  *   static void sceneSetRailWidth(Scene *, size_t width)
  *   static void resolveDeviceBackground(void)   what a fade fades TO
  *   static bool queryDeviceBackground(uint32_t *) / parseDeviceBackground
  *   static bool parsePackedHex(const char *, uint32_t *)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
- *   static bool blitRun(void *, TerminalRun)
+ *   static bool blitRun(void *, TerminalRun)   wide-character ncurses output
  *   static void drawChrome(canvas, width, height, size_t railWidth)
  *   static void handlePointer(Scene *, Interaction *, int width, int height)
  *   static int dumpFrame(int, int, FileText *)
@@ -122,7 +124,9 @@
  *   int main(int, char **)   --help / --dump [WxH] / --file PATH / interactive.
  * Contracts:
  *   The interactive path REQUIRES a tty on stdin and stdout and refuses before
- *   ncurses otherwise. Ctrl-C is the ONLY quit key - a letter key must not quit,
+ *   ncurses otherwise. It selects the environment's LC_CTYPE before newterm and
+ *   sends canvas cells through ncurses' wide-character API. Ctrl-C is the ONLY
+ *   quit key - a letter key must not quit,
  *   because the terminal is a text editor and letters are text; the terminal is
  *   restored on every normal exit and on SIGINT/SIGTERM (SIGKILL or a crash
  *   cannot promise that).
@@ -1003,8 +1007,7 @@ static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width
         out[at++] = ' ';
         out[at++] = ' ';
     }
-    // Disclosure shapes are Unicode in the canvas; blitRun uses ASCII at the narrow-curses
-    // device boundary to avoid locale-dependent glyph loss.
+    // Disclosure shapes stay Unicode through the wide-character curses device boundary.
     if (row.folder)
         (void) snprintf(out + at, size - at, "%s [] %s", row.expanded ? "⌄" : "›",
                         row.label);
@@ -1136,12 +1139,12 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     }
     (void) TerminalPanel_setLayout(code, TERMINAL_PANEL_LAYERED);
     // The run chip sits left of the diagnostics chip in the same row.
-    // The gutter, then the design's gap, then the code. The gap is a RESERVED band, so the
-    // code's own columns start two cells later and its width is two cells smaller - the
-    // scroll bound accounts for exactly that.
+    // The gutter is two spaces, a right-aligned per-file number, and a period; the reserved
+    // two-cell gap after it keeps code aligned without rendering a divider at rest.
     TerminalText *gap = plain("  ", COL_TEXT);
     if (!putPanel(editor, gutter,
-                  TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->numberWidth + 1u))
+                  TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                   scene->numberWidth + 2u + 1u))
         || !putText(editor, gap, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CODE_PAD))
         || !putPanel(editor, code, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
@@ -1234,9 +1237,9 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
             continue;
         }
         size_t line = first + i;
-        // Match every number to the largest line number in this file; the period follows
-        // immediately and TUI_CODE_PAD supplies the two-cell gap before code.
-        int written = snprintf(gGutter[i], sizeof gGutter[i], "%*zu.",
+        // Match every number to the largest line number in this file. Two leading spaces
+        // follow the invisible rail seam; the period is adjacent to the number.
+        int written = snprintf(gGutter[i], sizeof gGutter[i], "  %*zu.",
                                (int) scene->numberWidth, line + 1);
         if (written < 0)
             written = 0;
@@ -1453,12 +1456,6 @@ static bool blitRun(void *context, TerminalRun run) {
     short currentPair = 0;
     for (size_t i = 0; i < run.length; ++i) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
-        // Keep the canvas Unicode; the narrow-curses device boundary uses the
-        // documented one-cell ASCII fallback instead of relying on locale glyph support.
-        if (glyph == 0x2304u)
-            glyph = 'v';
-        else if (glyph == 0x203Au)
-            glyph = '>';
         if (glyph == 0)
             continue;                                  // wide glyph continuation
         uint8_t style = run.styles != nullptr ? run.styles[i] : 0;
@@ -1490,25 +1487,23 @@ static bool blitRun(void *context, TerminalRun run) {
             currentPair = pair;
             haveAttrs = true;
         }
-        char encoded[8];
-        size_t bytes = 0;
-        if (glyph < 0x80u) {
-            encoded[bytes++] = (char) glyph;
-        } else if (glyph < 0x800u) {
-            encoded[bytes++] = (char) (0xC0u | (glyph >> 6));
-            encoded[bytes++] = (char) (0x80u | (glyph & 0x3Fu));
-        } else if (glyph < 0x10000u) {
-            encoded[bytes++] = (char) (0xE0u | (glyph >> 12));
-            encoded[bytes++] = (char) (0x80u | ((glyph >> 6) & 0x3Fu));
-            encoded[bytes++] = (char) (0x80u | (glyph & 0x3Fu));
-        } else {
-            encoded[bytes++] = (char) (0xF0u | (glyph >> 18));
-            encoded[bytes++] = (char) (0x80u | ((glyph >> 12) & 0x3Fu));
-            encoded[bytes++] = (char) (0x80u | ((glyph >> 6) & 0x3Fu));
-            encoded[bytes++] = (char) (0x80u | (glyph & 0x3Fu));
+        if (glyph > (uint32_t) WCHAR_MAX || (glyph >= 0xD800u && glyph <= 0xDFFFu))
+            glyph = '?';
+        wchar_t characters[CCHARW_MAX] = { (wchar_t) glyph, L'\0' };
+        cchar_t cell;
+        bool validCell = setcchar(&cell, characters, attrs, pair, nullptr) != ERR;
+        if (!validCell) {
+            characters[0] = L'?';
+            validCell = setcchar(&cell, characters, attrs, pair, nullptr) != ERR;
         }
-        encoded[bytes] = '\0';
-        mvwaddstr(stdscr, (int) run.y, (int) (run.x + i), encoded);
+        // ncurses reports ERR after drawing the terminal's bottom-right cell because
+        // advancing beyond that cell is impossible. The canvas run is still delivered.
+        int result = validCell
+                   ? mvwadd_wch(stdscr, (int) run.y, (int) (run.x + i), &cell)
+                   : ERR;
+        if (result == ERR && (glyph == 0x2304u || glyph == 0x203Au))
+            (void) mvwaddch(stdscr, (int) run.y, (int) (run.x + i),
+                            glyph == 0x2304u ? 'v' : '>');
     }
     return true;
 }
@@ -1516,16 +1511,15 @@ static bool blitRun(void *context, TerminalRun run) {
 // The chrome the toolkit has no widget for yet: the rail's two verticals and the
 // panel's right edge, drawn over the painted tree. The divider moves with the
 // rail, which is why it takes the width rather than a constant.
-static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size_t railWidth) {
+static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size_t railWidth,
+                       bool dividerHovered) {
     if (height < 3 || width < 4)
+        return;
+    if (!dividerHovered)
         return;
     size_t rows = height - 2;
     TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_MUTED);
-    // BORDERLESS. ONE line survives, and it survives because it is the drag target rather
-    // than decoration: the seam between the rail and the editor. Everything else the frame
-    // used to draw - two full-height verticals, four corners, a tee, and the horizontal
-    // runs - is gone, because decoration in this design is a BACKGROUND (the translucent
-    // highlight), never a glyph.
+    // The seam is invisible at rest; hovering its drag target reveals the divider.
     TerminalCanvas divider = TerminalCanvas_sub(canvas, railWidth - 1, 1, 1, rows);
     TerminalCanvas_vline(&divider, 0, '|', pen);
 }
@@ -1546,14 +1540,13 @@ static size_t editorRowCount(int height) {
 // centre starts at the rail seam, the number field follows the file's largest line,
 // and the period and two-cell code gap are reserved before code begins.
 static size_t codeLeftColumn(size_t railWidth, size_t numberWidth) {
-    return railWidth + numberWidth + 1u;
+    return railWidth + numberWidth + 2u + 1u + TUI_CODE_PAD;
 }
 
 static size_t codeColumns(size_t railWidth, size_t numberWidth, int width) {
-    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth, numberWidth) + 1u + TUI_CODE_PAD)
+    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth, numberWidth))
         return 0;
-    // The code's own columns, which the gap has already taken two of.
-    return (size_t) width - codeLeftColumn(railWidth, numberWidth) - 1u - TUI_CODE_PAD;
+    return (size_t) width - codeLeftColumn(railWidth, numberWidth);
 }
 
 static size_t editorVisibleRows(int height) {
@@ -1792,7 +1785,7 @@ static int dumpFrame(int width, int height, const FileText *file) {
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
-    drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth);
+    drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth, false);
     for (int y = 0; y < height; ++y) {
         TerminalCanvasTextRow row = TerminalCanvas_copyRow(&canvas, (size_t) y);
         fwrite(row.data, 1, row.bytes, stdout);
@@ -1809,6 +1802,10 @@ static int dumpFrame(int width, int height, const FileText *file) {
 static int runInputProbe(void) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         THROW("semicolon --input-probe requires a terminal");
+        return 1;
+    }
+    if (setlocale(LC_CTYPE, "") == nullptr) {
+        THROW("semicolon: cannot select the environment character locale");
         return 1;
     }
     SCREEN *screen = newterm(nullptr, stdout, stdin);
@@ -1911,12 +1908,15 @@ static int runTerminal(FileText *file) {
         THROW("semicolon requires terminal stdin and stdout (use --dump for a plain render)");
         return 1;
     }
+    if (setlocale(LC_CTYPE, "") == nullptr) {
+        THROW("semicolon: cannot select the environment character locale");
+        return 1;
+    }
     SCREEN *screen = newterm(nullptr, stdout, stdin);
     if (screen == nullptr) {
         THROW("semicolon: terminal initialization failed");
         return 1;
     }
-    (void) setlocale(LC_CTYPE, "");
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -2180,7 +2180,7 @@ static int runTerminal(FileText *file) {
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
-                        break;   // hover is reported and deliberately does nothing yet
+                        break;
                     default:
                         break;
                 }
@@ -2217,7 +2217,12 @@ static int runTerminal(FileText *file) {
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         sceneSyncRail(&scene, visible);
         TerminalPanel_paint(scene.root, &back);
-        drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);
+        size_t divider = scene.railWidth - 1u;
+        bool dividerHovered = interaction.havePointer
+                           && interaction.pointerX + 1u >= divider
+                           && interaction.pointerX <= divider + 1u;
+        drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth,
+                   dividerHovered);
         TerminalPresentResult presented = TerminalSurface_present(&surface);
         if (!presented.ok)
             ok = false;
