@@ -64,8 +64,26 @@ nothing, because press and drag are separable gestures, so passing the pointer
 across the border never disturbs the view. It needs only drag events, which every
 terminal sends. The vertical edge zone sits two rows above it.
 
-The rail divider is **draggable**. No panel
-sets a background, so the terminal's own theme shows through.
+The rail divider is **draggable**.
+
+Colour carries **real alpha**, which is what makes a fade possible. A terminal has no
+alpha channel — `SGR` sets *one* colour — so a translucent pen is composited by the
+shell before the device sees it: the background plane over the terminal's own
+background, and then the ink over that. Two consequences worth knowing:
+
+- **One colour, any theme.** The gutter is a single translucent value, so it recedes on
+  a dark theme *and* on a light one — it lands around `#5F5F6B` on black and `#D6D6DC`
+  on white. Fully opaque artwork is passed through untouched, so nothing that was
+  already opaque changed.
+- **The shell must still be told the theme**, because a fade has to be composited
+  *against* something. It asks the terminal (OSC 11) and falls back if there is no
+  answer; `SEMICOLON_BG=#RRGGBB` overrides it, and `semicolon --bg-probe` prints what it
+  found and where it came from.
+
+The design's one **highlight** is the open tab, and it is a tint rather than a block —
+22% of the accent over whatever the theme paints, so it reads as "this one" without
+covering the design up. Everything else stays transparent: a full repaint emits exactly
+one background colour across the whole frame.
 
 Scrolling is free because text is addressable: the editor's rows are created once
 and re-pointed with `TerminalText_setText`, so no row is allocated, freed or
