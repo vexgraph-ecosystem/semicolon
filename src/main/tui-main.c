@@ -92,6 +92,9 @@
  *   static double glideStep(double *shown, double target)   one frame of easing
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
  *   static void sceneSetRailWidth(Scene *, size_t width)
+ *   static void resolveDeviceBackground(void)   what a fade fades TO
+ *   static bool queryDeviceBackground(uint32_t *) / parseDeviceBackground
+ *   static bool parsePackedHex(const char *, uint32_t *)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
  *   static bool blitRun(void *, TerminalRun)
  *   static void drawChrome(canvas, width, height, size_t railWidth)
@@ -99,19 +102,27 @@
  *   static int dumpFrame(int, int, FileText *)
  *   static void frameBracket(void *, TerminalPresentPhase)  the frame transaction
  *   static int runInputProbe(void)   DEBUG: print what the terminal sends
+ *   static int runBackgroundProbe(void)   DEBUG: what is this terminal's background?
  *   static int runTerminal(FileText *)
  * Entry:
  *   int main(int, char **)   --help / --dump [WxH] / --file PATH / interactive.
  * Contracts:
  *   The interactive path REQUIRES a tty on stdin and stdout and refuses before
- *   ncurses otherwise. Ctrl-Q or q quits; the terminal is restored on every
- *   normal exit and on SIGINT/SIGTERM (SIGKILL or a crash cannot promise that).
+ *   ncurses otherwise. Ctrl-C is the ONLY quit key - a letter key must not quit,
+ *   because the terminal is a text editor and letters are text; the terminal is
+ *   restored on every normal exit and on SIGINT/SIGTERM (SIGKILL or a crash
+ *   cannot promise that).
  *   Mouse reporting is enabled for ANY-MOTION plus SGR encoding, so hover and
  *   drag both arrive; it is disabled again on exit, which hands the mouse back to
  *   the terminal's own selection. Wheel scrolls three lines, a pointer resting on
  *   the top or bottom editor row scrolls one line per motion event, and a press
  *   within one cell of the divider begins a drag that resizes the rail. No file
  *   is written, no network is touched and no program is executed.
+ *   Colour carries REAL alpha: a translucent pen is composited over its cell's
+ *   background, and that in turn over the device background, before the device is
+ *   handed anything - a terminal has no alpha channel, so this is the only place a
+ *   fade can happen. The device background is resolved at startup and is what a
+ *   fade actually fades toward; fully opaque artwork passes through untouched.
  * ============================================================================ */
 
 #define TUI_MAX_W 400
@@ -147,7 +158,30 @@
 #define COL_MUTED  TERMINAL_RGB(0x77, 0x77, 0x88)
 #define COL_ACCENT TERMINAL_RGB(0x7A, 0xC8, 0xFF)
 #define COL_ERROR  TERMINAL_RGB(0xFF, 0x6B, 0x6B)
-#define COL_GUTTER TERMINAL_RGB(0x55, 0x55, 0x66)
+// FADED, not merely dark. A translucent colour lands between itself and whatever is
+// behind it, so the gutter recedes on a dark theme and on a light one from ONE value
+// instead of two. Alpha 0 is the unset sentinel (inherit), so a fade keeps a non-zero
+// alpha - there is deliberately no such thing here as "fully transparent".
+#define COL_GUTTER TERMINAL_RGBA(0xAA, 0xAA, 0xC4, 0x7A)
+// The shell's one HIGHLIGHT, and it is a tint rather than a block: at 22% the accent
+// reads as "this one" over any theme's own background instead of covering it up.
+#define COL_SELECT TERMINAL_RGBA(0x7A, 0xC8, 0xFF, 0x38)
+// Which tab is the open one. The design lights exactly one tab; naming it keeps that
+// from being a bare literal in a loop.
+#define TUI_ACTIVE_TAB 3u
+
+// The terminal's OWN background: what shows through every transparent cell, and so what
+// a translucent colour is composited against. Resolved at startup (resolveDeviceBackground)
+// and this is only the last resort, for a terminal that neither declares nor answers.
+// It only ever affects TRANSLUCENT colours - opaque artwork is identical either way.
+#define TUI_DEVICE_BG_FALLBACK TERMINAL_RGB(0x1A, 0x1A, 0x1A)
+// How long the device background query waits, and how much of the answer is kept. A
+// terminal that answers does so in a millisecond or two; one that ignores the query
+// never answers at all, so this window is the whole cost of asking.
+#define TUI_PROBE_MS 120
+#define TUI_PROBE_BYTES 64
+static uint32_t gDeviceBg = TUI_DEVICE_BG_FALLBACK;
+static const char *gDeviceBgSource = "the built-in fallback";
 
 static volatile sig_atomic_t gQuit;
 static uint32_t gCells[TUI_MAX_W * TUI_MAX_H];
@@ -418,7 +452,10 @@ static TerminalPanel *buildChromeRow(void) {
     static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
         TerminalText *tab = chip(tabLabels[i]);
-        (void) TerminalText_setForegroundColor(tab, i == 3 ? COL_TEXT : COL_MUTED);
+        bool open = i == TUI_ACTIVE_TAB;
+        (void) TerminalText_setForegroundColor(tab, open ? COL_TEXT : COL_MUTED);
+        if (open)
+            (void) TerminalText_setBackgroundColor(tab, COL_SELECT);
         if (!putText(bar, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
                                                 TerminalText_measure(tab)))) {
             TerminalPanel_free(bar);
@@ -685,6 +722,124 @@ typedef struct TermPair {
 static TermPair gPairs[TUI_PAIR_MAX];
 static size_t gPairCount;
 
+static int hexDigitValue(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+// SEMICOLON_BG is written the way the rest of the ecosystem writes colours: #RRGGBB
+// (opaque) or #RRGGBBAA. Anything else is refused rather than guessed at, because a
+// silently mis-parsed background would fade every colour in the shell toward a value
+// that was never asked for.
+static bool parsePackedHex(const char *text, uint32_t *color) {
+    if (text == nullptr)
+        return false;
+    if (*text == '#')
+        ++text;
+    else if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+        text += 2;
+    uint32_t value = 0u;
+    size_t digits = 0;
+    while (digits < 8u) {
+        int digit = hexDigitValue(text[digits]);
+        if (digit < 0)
+            break;
+        value = value * 16u + (uint32_t) digit;
+        ++digits;
+    }
+    if ((digits != 6u && digits != 8u) || text[digits] != '\0')
+        return false;
+    *color = digits == 6u ? ((value << 8) | 0xFFu) : value;
+    return true;
+}
+
+// The device answers the OSC 11 query with an X11 colour: `rgb:RRRR/GGGG/BBBB` (16 bits
+// per channel) or the short `rgb:RR/GG/BB`. Both scale to the same high Byte, so only
+// the first two hex digits of each component are read and the two forms need no special
+// case. The reply is scanned rather than indexed because the framing around it varies
+// (BEL or ST, with or without an ESC that ncurses has already consumed).
+static bool parseDeviceBackground(const char *text, size_t length, uint32_t *color) {
+    size_t at = 0;
+    while (at + 4u <= length
+           && !(text[at] == 'r' && text[at + 1] == 'g' && text[at + 2] == 'b' && text[at + 3] == ':'))
+        ++at;
+    if (at + 4u > length)
+        return false;
+    at += 4u;
+    uint32_t channels[3] = { 0u, 0u, 0u };
+    for (size_t channel = 0; channel < 3u; ++channel) {
+        int high = -1;
+        int low = -1;
+        size_t digits = 0;
+        while (at < length && digits < 4u) {
+            int value = hexDigitValue(text[at]);
+            if (value < 0)
+                break;
+            if (digits == 0u)
+                high = value;
+            else if (digits == 1u)
+                low = value;
+            ++digits;
+            ++at;
+        }
+        if (digits < 2u)
+            return false;
+        channels[channel] = (uint32_t) (high * 16 + low);
+        if (at < length && text[at] == '/')
+            ++at;
+    }
+    *color = TERMINAL_RGB(channels[0], channels[1], channels[2]);
+    return true;
+}
+
+// Ask the device for its background (OSC 11) and read the answer inside ONE bounded
+// window. A terminal that does not answer - and plenty ignore the query outright - is
+// not an error: it means the value stays whatever was already resolved. Nothing here is
+// load-bearing for rendering, so nothing waits longer than TUI_PROBE_MS for it.
+static bool queryDeviceBackground(uint32_t *color) {
+    static const char request[] = "\x1b]11;?\x1b\\";
+    if (write(STDOUT_FILENO, request, sizeof request - 1u) < 0)
+        return false;
+    char reply[TUI_PROBE_BYTES];
+    size_t length = 0;
+    timeout(TUI_PROBE_MS);
+    int key = 0;
+    while (length + 1u < sizeof reply && (key = getch()) != ERR)
+        reply[length++] = (char) (key & 0xFF);
+    reply[length] = '\0';
+    return parseDeviceBackground(reply, length, color);
+}
+
+// Decide what is behind every transparent cell: what a fade fades TO. Stated beats
+// guessed, so an explicit SEMICOLON_BG wins; otherwise the device is asked; otherwise
+// the fallback stands. The caller owns the screen state (this reads bytes from it, so
+// it must run with the terminal already in raw mode and before the event loop starts).
+static void resolveDeviceBackground(void) {
+    const char *configured = getenv("SEMICOLON_BG");
+    if (configured != nullptr && *configured != '\0') {
+        uint32_t declared = 0u;
+        if (!parsePackedHex(configured, &declared)) {
+            THROW("semicolon: SEMICOLON_BG '%s' is not #RRGGBB; using the fallback", configured);
+        } else {
+            gDeviceBg = declared;
+            gDeviceBgSource = "SEMICOLON_BG";
+            return;
+        }
+    }
+    uint32_t answered = 0u;
+    if (queryDeviceBackground(&answered)) {
+        gDeviceBg = answered;
+        gDeviceBgSource = "the terminal answered OSC 11";
+        return;
+    }
+    gDeviceBgSource = "the built-in fallback (this terminal did not answer)";
+}
+
 static short colorIndex(uint32_t color) {
     if (!TERMINAL_COLOR_IS_SET(color))
         return -1;
@@ -748,7 +903,23 @@ static bool blitRun(void *context, TerminalRun run) {
         uint32_t fg = run.fg != nullptr ? run.fg[i] : TERMINAL_COLOR_DEFAULT;
         uint32_t bg = run.bg != nullptr ? run.bg[i] : TERMINAL_COLOR_DEFAULT;
         attr_t attrs = attrsFor(style);
-        short pair = pairFor(fg, bg);
+        // Resolve the cell against the device before mapping it, because SGR sets ONE
+        // colour and a fade has to be composed by US. The background plane goes over
+        // the device background; the ink then goes over THAT.
+        //
+        // An unset background is left unset and the device paints its own, which keeps
+        // a wrong backdrop guess a subtle tint instead of repainting the whole screen.
+        // An unset foreground is left unset too: it means "the device's default ink",
+        // and compositing it would paint the glyph in the backdrop colour and make the
+        // text silently vanish - the difference between faded ink and invisible ink.
+        uint32_t cellBg = TERMINAL_COLOR_IS_SET(bg)
+                              ? TerminalColor_over(bg, gDeviceBg)
+                              : TERMINAL_COLOR_DEFAULT;
+        uint32_t backdrop = TERMINAL_COLOR_IS_SET(cellBg) ? cellBg : gDeviceBg;
+        uint32_t cellFg = TERMINAL_COLOR_IS_SET(fg)
+                              ? TerminalColor_over(fg, backdrop)
+                              : TERMINAL_COLOR_DEFAULT;
+        short pair = pairFor(cellFg, cellBg);
         // A run usually shares one pen, so set the attributes once and only touch
         // them again at a boundary: one wattr_set per cell is pure overhead.
         if (!haveAttrs || attrs != currentAttrs || pair != currentPair) {
@@ -1117,6 +1288,36 @@ static int runInputProbe(void) {
     return 0;
 }
 
+// A diagnostic that answers one question with the terminal's own words: what colour is
+// your background? Every fade in the shell is composited against that value, so when a
+// fade looks wrong, this is the number to read first and SEMICOLON_BG is the fix.
+;;DEBUG
+static int runBackgroundProbe(void) {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        THROW("semicolon --bg-probe requires a terminal");
+        return 1;
+    }
+    SCREEN *screen = newterm(nullptr, stdout, stdin);
+    if (screen == nullptr) {
+        THROW("semicolon: terminal initialization failed");
+        return 1;
+    }
+    (void) cbreak();
+    (void) noecho();
+    (void) notimeout(stdscr, false);
+    set_escdelay(25);
+    resolveDeviceBackground();
+    endwin();
+    delscreen(screen);
+    printf("device background: #%02X%02X%02X\n",
+           (unsigned) TERMINAL_COLOR_RED(gDeviceBg), (unsigned) TERMINAL_COLOR_GREEN(gDeviceBg),
+           (unsigned) TERMINAL_COLOR_BLUE(gDeviceBg));
+    printf("source: %s\n", gDeviceBgSource);
+    printf("set SEMICOLON_BG=#RRGGBB to override it.\n");
+    fflush(stdout);
+    return 0;
+}
+
 static int runTerminal(FileText *file) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         THROW("semicolon requires terminal stdin and stdout (use --dump for a plain render)");
@@ -1158,6 +1359,9 @@ static int runTerminal(FileText *file) {
     (void) define_key("\033OB", KEY_DOWN);
     (void) define_key("\033OC", KEY_RIGHT);
     (void) define_key("\033OD", KEY_LEFT);
+    // Before the event loop owns the input stream: this reads the terminal's reply, so
+    // it has to happen while nothing else is watching the same bytes.
+    resolveDeviceBackground();
     timeout(TUI_POLL_MS);
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
@@ -1424,6 +1628,7 @@ int main(int argc, char **argv) {
             puts("  --file PATH   show PATH in the editor (default: vexspoke's oop/type.h)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
             puts("  --input-probe print the mouse and key events this terminal actually sends");
+            puts("  --bg-probe    print the background colour this terminal reports (fades use it)");
             return 0;
         }
         if (strcmp(argv[i], "--dump") == 0) {
@@ -1447,6 +1652,8 @@ int main(int argc, char **argv) {
             initTextures();
             return runInputProbe();
         }
+        if (strcmp(argv[i], "--bg-probe") == 0)
+            return runBackgroundProbe();
         if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
             (void) snprintf(path, sizeof path, "%s", argv[++i]);
             fileGiven = true;
