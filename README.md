@@ -39,11 +39,13 @@ is a pair most terminals never send and Shift+wheel is routinely eaten by the
 terminal's own scrollback, so the keys are the path that always exists.
 
 **The tracking line** is the answer for a terminal that never reports horizontal
-scrolling — macOS Terminal.app, for one. The bottom editor row is a horizontal
-slider with no drawn chrome: a drag on it maps the pointer straight onto the
-offset, so dragging to an end reaches that end of the line. A *click* there does
-nothing, because press and drag are separable gestures. It needs only drag events,
-which every terminal sends. The vertical edge zone sits one row above it.
+scrolling — macOS Terminal.app, for one. The bottom TWO rows are one horizontal
+slider with no drawn chrome — the last editor row and the frame's bottom border,
+so the whole floor of the window is grabbable. A drag maps the pointer straight onto
+the offset, so dragging to an end reaches that end of the line. A *click* there does
+nothing, because press and drag are separable gestures, so passing the pointer
+across the border never disturbs the view. It needs only drag events, which every
+terminal sends. The vertical edge zone sits two rows above it.
 
 The rail divider is **draggable**. No panel
 sets a background, so the terminal's own theme shows through.

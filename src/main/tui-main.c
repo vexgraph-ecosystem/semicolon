@@ -902,6 +902,8 @@ static size_t clampScroll(size_t value, size_t maximum) {
 // it maps the pointer's position straight onto the offset, so dragging to either end
 // reaches that end of the document rather than nudging by a step. Clicking there does
 // nothing at all - press and drag are separable gestures, and only the drag pans.
+// Two rows are the handle, so this is deliberately `>=` rather than an equality
+// against one: the last editor row and the status border are the same slider.
 static size_t sliderScroll(size_t pointerX, size_t left, size_t right, size_t maximum) {
     if (maximum == 0 || right <= left)
         return 0;
@@ -1197,9 +1199,11 @@ static int runTerminal(FileText *file) {
                         break;
                     case TERMINAL_POINTER_PRESS:
                         interaction.pressed = true;
-                        // The last editor row is the tracking line, and it wins there:
-                        // the divider is still grabbable on every row above it.
-                        if (event.y == height - 2u) {
+                        // The tracking line is the bottom TWO rows: the last editor row
+                        // and the frame's bottom border, so the whole floor of the
+                        // window is draggable. It wins there; the divider is still
+                        // grabbable on every row above.
+                        if (event.y + 1u >= (size_t) height - 1u) {
                             interaction.tracking = true;
                             break;
                         }
@@ -1238,8 +1242,8 @@ static int runTerminal(FileText *file) {
                         // Edge autoscroll belongs to a DRAG, not to hovering: acting
                         // on plain motion made the view scroll whenever the pointer
                         // passed over the first or last editor row.
-                        // The bottom editor row belongs to the tracking line, so the
-                        // vertical edge zone sits one row above it.
+                        // Both bottom rows belong to the tracking line, so the vertical
+                        // edge zone sits two rows above them.
                         if (event.y == editorFirstRow())
                             scrollTop = applyScroll(scrollTop, -1, maxTop);
                         else if (event.y == height - 3u)
