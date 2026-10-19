@@ -1,26 +1,26 @@
-┌-[;]-[>w< agents]-----[<-|->]┐[helloworld.c  x][placeholder.txt  x][terminal  x][cmakelists.txt  x][another...┐ <- three dots needed when it is being warped
-| v [] vexgraph               |   1|#include "whatever.h"                                  [> run] [20!!, 20!] |
-|   v [] src                  |   2|int main() {                                                               |
-|       {} opencode.json      |   3|    Hello *h = Hello();                                                    |
-|       Aa hello.txt          |   4|    return 0;                                                              |
-|        J example.java       |   5|}                                                                          |
-|        C whatever.c         |   6|                                                                           |
-|       C+ whatever.cpp       |   7|                                                                           |
-|       oC shim.m             |   8|                                                                           |
-|   > [] new folder           |   9|                                                                           |
-|   > [] another folder       |  10|                                                                           |
-|                             |  11| <- this thin line is not highlighted                                      |
-|                             |  12|                                                                           |<- borders like this is not highlighted
-|                             |  13|                                                                           |
-|                             |  14|                                                                           |
-|                             |  15|                                                                           |
-|                             |  16|                                                                           |
-|                             |  17|                                                                           |
-|         draggable btw... -> |  18|                                                                           |
-|                             |  19|                                                                           |
-|                             |  20|                                                                           |
-|                             |  21|                                                                           |
-└--[vexgraph>folder>folder>text.c::toString()]-------------------------------[c23/java]-[ln:ch]-[time]-[utf-8]-┘
+┌-[;]-[>w< agents]-----[<-|->]┐[helloworld.c  x][placeholder.txt  x][terminal  x][cmakelists.txt  x][another-...┐ <- three dots needed when it is being warped
+| v [] vexgraph               |   1.  #include "whatever.h"                                 [> run] [20!!, 20!] |
+|   v [] src                  |   2.  int main() {                                                              |
+|       {} opencode.json      |   3.       Hello *h = Hello();                                                  |
+|       Aa hello.txt          |   4.       return 0;                                                            |
+|        J example.java       |   5.   }                                                                        |
+|        C whatever.c         |   6.                                                                            |
+|       C+ whatever.cpp       |   7.                                                                            |
+|       oC shim.m             |   8.                                                                            |
+|   > [] new folder           |   9.                                                                            |
+|   > [] another folder       |  10.                                                                            |
+|                             |  11. <- this thin line is not highlighted                                       |
+|                             |  12.                                                                            |<- borders like this is not highlighted
+|                             |  13.                                                                            |
+|                             |  14.                                                                            |
+|                             |  15.                                                                            |
+|                             |  16.                                                                            |
+|                             |  17.                                                                            |
+|         draggable btw... -> |  18.                                                                            |
+|                             |  19.                                                                            |
+|                             |  20.                                                                            |
+|                             |  21.                                                                            |
+└--[vexgraph>folder>folder>text.c::toString()]--------------------------------[c23/java]-[ln:ch]-[time]-[utf-8]-┘
               ^
               ^
               breadcrumbs, the >s are not highlighted... it would be nice if it looked like rainbow but it depends
@@ -201,7 +201,7 @@ Want me to drop this in as a `terminal_glyph.h` table of named codepoint constan
 
  bf - brainfuck idk
  im - any image format or anything...
- 
+
 
 
 
