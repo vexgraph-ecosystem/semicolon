@@ -16,9 +16,12 @@ Primeagen remains independently buildable R5, never dependent on Semicolon.
 
 **Implemented and proven:** a **terminal shell** (`src/main/tui-main.c`) that
 draws the hand-made design on a real terminal, on Determinant's component tree of
-panels and texts, over a **real file**. It reads `vexspoke`'s `oop/type.h` by
-default (`--file PATH` overrides) and shows it in a **scrollable editor** with live
-line numbers.
+panels and texts, over a **real file** in a **real project**. The project is the
+directory it was started in (`--root PATH` overrides), so `cd <project> && semicolon`
+shows that project; the **rail is its file tree**, read one directory at a time and
+folded by clicking; a click on a file opens it in the showable editor with live line
+numbers. `--file PATH` opens a specific file, and a per-project **session** (the open
+file, the divider) is remembered outside the project so the next run resumes.
 
 **A present is a transaction.** Determinant brackets every frame that carries a
 change — the bracket opens only when there is something to send and closes even if a
@@ -91,13 +94,17 @@ rebuilt while scrolling. The divider is dragged by moving an **anchor** — the 
 layer gets a new extent through `TerminalPanel_setAnchor` — so resizing a pane and
 scrolling a file are both ordinary state changes, not scene surgery.
 
-It is still a mock-up in every other respect: the file tree and tab strip are
-literals, nothing is edited, and there is no syntax highlighting. `--dump WxH`
-prints one frame as plain text, which is how the owner checks the layout without a
-terminal. `tests/semicolon/tui_main_test.py` asserts the frame's measured geometry
-(columns 1/31/36/112), the non-tty refusal, and — under a real pty — that mouse
-reporting is enabled and switched off again, that a wheel event scrolls, and that
-a divider drag survives.
+The **tab strip** is still literals, nothing is edited, and there is no syntax
+highlighting. `--dump WxH` prints one frame as plain text, which is how the owner
+checks the layout without a terminal. `tests/semicolon/tui_main_test.py` asserts the
+frame's measured geometry (columns 1/31/36/112), the non-tty refusal, and — under a
+real pty on a scratch project — that mouse reporting is enabled and switched off
+again, that a wheel over the rail scrolls the rail and not the editor, that clicking
+a directory opens and closes it, that clicking a file opens it (and the header and
+tab follow), that a divider drag survives, and that the session round-trips. It also
+proves the colour path: the pty plays the terminal and answers the OSC 11 background
+query, and a translucent highlight is asserted to reach the device as the accent
+composited over that backdrop.
 
 Also present: `build.py` (explicit, strict, no fetch and no program run), the
 `semicolon` launcher, and `install-command.sh` for a per-user command link.
@@ -147,7 +154,8 @@ there is no syntax highlighting, no build integration and no agent. There is no
 caret: the scroll-past padding reserves the space a caret would need, but nothing
 inserts yet. Resizing
 re-lays the whole tree because every rectangle is recomputed from the canvas on
-each paint. There is no hover, no click and no focus: Determinant decodes the
+each paint. There is no hover and no focus, and the only click is the rail's file
+tree: Determinant decodes the
 mouse and can resolve a cell to the child under it, but nothing routes events
 between the two, so the only interactions are the wheel, the one-cell edge
 autoscroll and the divider drag. The chip bars are texts rather than the segment
