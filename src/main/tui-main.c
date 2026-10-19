@@ -5,6 +5,7 @@
 #include "terminal/terminal_color.h"
 #include "terminal/terminal_style.h"
 #include "terminal/terminal_surface.h"
+#include "terminal/terminal_tree_view.h"
 #include "terminal/terminal_input.h"
 #include "exception/throw.h"
 #include "annotation/definition.h"
@@ -17,7 +18,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <strings.h>
 #include <termios.h>
 #include <unistd.h>
 #include <ncurses.h>
@@ -80,7 +85,13 @@
  *   static TerminalText *plain(const char *, uint32_t)
  *   static bool putText(parent, text, anchor) / putPanel(parent, panel, anchor)
  *   static TerminalPanel *buildChromeRow(void) / buildStatusBar(Scene *, FileText *)
- *   static TerminalPanel *buildRail(void)
+ *   static void railBuild(const char *)   the project as a tree, one level at a time
+ *   static bool railReadChildren(id) / railRevealPath(path)
+ *   static void railClick(y) / railScrollBy(rows)   the rail's pointer contract
+ *   static void sceneSyncRail(Scene *)   point the row pool at the visible rows
+ *   static bool openFile(path, node)   swap the editor's file, not the scene
+ *   static void cacheLoad/cacheSave(void)   the project's session, kept outside the tree
+ *   static TerminalPanel *buildRail(Scene *, size_t rowCount)
  *   static TerminalPanel *buildEditor(Scene *, size_t)
  *   static TerminalPanel *buildCentre(Scene *, size_t)
  *   static void sceneBuild(Scene *, FileText *, size_t)
@@ -128,8 +139,28 @@
 #define TUI_MAX_W 400
 #define TUI_MAX_H 200
 #define TUI_MAX_ROWS 160
+// One rail row's composed text: indent, fold marker, name. Sized so the deepest name a
+// 30-cell rail can show still fits rather than being silently cut.
+#define TUI_RAIL_TEXT 96
+// Where a project's session lives, relative to the home directory. Machine-scoped and
+// outside the project on purpose: browsing a checkout must never write into it.
+#if defined(__APPLE__)
+#define TUI_STATE_DIR "Library/Application Support/vexgraph/semicolon"
+#else
+#define TUI_STATE_DIR ".local/state/vexgraph/semicolon"
+#endif
 #define TUI_MAX_FILE_BYTES (4u * 1024u * 1024u)
 #define GUTTER_WIDTH 5u
+// The design puts TWO cells between the gutter's bar and the first code cell, so a row
+// reads as `number |  code` rather than as `number|code`. It is a reserved band in the
+// editor's flow rather than padding copied into every line, which keeps the code text a
+// borrowed pointer into the file instead of a per-frame copy.
+#define TUI_CODE_PAD 2u
+// The breadcrumb's band. It is a FIXED width rather than the width of whatever it says,
+// because the crumb is re-pointed whenever the open file changes: a band measured once
+// would clip every later path, and the design draws the crumb area wide enough for exactly
+// that reason.
+#define TUI_CRUMB_CELLS 44u
 #define TUI_POLL_MS 100
 #define TUI_RAIL_MIN 12u
 #define TUI_RAIL_MARGIN 24u
@@ -224,7 +255,41 @@ typedef struct Scene {
     size_t rowCount;
     TerminalText *lineChip;
     size_t railWidth;
+    // The rail's rows. One Text per VISIBLE row, created once and re-pointed, so folding
+    // the tree and scrolling it are both allocation-free - exactly the trick the editor
+    // rows use, and the reason the row count is the panel's height rather than the
+    // tree's size.
+    TerminalText *railRows[TUI_MAX_ROWS];
+    size_t railRowCount;
+    char railText[TUI_MAX_ROWS][TUI_RAIL_TEXT];
+    // Re-pointed when the open file changes, so the header cannot describe a file the
+    // editor is not showing.
+    TerminalText *breadcrumb;
+    TerminalText *activeTab;
 } Scene;
+
+// SLOT RECORD: RailEntry
+typedef struct RailEntry {
+    char label[TUI_RAIL_TEXT];      // borrowed by the tree view, so it lives here
+    char path[1024];                // absolute, for reading and for opening
+    TerminalTreeNodeId parent;
+    bool loaded;                    // children have been read (exactly once)
+} RailEntry;
+
+static TerminalTreeView *gRail;
+static RailEntry *gRailEntries;
+static size_t gRailEntryCount;
+static size_t gRailEntryCapacity;
+static char gRailRoot[1024];
+static TerminalTreeNodeId gRailRootNode;
+static TerminalTreeNodeId gRailOpenNode;
+static char gOpenPath[1024];
+static FileText *gOpenFile;         // the editor's file, owned by runTerminal
+static Scene *gScene;               // the live scene, or null outside an interactive run
+static bool gResetView;             // a newly opened file starts at its top-left
+static char gActiveTab[TUI_RAIL_TEXT];
+static char gCachedOpen[1024];      // restored from the project's session
+static size_t gCachedRail;
 
 typedef struct Interaction {
     TerminalInput input;
@@ -414,7 +479,7 @@ static bool putPanel(TerminalPanel *parent, TerminalPanel *child, TerminalAnchor
     return true;
 }
 
-static TerminalPanel *buildChromeRow(void) {
+static TerminalPanel *buildChromeRow(Scene *scene) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
@@ -437,22 +502,30 @@ static TerminalPanel *buildChromeRow(void) {
             TerminalPanel_free(bar);
             return nullptr;
         }
-        if (i < 2)
-            (void) putText(bar, plain(gRule, COL_MUTED),
-                           TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1));
+        // The design's runs between the chips: one cell after the brand, then a longer
+        // gap that pushes the last chip flush against the rail's right border.
+        static const size_t rules[] = { 1u, 5u };
+        if (i < 2
+            && !putText(bar, plain(gRule, COL_MUTED),
+                        TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, rules[i]))) {
+            TerminalPanel_free(bar);
+            return nullptr;
+        }
     }
-    // Dashes out to the rail's right border, so the chrome row's left group ends
-    // exactly where the rail ends and the tab strip starts in the centre's columns.
-    // The count is what puts the tabs at the centre's first column.
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 5))) {
+    // The left group reserves the corner's cell too. The frame paints the corner over it,
+    // but reserving it is what starts the tab strip at the centre's first column instead of
+    // on top of the corner, where the strip's own opening bracket would be lost.
+    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
     // The compact trick: the tab strip shares the chrome row, so it costs no row.
     static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
-        TerminalText *tab = chip(tabLabels[i]);
         bool open = i == TUI_ACTIVE_TAB;
+        TerminalText *tab = chip(open && gActiveTab[0] != '\0' ? gActiveTab : tabLabels[i]);
+        if (open)
+            scene->activeTab = tab;
         (void) TerminalText_setForegroundColor(tab, open ? COL_TEXT : COL_MUTED);
         if (open)
             (void) TerminalText_setBackgroundColor(tab, COL_SELECT);
@@ -466,6 +539,10 @@ static TerminalPanel *buildChromeRow(void) {
     return bar;
 }
 
+// Defined with the rest of the rail: the header names the file on screen, so it needs
+// the project root and the open path.
+static void breadcrumbFor(const char *path, char *out, size_t size);
+
 static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
@@ -476,17 +553,24 @@ static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 2))) {
+    // Two cells of run between the corner and the breadcrumb, which is what the design
+    // shows - the corner paints over the first of them.
+    if (!putText(bar, plain(gRule, COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 3))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
     // The chip BORROWS this string for the life of the tree, so it must outlive
-    // this function: a stack buffer here renders as garbage.
-    (void) snprintf(gBreadcrumb, sizeof gBreadcrumb, "vexgraph>src>%s", file->name);
+    // this function: a stack buffer here renders as garbage. The crumb describes the file
+    // on screen - a header naming a different file is a lie, not a placeholder.
+    breadcrumbFor(gOpenPath[0] != '\0' ? gOpenPath : file->name, gBreadcrumb,
+                  sizeof gBreadcrumb);
     TerminalText *crumb = chip(gBreadcrumb);
+    scene->breadcrumb = crumb;
     (void) TerminalText_setForegroundColor(crumb, COL_TEXT);
-    if (!putText(bar, crumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
-                                             TerminalText_measure(crumb)))) {
+    // A FIXED band, not the width of whatever the crumb says today: the crumb is
+    // re-pointed whenever the open file changes, and a band measured once would clip every
+    // later path. The design draws this area wide for exactly that reason.
+    if (!putText(bar, crumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CRUMB_CELLS))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
@@ -515,23 +599,461 @@ static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
     return bar;
 }
 
-static TerminalPanel *buildRail(void) {
-    static const char *rows[] = {
-        "  v [] vexgraph", "    v [] src", "        {} opencode.json", "        Aa hello.txt",
-        "         J example.java", "         C whatever.c", "        C+ whatever.cpp",
-        "        oC shim.m", "    > [] new folder", "    > [] another folder"
-    };
+// ---------------------------------------------------------------- the rail's tree
+//
+// The rail IS the project. It is read ONE DIRECTORY AT A TIME, when a folder opens, so
+// starting in a big checkout costs the listing of its top level and nothing else: no
+// recursive walk, no watch, no index to go stale. A symlink loop cannot hang it either,
+// because following one only adds another directory that is read when it is opened.
+//
+// The tree BORROWS every label, so each name must live as long as its node. It lives in
+// RailEntry, indexed by (id - 1): ids are handed out in order and nodes are never
+// removed, which makes that index stable for the life of the process.
+
+// One listing, sorted before insertion. readdir order is not a contract, and a tree that
+// reshuffles between runs is not a tree.
+// SLOT RECORD: DirEntry
+typedef struct DirEntry {
+    char name[TUI_RAIL_TEXT];
+    bool folder;
+} DirEntry;
+
+static int compareDirEntries(const void *left, const void *right) {
+    const DirEntry *a = left;
+    const DirEntry *b = right;
+    if ((*a).folder != (*b).folder)
+        return (*a).folder ? -1 : 1;              // folders first, like every browser
+    return strcasecmp((*a).name, (*b).name);
+}
+
+static RailEntry *railEntryFor(TerminalTreeNodeId id) {
+    if (id == TERMINAL_TREE_NO_NODE || (size_t) id > gRailEntryCount)
+        return nullptr;
+    return &gRailEntries[(size_t) id - 1u];
+}
+
+static bool railReserveEntry(void) {
+    if (gRailEntryCount < gRailEntryCapacity)
+        return true;
+    size_t next = gRailEntryCapacity == 0 ? 32u : gRailEntryCapacity * 2u;
+    RailEntry *grown = realloc(gRailEntries, next * sizeof(RailEntry));
+    if (grown == nullptr)
+        return false;
+    gRailEntries = grown;
+    gRailEntryCapacity = next;
+    return true;
+}
+
+// Add a node and give it a home for its borrowed label. The tree is given an empty label
+// first and re-pointed afterwards, because the entry array may move: handing it the
+// address of a temporary would leave the tree reading freed memory.
+static TerminalTreeNodeId railAddNode(TerminalTreeNodeId parent, const char *name,
+                                      const char *path, bool folder) {
+    if (gRail == nullptr || !railReserveEntry())
+        return TERMINAL_TREE_NO_NODE;
+    TerminalTreeNodeId id = TerminalTreeView_addChild(gRail, parent, "", folder);
+    if (id == TERMINAL_TREE_NO_NODE)
+        return TERMINAL_TREE_NO_NODE;
+    RailEntry *entry = &gRailEntries[gRailEntryCount];
+    (void) snprintf(entry->label, sizeof entry->label, "%s", name);
+    (void) snprintf(entry->path, sizeof entry->path, "%s", path);
+    entry->parent = parent;
+    entry->loaded = false;
+    ++gRailEntryCount;
+    (void) TerminalTreeView_setLabel(gRail, id, entry->label);
+    return id;
+}
+
+// Read one directory, once. A read that fails is remembered as "loaded": retrying on
+// every frame would hammer the same unreadable path for no gain.
+static bool railReadChildren(TerminalTreeNodeId id) {
+    RailEntry *entry = railEntryFor(id);
+    if (entry == nullptr)
+        return false;
+    if ((*entry).loaded)
+        return true;
+    (*entry).loaded = true;
+    char parentPath[1024];
+    (void) snprintf(parentPath, sizeof parentPath, "%s", (*entry).path);
+    DIR *directory = opendir(parentPath);
+    if (directory == nullptr)
+        return false;
+    DirEntry *found = nullptr;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *item = nullptr;
+    while ((item = readdir(directory)) != nullptr) {
+        if (strcmp((*item).d_name, ".") == 0 || strcmp((*item).d_name, "..") == 0)
+            continue;
+        if (strlen((*item).d_name) >= TUI_RAIL_TEXT)
+            continue;
+        if ((*item).d_name[0] == '.')
+            continue;                             // dotfiles hidden, like every file pane
+        char child[1024];
+        (void) snprintf(child, sizeof child, "%s/%s", parentPath, (*item).d_name);
+        struct stat info;
+        if (stat(child, &info) != 0)
+            continue;
+        bool folder = S_ISDIR(info.st_mode);
+        if (!folder && !S_ISREG(info.st_mode))
+            continue;                             // no fifos, no devices, no sockets
+        if (count == capacity) {
+            size_t next = capacity == 0 ? 32u : capacity * 2u;
+            DirEntry *grown = realloc(found, next * sizeof(DirEntry));
+            if (grown == nullptr)
+                break;
+            found = grown;
+            capacity = next;
+        }
+        (void) snprintf(found[count].name, sizeof found[count].name, "%s", (*item).d_name);
+        found[count].folder = folder;
+        ++count;
+    }
+    (void) closedir(directory);
+    if (count > 1u)
+        qsort(found, count, sizeof(DirEntry), compareDirEntries);
+    // The entry array may move as children are added, so nothing taken above is used here.
+    for (size_t index = 0; index < count; ++index) {
+        char child[1024];
+        (void) snprintf(child, sizeof child, "%s/%s", parentPath, found[index].name);
+        (void) railAddNode(id, found[index].name, child, found[index].folder);
+    }
+    free(found);
+    return true;
+}
+
+static TerminalTreeNodeId railFindChild(TerminalTreeNodeId parent, const char *name) {
+    for (size_t index = 0; index < gRailEntryCount; ++index)
+        if (gRailEntries[index].parent == parent && strcmp(gRailEntries[index].label, name) == 0)
+            return (TerminalTreeNodeId) (index + 1u);
+    return TERMINAL_TREE_NO_NODE;
+}
+
+// Open the path to one node by walking it from the root, reading as it goes. Returns the
+// node, or NO_NODE when the path is outside this project.
+static TerminalTreeNodeId railRevealPath(const char *path) {
+    if (gRail == nullptr || path == nullptr || gRailRootNode == TERMINAL_TREE_NO_NODE)
+        return TERMINAL_TREE_NO_NODE;
+    size_t rootLength = strlen(gRailRoot);
+    if (rootLength == 0 || strncmp(path, gRailRoot, rootLength) != 0 || path[rootLength] != '/')
+        return TERMINAL_TREE_NO_NODE;
+    TerminalTreeNodeId current = gRailRootNode;
+    const char *at = path + rootLength + 1u;
+    while (*at != '\0') {
+        char component[TUI_RAIL_TEXT];
+        size_t length = 0;
+        while (at[length] != '\0' && at[length] != '/' && length + 1u < sizeof component)
+            ++length;
+        memcpy(component, at, length);
+        component[length] = '\0';
+        at += length;
+        if (*at == '/')
+            ++at;
+        (void) railReadChildren(current);
+        TerminalTreeNodeId child = railFindChild(current, component);
+        if (child == TERMINAL_TREE_NO_NODE)
+            return TERMINAL_TREE_NO_NODE;
+        current = child;
+        if (*at != '\0')
+            (void) TerminalTreeView_setExpanded(gRail, current, true);
+    }
+    return current;
+}
+
+// The breadcrumb is `root>dir>file` - the shape the design uses, and the only one that
+// fits beside the status chips. A full path would push them off the row.
+static void breadcrumbFor(const char *path, char *out, size_t size) {
+    const char *relative = path;
+    bool inside = false;
+    size_t rootLength = strlen(gRailRoot);
+    if (rootLength != 0 && strncmp(path, gRailRoot, rootLength) == 0 && path[rootLength] == '/') {
+        relative = path + rootLength + 1u;
+        inside = true;
+    }
+    size_t slashes = 0;
+    for (const char *at = relative; *at != '\0'; ++at)
+        if (*at == '/')
+            ++slashes;
+    const char *tail = relative;
+    size_t keep = slashes > 1u ? slashes - 1u : 0u;
+    for (const char *at = relative; *at != '\0' && keep != 0u; ++at)
+        if (*at == '/') {
+            tail = at + 1;
+            --keep;
+        }
+    // A file opened from OUTSIDE the project - the default file, or an explicit --file -
+    // is shown as outside it. Prefixing it with the project's name would claim a path that
+    // does not exist, and a header that lies about where a file is, is worse than a short
+    // one.
+    const char *rootName = strrchr(gRailRoot, '/');
+    rootName = rootName == nullptr ? gRailRoot : rootName + 1u;
+    // The tail is copied with its separators rewritten, so the crumb uses ONE separator
+    // throughout: mixing `>` and `/` in the same string reads as two different things.
+    char normalised[512];
+    size_t at = 0;
+    for (const char *source = tail; *source != '\0' && at + 1u < sizeof normalised; ++source)
+        normalised[at++] = *source == '/' ? '>' : *source;
+    normalised[at] = '\0';
+    if (inside)
+        (void) snprintf(out, size, "%s>%s", rootName, normalised);
+    else
+        (void) snprintf(out, size, "…>%s", normalised);
+}
+
+// Open a file in the editor. The OLD file stays open when the new one cannot be read: a
+// failed click must not blank the view and throw away the scroll position for nothing.
+static bool openFile(const char *path, TerminalTreeNodeId node) {
+    if (gOpenFile == nullptr || path == nullptr)
+        return false;
+    FileText opened;
+    if (!fileLoad(&opened, path))
+        return false;
+    fileFree(gOpenFile);
+    *gOpenFile = opened;
+    (void) snprintf(gOpenPath, sizeof gOpenPath, "%s", path);
+    gRailOpenNode = node;
+    if (gRail != nullptr) {
+        (void) TerminalTreeView_setSelected(gRail, node);
+        (void) TerminalTreeView_reveal(gRail, node);
+    }
+    gResetView = true;
+    if (gScene != nullptr) {
+        breadcrumbFor(path, gBreadcrumb, sizeof gBreadcrumb);
+        if (gScene->breadcrumb != nullptr)
+            (void) TerminalText_setText(gScene->breadcrumb, gBreadcrumb, strlen(gBreadcrumb));
+        (void) snprintf(gActiveTab, sizeof gActiveTab, "%s  x", opened.name);
+        if (gScene->activeTab != nullptr)
+            (void) TerminalText_setText(gScene->activeTab, gActiveTab, strlen(gActiveTab));
+    }
+    return true;
+}
+
+// The project's session, kept OUTSIDE the project. Writing state into the checkout would
+// litter every repository the shell is pointed at, so it lives in the machine's state
+// directory, one file per root, named by a hash of that root and carrying the root inside
+// so a collision is caught instead of restoring somebody else's session. SEMICOLON_STATE
+// overrides the directory, which is also how the owner test avoids touching a real one.
+static void cachePathFor(const char *root, char *out, size_t size) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const char *at = root; *at != '\0'; ++at) {
+        hash ^= (unsigned char) *at;
+        hash *= 1099511628211ull;
+    }
+    const char *override = getenv("SEMICOLON_STATE");
+    if (override != nullptr && *override != '\0') {
+        (void) snprintf(out, size, "%s/%016llx.state", override, (unsigned long long) hash);
+        return;
+    }
+    const char *xdg = getenv("XDG_STATE_HOME");
+    if (xdg != nullptr && *xdg != '\0') {
+        (void) snprintf(out, size, "%s/semicolon/%016llx.state", xdg,
+                        (unsigned long long) hash);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (home == nullptr)
+        home = ".";
+    (void) snprintf(out, size, "%s/%s/%016llx.state", home, TUI_STATE_DIR,
+                    (unsigned long long) hash);
+}
+
+// mkdir -p, without a shell: a state directory that does not exist yet is not an error.
+static bool ensureDirectory(const char *path) {
+    char buffer[1024];
+    (void) snprintf(buffer, sizeof buffer, "%s", path);
+    for (char *at = buffer + 1; *at != '\0'; ++at) {
+        if (*at != '/')
+            continue;
+        *at = '\0';
+        if (mkdir(buffer, 0700) != 0 && errno != EEXIST)
+            return false;
+        *at = '/';
+    }
+    return mkdir(buffer, 0700) == 0 || errno == EEXIST;
+}
+
+static void cacheLoad(const char *root) {
+    gCachedOpen[0] = '\0';
+    gCachedRail = 0;
+    char path[1024];
+    cachePathFor(root, path, sizeof path);
+    FILE *handle = fopen(path, "r");
+    if (handle == nullptr)
+        return;
+    char line[1300];
+    bool sameRoot = false;
+    char opened[1024];
+    opened[0] = '\0';
+    size_t width = 0;
+    while (fgets(line, sizeof line, handle) != nullptr) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "root ", 5) == 0)
+            sameRoot = strcmp(line + 5, root) == 0;
+        else if (strncmp(line, "open ", 5) == 0)
+            (void) snprintf(opened, sizeof opened, "%s", line + 5);
+        else if (strncmp(line, "rail ", 5) == 0)
+            width = (size_t) strtoul(line + 5, nullptr, 10);
+    }
+    (void) fclose(handle);
+    if (!sameRoot)
+        return;                                   // a hash collision, or a reused directory
+    if (opened[0] != '\0')
+        (void) snprintf(gCachedOpen, sizeof gCachedOpen, "%s", opened);
+    gCachedRail = width;
+}
+
+// Staged and renamed, so an interrupted write cannot leave a half session that the next
+// run would believe.
+static void cacheSave(void) {
+    if (gRailRoot[0] == '\0')
+        return;
+    char path[1024];
+    cachePathFor(gRailRoot, path, sizeof path);
+    char directory[1024];
+    (void) snprintf(directory, sizeof directory, "%s", path);
+    char *slash = strrchr(directory, '/');
+    if (slash != nullptr) {
+        *slash = '\0';
+        if (!ensureDirectory(directory))
+            return;
+    }
+    char staged[1100];
+    (void) snprintf(staged, sizeof staged, "%s.tmp", path);
+    FILE *handle = fopen(staged, "w");
+    if (handle == nullptr)
+        return;
+    fprintf(handle, "root %s\n", gRailRoot);
+    fprintf(handle, "open %s\n", gOpenPath);
+    fprintf(handle, "rail %zu\n", gScene != nullptr ? gScene->railWidth : 0u);
+    bool ok = fflush(handle) == 0;
+    ok = fclose(handle) == 0 && ok;
+    if (!ok || rename(staged, path) != 0)
+        (void) remove(staged);
+}
+
+// The file to open when nothing else names one: the root's first regular file in sorted
+// order. Deterministic, so two runs on the same project open the same thing.
+static bool firstFileIn(const char *root, char *out, size_t size) {
+    DIR *directory = opendir(root);
+    if (directory == nullptr)
+        return false;
+    char best[TUI_RAIL_TEXT];
+    best[0] = '\0';
+    struct dirent *item = nullptr;
+    while ((item = readdir(directory)) != nullptr) {
+        if ((*item).d_name[0] == '.' || strlen((*item).d_name) >= TUI_RAIL_TEXT)
+            continue;
+        char child[1024];
+        (void) snprintf(child, sizeof child, "%s/%s", root, (*item).d_name);
+        struct stat info;
+        if (stat(child, &info) != 0 || !S_ISREG(info.st_mode))
+            continue;
+        if (best[0] == '\0' || strcasecmp((*item).d_name, best) < 0)
+            (void) snprintf(best, sizeof best, "%s", (*item).d_name);
+    }
+    (void) closedir(directory);
+    if (best[0] == '\0')
+        return false;
+    (void) snprintf(out, size, "%s/%s", root, best);
+    return true;
+}
+
+// Build the rail at startup: one root node, its top level read, and the open file
+// revealed down the tree. Nothing recursive happens here - the rest of the project is
+// read when a folder is opened.
+static void railBuild(const char *root) {
+    (void) snprintf(gRailRoot, sizeof gRailRoot, "%s", root);
+    gRail = TerminalTreeView();
+    if (gRail == nullptr)
+        return;
+    const char *name = strrchr(root, '/');
+    name = name == nullptr ? root : name + 1u;
+    if (*name == '\0')
+        name = "/";
+    gRailRootNode = railAddNode(TERMINAL_TREE_NO_NODE, name, root, true);
+    if (gRailRootNode == TERMINAL_TREE_NO_NODE)
+        return;
+    (void) railReadChildren(gRailRootNode);
+    (void) TerminalTreeView_setExpanded(gRail, gRailRootNode, true);
+}
+
+// Compose one rail row: indentation, the fold marker, and the name. Presentation lives
+// here and structure lives in the tree, which is why the tree never had to know what a
+// folder looks like.
+static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width) {
+    // The rail sits UNDER the frame's left border, which is painted over the first cell of
+    // every row - so the margin is not decoration, it is what keeps the tree off the
+    // border. The design's rows have always carried it. One extra level of indent is
+    // reserved for that margin; beyond that the indent stops growing so a deep node still
+    // shows a name instead of nothing but spaces.
+    size_t deepest = width > 8u ? (width - 6u) / 2u : 1u;
+    size_t levels = row.depth + 1u;
+    if (levels > deepest)
+        levels = deepest;
+    size_t at = 0;
+    for (size_t level = 0; level < levels && at + 3u < size; ++level) {
+        out[at++] = ' ';
+        out[at++] = ' ';
+    }
+    if (row.folder)
+        (void) snprintf(out + at, size - at, "%c [] %s", row.expanded ? 'v' : '>', row.label);
+    else
+        (void) snprintf(out + at, size - at, "  %s", row.label);
+}
+
+// Point every rail row at the tree row it shows. One Text per VISIBLE row is what makes
+// folding and scrolling allocation-free: the pool is the panel's height, so a row with
+// nothing to show shows nothing.
+static void sceneSyncRail(Scene *scene, size_t visible) {
+    if (gRail == nullptr)
+        return;
+    // The viewport is what the panel can actually SHOW, not the size of the row pool: a
+    // viewport as tall as the pool would let nothing scroll, because everything would
+    // already fit.
+    (void) TerminalTreeView_setViewportRows(gRail, visible);
+    // `first` and `shown` are the TREE's own coordinates; `visible` above is how many rows
+    // the panel has to give it. Two different questions, so two different names.
+    size_t first = TerminalTreeView_scrollRow(gRail);
+    size_t shown = TerminalTreeView_visibleCount(gRail);
+    for (size_t index = 0; index < scene->railRowCount; ++index) {
+        TerminalText *row = scene->railRows[index];
+        if (row == nullptr)
+            continue;
+        if (first + index >= shown) {
+            (void) TerminalText_setText(row, gEmptyLine, 0);
+            (void) TerminalText_setBackgroundColor(row, TERMINAL_COLOR_DEFAULT);
+            continue;
+        }
+        TerminalTreeRow record = TerminalTreeView_rowAt(gRail, first + index);
+        railFormat(scene->railText[index], sizeof scene->railText[index], record,
+                   scene->railWidth);
+        (void) TerminalText_setText(row, scene->railText[index],
+                                    strlen(scene->railText[index]));
+        (void) TerminalText_setForegroundColor(row, record.folder ? COL_ACCENT : COL_TEXT);
+        // The open file is the selection, and the tint is the one highlight in the shell.
+        (void) TerminalText_setBackgroundColor(row, record.selected ? COL_SELECT
+                                                                   : TERMINAL_COLOR_DEFAULT);
+    }
+}
+
+static TerminalPanel *buildRail(Scene *scene, size_t rowCount) {
     TerminalPanel *rail = TerminalPanel();
     if (rail == nullptr)
         return nullptr;
-    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; ++i) {
-        bool isFolder = strstr(rows[i], "[]") != nullptr;
-        TerminalText *row = plain(rows[i], isFolder ? COL_ACCENT : COL_TEXT);
-        if (!putText(rail, row, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
+    if (rowCount > TUI_MAX_ROWS)
+        rowCount = TUI_MAX_ROWS;
+    for (size_t i = 0; i < rowCount; ++i) {
+        // Every row starts EMPTY and is pointed at a tree row by sceneSyncRail. The pool
+        // is the panel's height, not the tree's size, which is what keeps a fold and a
+        // scroll free of allocation: a row that has nothing to show shows nothing.
+        TerminalText *row = plain(gEmptyLine, COL_TEXT);
+        if (row == nullptr || !putText(rail, row, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
             TerminalPanel_free(rail);
             return nullptr;
         }
+        scene->railRows[i] = row;
     }
+    scene->railRowCount = rowCount;
     (void) TerminalPanel_setForegroundColor(rail, COL_TEXT);
     return rail;
 }
@@ -590,7 +1112,12 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     }
     (void) TerminalPanel_setLayout(code, TERMINAL_PANEL_LAYERED);
     // The run chip sits left of the diagnostics chip in the same row.
+    // The gutter, then the design's gap, then the code. The gap is a RESERVED band, so the
+    // code's own columns start two cells later and its width is two cells smaller - the
+    // scroll bound accounts for exactly that.
+    TerminalText *gap = plain("  ", COL_TEXT);
     if (!putPanel(editor, gutter, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, GUTTER_WIDTH))
+        || !putText(editor, gap, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CODE_PAD))
         || !putPanel(editor, code, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
         return nullptr;
@@ -621,9 +1148,9 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
 static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
     *scene = (Scene) {0};
     scene->railWidth = 31;
-    TerminalPanel *title = buildChromeRow();
+    TerminalPanel *title = buildChromeRow(scene);
     TerminalPanel *status = buildStatusBar(scene, file);
-    TerminalPanel *rail = buildRail();
+    TerminalPanel *rail = buildRail(scene, rowCount);
     TerminalPanel *centre = buildCentre(scene, rowCount);
     TerminalText *border = plain(gRule, COL_MUTED);
     scene->root = TerminalPanel();
@@ -997,14 +1524,44 @@ static size_t editorRowCount(int height) {
 static size_t codeLeftColumn(size_t railWidth) { return railWidth + GUTTER_WIDTH; }
 
 static size_t codeColumns(size_t railWidth, int width) {
-    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth) + 1u)
+    if (width <= 0 || (size_t) width <= codeLeftColumn(railWidth) + 1u + TUI_CODE_PAD)
         return 0;
-    return (size_t) width - codeLeftColumn(railWidth) - 1u;
+    // The code's own columns, which the gap has already taken two of.
+    return (size_t) width - codeLeftColumn(railWidth) - 1u - TUI_CODE_PAD;
 }
 
 static size_t editorVisibleRows(int height) {
     size_t rows = editorRowCount(height);
     return rows > TUI_MAX_ROWS ? TUI_MAX_ROWS : rows;
+}
+
+// One click, one decision: a folder opens or closes, a file opens in the editor. The row
+// is resolved by the tree from the viewport offset, so the rail's scroll is already
+// accounted for and a click past the last row is not a click on anything.
+static void railClick(size_t y) {
+    if (gRail == nullptr || y < editorFirstRow())
+        return;
+    TerminalTreeNodeId id = TerminalTreeView_nodeAtOffset(gRail, y - editorFirstRow());
+    if (id == TERMINAL_TREE_NO_NODE)
+        return;
+    if (TerminalTreeView_isFolder(gRail, id)) {
+        if (TerminalTreeView_isExpanded(gRail, id)) {
+            (void) TerminalTreeView_setExpanded(gRail, id, false);
+            return;
+        }
+        // Read BEFORE opening, so the rows exist by the time they become visible.
+        (void) railReadChildren(id);
+        (void) TerminalTreeView_setExpanded(gRail, id, true);
+        return;
+    }
+    RailEntry *entry = railEntryFor(id);
+    if (entry != nullptr)
+        (void) openFile((*entry).path, id);
+}
+
+static void railScrollBy(long rows) {
+    if (gRail != nullptr)
+        (void) TerminalTreeView_scrollBy(gRail, rows);
 }
 
 #define TUI_MOUSE_SGR (KEY_MAX + 1)
@@ -1196,6 +1753,11 @@ static int dumpFrame(int width, int height, const FileText *file) {
     }
     Scene scene;
     sceneBuild(&scene, file, TUI_MAX_ROWS);
+    // The dump renders the same scene, so it needs the same project: a rail that is empty
+    // here would be a different frame from the one the shell shows.
+    railBuild(gRailRoot);
+    (void) railRevealPath(gOpenPath);
+    sceneSyncRail(&scene, editorVisibleRows(height));
     if (scene.root == nullptr) {
         fprintf(stderr, "[vex] semicolon: scene construction failed\n");
         return 1;
@@ -1376,6 +1938,19 @@ static int runTerminal(FileText *file) {
         height = TUI_MAX_H;
     Scene scene;
     sceneBuild(&scene, file, TUI_MAX_ROWS);
+    gScene = &scene;
+    gOpenFile = file;
+    // The cached divider width, applied where the terminal's width is known so it can be
+    // checked rather than trusted.
+    if (gCachedRail >= TUI_RAIL_MIN && gCachedRail + TUI_RAIL_MARGIN < (size_t) width)
+        sceneSetRailWidth(&scene, gCachedRail);
+    // The project, one level at a time, then the open file revealed down it.
+    railBuild(gRailRoot);
+    TerminalTreeNodeId opening = railRevealPath(gOpenPath);
+    if (opening != TERMINAL_TREE_NO_NODE) {
+        gRailOpenNode = opening;
+        (void) TerminalTreeView_setSelected(gRail, opening);
+    }
     bool ok = scene.root != nullptr;
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
@@ -1470,6 +2045,12 @@ static int runTerminal(FileText *file) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
+                        // A wheel over the RAIL scrolls the rail, not the editor: the
+                        // pointer says which list the user means, so no mode is needed.
+                        if (event.x < divider) {
+                            railScrollBy(down ? 1 : -1);
+                            break;
+                        }
                         // ANY modified wheel pans sideways, because terminals differ
                         // over which modifier they let through: Shift is the one most
                         // often stolen for the terminal's own scrollback, while
@@ -1497,6 +2078,13 @@ static int runTerminal(FileText *file) {
                         // CATCH IT: a press ends any scroll in flight, which is what makes
                         // momentum safe to have - you can always stop it by touching.
                         glideHalt(&glide);
+                        // A press inside the rail is a file-browser click. Checked before
+                        // the divider because the divider is its own edge: a rail row
+                        // beside it must still open.
+                        if (event.x < divider) {
+                            railClick(event.y);
+                            break;
+                        }
                         // The tracking line is the bottom TWO rows: the last editor row
                         // and the frame's bottom border, so the whole floor of the
                         // window is draggable. It wins there; the divider is still
@@ -1587,9 +2175,19 @@ static int runTerminal(FileText *file) {
         }
         // Cover a fraction of what is left. The position is a whole number of cells, so
         // the fractional glide is rounded at the moment it is drawn.
+        // A newly opened file starts at its top-left, and the glide is dropped with it:
+        // momentum carried over from the previous file would scroll the new one away.
+        if (gResetView) {
+            glide.rowShown = 0.0;
+            glide.rowTarget = 0.0;
+            glide.columnShown = 0.0;
+            glide.columnTarget = 0.0;
+            gResetView = false;
+        }
         size_t scrollTop = (size_t) (glideStep(&glide.rowShown, glide.rowTarget) + 0.5);
         size_t scrollLeft = (size_t) (glideStep(&glide.columnShown, glide.columnTarget) + 0.5);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
+        sceneSyncRail(&scene, visible);
         TerminalPanel_paint(scene.root, &back);
         drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth);
         TerminalPresentResult presented = TerminalSurface_present(&surface);
@@ -1604,6 +2202,11 @@ static int runTerminal(FileText *file) {
             break;
     }
     (void) mouseReporting(false);
+    // The session is written on the way out, so the next run in this project comes back
+    // to the same file and the same divider.
+    cacheSave();
+    gScene = nullptr;
+    gOpenFile = nullptr;
     (void) curs_set(1);
     (void) endwin();
     (void) delscreen(screen);
@@ -1625,7 +2228,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0) {
             puts("semicolon [--dump [WxH]] [--file PATH] [--help]");
             puts("  no arguments  draw the IDE shell on this terminal (Ctrl-C quits)");
-            puts("  --file PATH   show PATH in the editor (default: vexspoke's oop/type.h)");
+            puts("  --root PATH   browse this project (default: the current directory)");
+            puts("  --file PATH   open PATH in the editor (default: this project's session,"
+                 " else its first file)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
             puts("  --input-probe print the mouse and key events this terminal actually sends");
             puts("  --bg-probe    print the background colour this terminal reports (fades use it)");
@@ -1654,6 +2259,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--bg-probe") == 0)
             return runBackgroundProbe();
+        if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) {
+            (void) snprintf(gRailRoot, sizeof gRailRoot, "%s", argv[++i]);
+            continue;
+        }
         if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
             (void) snprintf(path, sizeof path, "%s", argv[++i]);
             fileGiven = true;
@@ -1662,20 +2271,37 @@ int main(int argc, char **argv) {
         THROW("semicolon: unknown argument");
         return 1;
     }
-    if (!fileGiven) {
-        char directory[1000];
-        (void) snprintf(directory, sizeof directory, "%s", argv[0]);
-        char *slash = strrchr(directory, '/');
-        if (slash != nullptr)
-            *slash = '\0';
-        (void) snprintf(path, sizeof path,
-                        "%s/../../../../suite/ecosystem/vexspoke/src/oop/type.h", directory);
+    // The project is where the shell was started, unless one was named. That is what
+    // makes "cd anywhere && semicolon" mean the project you are standing in.
+    if (gRailRoot[0] == '\0') {
+        if (getcwd(gRailRoot, sizeof gRailRoot) == nullptr) {
+            THROW("semicolon: cannot determine the current directory; pass --root");
+            return 1;
+        }
     }
+    size_t rootLength = strlen(gRailRoot);
+    while (rootLength > 1u && gRailRoot[rootLength - 1u] == '/')
+        gRailRoot[--rootLength] = '\0';
+    cacheLoad(gRailRoot);
+    if (!fileGiven) {
+        // The project's own session first, then its first file. A cached path that is no
+        // longer readable is simply not used, so a deleted file is not a startup failure.
+        if (gCachedOpen[0] != '\0' && access(gCachedOpen, R_OK) == 0)
+            (void) snprintf(path, sizeof path, "%s", gCachedOpen);
+        else if (!firstFileIn(gRailRoot, path, sizeof path)) {
+            THROW("semicolon: no file to open in %s; pass --file", gRailRoot);
+            return 1;
+        }
+    }
+    (void) snprintf(gOpenPath, sizeof gOpenPath, "%s", path);
     FileText file;
     if (!fileLoad(&file, path)) {
         fprintf(stderr, "[vex] semicolon: cannot read %s\n", path);
         return 1;
     }
+    // The active tab names the file that is on screen. Set here, once, so the dumped frame
+    // and the interactive shell cannot disagree about which file they are showing.
+    (void) snprintf(gActiveTab, sizeof gActiveTab, "%s  x", file.name);
     int status = 0;
     if (dump) {
         if (width < 1)
