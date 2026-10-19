@@ -35,10 +35,16 @@ Ghostty honour it.
 Output is quit with **Ctrl-C** only — there is deliberately no letter shortcut,
 because a keystroke is input and `q` is a legitimate thing to want to type.
 
-The layout is the compact one: the chrome row carries the rail's top border (brand,
-mode chip, undo/redo) AND the tab strip, so the whole frame costs two rows and the
-editor gets the rest. Real box corners are drawn, with a tee where the rail's
-divider meets the bottom border.
+The layout is now borderless: the header carries `[(); Code]` and `[>w< agents]`
+on the left and the tab strip starts at the rail seam. The seam is the only drawn
+vertical line; it remains the divider and drag target. The footer keeps the file
+breadcrumb and right-side status chips without a dashed rule. Disclosure shapes
+remain Unicode in the canvas and use `v`/`>` at the narrow-curses device boundary
+to avoid locale-dependent glyph loss.
+
+Editor line numbers are right-aligned to the width of the file's largest line
+number, with a period directly after that field and two cells before the code.
+The width is derived from the file, not fixed to a three- or four-digit guess.
 
 Scrolling is **two-axis**, and both axes scroll *past* the content: 10 empty lines
 follow the last line and 20 empty columns follow the longest one, so there is always
@@ -60,7 +66,7 @@ terminal's own scrollback, so the keys are the path that always exists.
 
 **The tracking line** is the answer for a terminal that never reports horizontal
 scrolling — macOS Terminal.app, for one. The bottom TWO rows are one horizontal
-slider with no drawn chrome — the last editor row and the frame's bottom border,
+slider with no drawn chrome — the last editor row and the footer,
 so the whole floor of the window is grabbable. A drag maps the pointer straight onto
 the offset, so dragging to an end reaches that end of the line. A *click* there does
 nothing, because press and drag are separable gestures, so passing the pointer
@@ -97,7 +103,8 @@ scrolling a file are both ordinary state changes, not scene surgery.
 The **tab strip** is still literals, nothing is edited, and there is no syntax
 highlighting. `--dump WxH` prints one frame as plain text, which is how the owner
 checks the layout without a terminal. `tests/semicolon/tui_main_test.py` asserts the
-frame's measured geometry (columns 1/31/36/112), the non-tty refusal, and — under a
+borderless geometry (rail seam at column 30), dynamic number alignment including a
+five-digit line count, the non-tty refusal, and — under a
 real pty on a scratch project — that mouse reporting is enabled and switched off
 again, that a wheel over the rail scrolls the rail and not the editor, that clicking
 a directory opens and closes it, that clicking a file opens it (and the header and
@@ -109,17 +116,17 @@ composited over that backdrop.
 Also present: `build.py` (explicit, strict, no fetch and no program run), the
 `semicolon` launcher, and `install-command.sh` for a per-user command link.
 
-The window chrome (the rail verticals and the right edge) is drawn by the shell
-with the canvas primitive, because the toolkit has no vertical-rule widget yet.
+The rail seam is drawn by the shell with the canvas primitive, because the toolkit
+has no vertical-rule widget yet. There are no decorative outer edges.
 
 `semicolon --input-probe` is a diagnostic: it prints the mouse and key events the
 terminal actually sends, so whether a trackpad reports a horizontal wheel (buttons
 66/67) is a measurement rather than a guess.
 
-`tests/semicolon/tui_main_test.py` asserts the frame's measured geometry, the
-non-tty refusal, and — under a real pty — that mouse reporting is enabled and
-switched off again, that a wheel event scrolls, and that a divider drag survives.
-It asserts the frame's *shape* rather than comparing rows against
+`tests/semicolon/tui_main_test.py` asserts the borderless geometry, dynamic number
+alignment, non-tty refusal, and — under a real pty — that mouse reporting is enabled
+and switched off again, wheel events scroll, and divider and horizontal tracking-line
+drags survive. It asserts the frame's *shape* rather than comparing rows against
 `src/tui/tui_example.txt`, because that file is a notebook as much as a design:
 rows 1 and 13 there carry trailing annotations past the frame, so no row of it is
 a 112-cell row any more.
@@ -152,13 +159,13 @@ Graphvex R3, not a second superapp graphics implementation.
 displayed; nothing is written, no tab is switched, no key edits a buffer, and
 there is no syntax highlighting, no build integration and no agent. There is no
 caret: the scroll-past padding reserves the space a caret would need, but nothing
-inserts yet. Resizing
+inserts yet. Resize
 re-lays the whole tree because every rectangle is recomputed from the canvas on
 each paint. There is no hover and no focus, and the only click is the rail's file
 tree: Determinant decodes the
-mouse and can resolve a cell to the child under it, but nothing routes events
-between the two, so the only interactions are the wheel, the one-cell edge
-autoscroll and the divider drag. The chip bars are texts rather than the segment
+mouse and can resolve a cell to the child under it; the host routes rail clicks,
+wheel scrolling, edge autoscroll and divider drag, but not editor hover/focus.
+The chip bars are texts rather than the segment
 widget they will become, and vertical rules are drawn by this shell instead of by
 a toolkit widget.
 
