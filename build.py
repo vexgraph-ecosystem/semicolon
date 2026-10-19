@@ -44,8 +44,13 @@ def build(output, compiler="clang"):
     if not entry.is_file():
         raise ValueError(f"missing entry point: {entry}")
     flags = ["-std=gnu23", "-Wall", "-Wextra", "-Werror", "-O2"]
+    curses_library = "-lncurses"
     if sys.platform == "darwin":
         flags += ["-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0"]
+    else:
+        # Linux commonly splits the wide-character ABI into ncursesw; Darwin's
+        # system ncurses exports the same wide API from -lncurses.
+        curses_library = "-lncursesw"
     output = Path(output).absolute()
     if output.is_symlink() or output.is_dir():
         raise ValueError("invalid build output")
@@ -54,7 +59,7 @@ def build(output, compiler="clang"):
         artifact = Path(temp) / "semicolon-tui"
         argv = [compiler, *flags, "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine),
                 str(entry), *(str(source) for source in sources(determinant, vexspoke, engine)),
-                "-lncurses", "-lm", "-o", str(artifact)]
+                 curses_library, "-lm", "-o", str(artifact)]
         result = run(argv)
         if result.returncode:
             raise ValueError(result.stderr.strip() or "compile failed")
