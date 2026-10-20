@@ -21,7 +21,7 @@ directory it was started in (`--root PATH` overrides), so `cd <project> && semic
 shows that project; the **rail is its file tree**, read one directory at a time and
 folded by clicking; a click on a file opens it in the showable editor with live line
 numbers. `--file PATH` opens a specific file, and a per-project **session** (the open
- file, the divider) is remembered outside the project so the next run resumes.
+file, the divider) is remembered outside the project so the next run resumes.
 
 `.md` and `.markdown` files start in a read-only rendered preview. The top-right
 `[preview]` and `[code]` controls replace the language hint chips for those files;
