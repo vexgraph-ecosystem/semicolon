@@ -86,8 +86,15 @@
  *     extensions, then generic file; borrowed static UTF-8, no IO or allocation.
  *   static bool setIconMode(const char *mode) — admit nerd/plain or THROW and retain
  *     the previous setting. Environment is read first; explicit CLI overrides it.
+ *   static uint32_t iconColor(uint32_t glyph) — fixed palette for icon glyphs only;
+ *     names do not inherit it.
+ *   static size_t railIndent(TerminalTreeRow, size_t) — shared indent geometry.
+ *   static void paintRailColors(Scene *, TerminalCanvas *, ...) — paint icon foregrounds
+ *     and hover-gray names after layout, preserving the text and background planes.
  *   Folder open/closed icons are selected from the visible row's expansion state;
  *   plain mode uses [] folders and - files. No automatic font detection is claimed.
+ *   Tree labels are white at rest and gray only under the pointer; hover does not
+ *     recolour the separate icon. The available terminal palette may quantize RGB.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
  * Private helpers:
@@ -110,7 +117,10 @@
  *   static TerminalPanel *buildCentre(Scene *, size_t)
  *   static void sceneBuild(Scene *, FileText *, size_t)
  *   static void sceneSyncRows(Scene *, const FileText *, size_t first, size_t left, size_t visible)
- *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
+  *   static size_t cellsOf/bytesForCells(const char *, size_t, ...)  cell offsets
+  *   static const char *fileIcon(const char *) / uint32_t iconColor(uint32_t)
+  *   static size_t railIndent(TerminalTreeRow, size_t)
+  *   static void paintRailColors(Scene *, TerminalCanvas *, bool, size_t, size_t)
  *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
  *   static bool glideActive(const ScrollGlide *)   a scroll is still in flight
  *   static void glideImpulse/glideHalt/glideClamp(const ScrollGlide *, ...)
@@ -273,11 +283,41 @@ static const char *fileIcon(const char *name) {
         {".sql", "\uf1c0"}, {".db", "\uf1c0"}, {".vexdb", "\uf1c0"},
         {".png", "\uf1c5"}, {".jpg", "\uf1c5"}, {".jpeg", "\uf1c5"},
         {".svg", "\uf1c5"}, {".gif", "\uf1c5"},
+        {".r", "\ue68a"}, {".f", "\ue69e"}, {".f90", "\ue69e"},
+        {".f95", "\ue69e"}, {".for", "\ue69e"},
     };
     for (size_t i = 0; i < sizeof icons / sizeof icons[0]; ++i)
         if (strcasecmp(extension, icons[i].extension) == 0)
             return icons[i].icon;
     return "\uf15b";
+}
+
+// INTENTIONAL(vex): the icon palette follows vex's requested language colours,
+// not upstream nvim-web-devicons defaults (notably Java, Python, C++, JSON and MD).
+// Defaults are presentation policy; icon glyph identity is independent of colour.
+static uint32_t iconColor(uint32_t glyph) {
+    switch (glyph) {
+        case 0xf07b: case 0xf07c: return 0xD7BA7DFFu; // folder gold
+        case 0xe738: return 0xE99545FFu; // Java orange
+        case 0xe74e: return 0xE5D45BFFu; // JavaScript yellow
+        case 0xe648: return 0x79B86AFFu; // C# green
+        case 0xe73c: return 0x56B6C2FFu; // Python turquoise
+        case 0xe628: case 0xe7ba: return 0x519ABAFFu; // TypeScript/React blue
+        case 0xe68a: return 0x8096B0FFu; // R gray-blue
+        case 0xe61e: case 0xf1dc: return 0x9993B5FFu; // C/header gray-purple
+        case 0xe61d: return 0xB18BDDFFu; // C++ purple
+        case 0xe69e: return 0xA074C4FFu; // Fortran purple
+        case 0xe60b: return 0xB294D6FFu; // JSON lavender
+        case 0xe73e: return 0x6BA6D9FFu; // Markdown blue
+        case 0xe627: return 0x56B6C2FFu; // Go cyan
+        case 0xe7a8: return 0xDEA584FFu; // Rust warm neutral
+        case 0xe755: case 0xe736: return 0xE99545FFu; // Swift/HTML orange
+        case 0xe749: return 0xB18BDDFFu; // CSS purple
+        case 0xf489: return 0x79B86AFFu; // shell green
+        case 0xe615: return 0x9993B5FFu; // configuration
+        case 0xf425: return 0xD7BA7DFFu; // build
+        default: return 0xA0A0AAFFu; // generic files, images and databases
+    }
 }
 
 static bool setIconMode(const char *mode) {
@@ -1061,16 +1101,19 @@ static void railBuild(const char *root) {
 // Compose one rail row: indentation, the fold marker, and the name. Presentation lives
 // here and structure lives in the tree, which is why the tree never had to know what a
 // folder looks like.
+static size_t railIndent(TerminalTreeRow row, size_t width) {
+    size_t deepest = width > 8u ? (width - 6u) / 2u : 1u;
+    size_t levels = row.depth + 1u;
+    return levels > deepest ? deepest : levels;
+}
+
 static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width) {
     // The rail sits UNDER the frame's left border, which is painted over the first cell of
     // every row - so the margin is not decoration, it is what keeps the tree off the
     // border. The design's rows have always carried it. One extra level of indent is
     // reserved for that margin; beyond that the indent stops growing so a deep node still
     // shows a name instead of nothing but spaces.
-    size_t deepest = width > 8u ? (width - 6u) / 2u : 1u;
-    size_t levels = row.depth + 1u;
-    if (levels > deepest)
-        levels = deepest;
+    size_t levels = railIndent(row, width);
     size_t at = 0;
     for (size_t level = 0; level < levels && at + 3u < size; ++level) {
         out[at++] = ' ';
@@ -1126,11 +1169,50 @@ static void sceneSyncRail(Scene *scene, size_t visible) {
                    scene->railWidth);
         (void) TerminalText_setText(row, scene->railText[index],
                                     strlen(scene->railText[index]));
-        (void) TerminalText_setForegroundColor(row, record.folder ? COL_ACCENT : COL_TEXT);
+        (void) TerminalText_setForegroundColor(row, 0xFFFFFFFFu);
         // The open file is the selection, and the tint is the one highlight in the shell.
         (void) TerminalText_setBackgroundColor(row, record.selected ? COL_SELECT
                                                                    : TERMINAL_COLOR_DEFAULT);
     }
+}
+
+// Colour only the icon/name cells AFTER normal tree layout. This is a presentation
+// pass over admitted cells, not ANSI inside text and not a second layout owner.
+// Geometry comes from railIndent/railFormat; clipping and selection backgrounds
+// survive because only the owned foreground plane changes. No allocation or IO.
+static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
+                            bool havePointer, size_t pointerX, size_t pointerY) {
+    size_t width = TerminalCanvas_getWidth(canvas);
+    size_t height = TerminalCanvas_getHeight(canvas);
+    size_t railEnd = scene->railWidth < width ? scene->railWidth : width;
+    size_t first = TerminalTreeView_scrollRow(gRail);
+    size_t count = TerminalTreeView_visibleCount(gRail);
+    for (size_t index = 0; index < scene->railRowCount && index + 2u < height
+                           && first + index < count; ++index) {
+        TerminalTreeRow row = TerminalTreeView_rowAt(gRail, first + index);
+        size_t iconX = railIndent(row, scene->railWidth) * 2u + 2u;
+        size_t nameX = iconX + (row.folder && !gNerdIcons ? 3u : 2u);
+        size_t y = index + 1u;
+        // Truncation ellipsis belongs to the visible name, not the row's whitespace.
+        size_t end = railEnd;
+        while (end > nameX && TerminalCanvas_glyphAt(canvas, end - 1u, y) == ' ')
+            --end;
+        bool hovered = havePointer && pointerY == y
+                    && pointerX >= nameX && pointerX < end;
+        if (hovered)
+            for (size_t x = nameX; x < end; ++x)
+                gFg[y * width + x] = 0xA0A0AAFFu;
+        if (gNerdIcons && iconX < railEnd)
+            gFg[y * width + iconX] = iconColor(TerminalCanvas_glyphAt(canvas, iconX, y));
+    }
+    // The tab strip is a literal row with bracketed labels; only private-use icon
+    // cells receive the palette, never the label, bracket, close mark or mode chips.
+    if (gNerdIcons)
+        for (size_t x = scene->railWidth; x < width; ++x) {
+            uint32_t glyph = TerminalCanvas_glyphAt(canvas, x, 0);
+            if (glyph >= 0xe000u && glyph <= 0xf8ffu)
+                gFg[x] = iconColor(glyph);
+        }
 }
 
 static TerminalPanel *buildRail(Scene *scene, size_t rowCount) {
@@ -1863,6 +1945,7 @@ static int dumpFrame(int width, int height, const FileText *file) {
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
+    paintRailColors(&scene, &canvas, false, 0, 0);
     drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth, false);
     for (int y = 0; y < height; ++y) {
         TerminalCanvasTextRow row = TerminalCanvas_copyRow(&canvas, (size_t) y);
@@ -2295,6 +2378,8 @@ static int runTerminal(FileText *file) {
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         sceneSyncRail(&scene, visible);
         TerminalPanel_paint(scene.root, &back);
+        paintRailColors(&scene, &back, interaction.havePointer,
+                         interaction.pointerX, interaction.pointerY);
         size_t divider = scene.railWidth - 1u;
         bool dividerHovered = interaction.havePointer
                            && interaction.pointerX + 1u >= divider
