@@ -79,6 +79,15 @@
  *     lineChip, railWidth, numberWidth, railRows[], railRowCount, railText[],
  *     breadcrumb, activeTab.
  *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
+ * ICON SETTINGS:
+ *   bool gNerdIcons = true — current user setting, overridden by environment/CLI.
+ *   char gTabLabels[4][128] — resident icon-prefixed labels borrowed by tab texts.
+ *   static const char *fileIcon(const char *name) — exact build names, then folded
+ *     extensions, then generic file; borrowed static UTF-8, no IO or allocation.
+ *   static bool setIconMode(const char *mode) — admit nerd/plain or THROW and retain
+ *     the previous setting. Environment is read first; explicit CLI overrides it.
+ *   Folder open/closed icons are selected from the visible row's expansion state;
+ *   plain mode uses [] folders and - files. No automatic font detection is claimed.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
  * Private helpers:
@@ -235,6 +244,50 @@ static char gGutter[TUI_MAX_ROWS][16];
 static char gLineChip[16];
 static char gBreadcrumb[192];
 static const char *gEmptyLine = "";
+// User-selected presentation setting; the terminal cannot report missing font glyphs.
+static bool gNerdIcons = true;
+static char gTabLabels[4][128];
+
+// One filename vocabulary for the rail and tabs. Nerd Fonts v3 BMP glyphs avoid
+// supplementary-plane wchar_t assumptions. Unknown types remain ordinary files.
+static const char *fileIcon(const char *name) {
+    if (!gNerdIcons)
+        return "-";
+    if (strcmp(name, "CMakeLists.txt") == 0 || strcmp(name, "Makefile") == 0)
+        return "\uf425";
+    const char *extension = strrchr(name, '.');
+    if (extension == nullptr)
+        return "\uf15b";
+    static const struct { const char *extension; const char *icon; } icons[] = {
+        {".c", "\ue61e"}, {".h", "\uf1dc"},
+        {".cpp", "\ue61d"}, {".cc", "\ue61d"}, {".hpp", "\uf1dc"},
+        {".m", "\ue61e"}, {".mm", "\ue61d"}, {".java", "\ue738"},
+        {".py", "\ue73c"}, {".rs", "\ue7a8"}, {".go", "\ue627"},
+        {".js", "\ue74e"}, {".ts", "\ue628"}, {".tsx", "\ue7ba"},
+        {".jsx", "\ue7ba"}, {".swift", "\ue755"}, {".cs", "\ue648"},
+        {".json", "\ue60b"}, {".jsonc", "\ue60b"},
+        {".yaml", "\ue615"}, {".yml", "\ue615"}, {".toml", "\ue615"},
+        {".md", "\ue73e"}, {".txt", "\uf15c"},
+        {".sh", "\uf489"}, {".zsh", "\uf489"},
+        {".html", "\ue736"}, {".xml", "\uf121"}, {".css", "\ue749"},
+        {".sql", "\uf1c0"}, {".db", "\uf1c0"}, {".vexdb", "\uf1c0"},
+        {".png", "\uf1c5"}, {".jpg", "\uf1c5"}, {".jpeg", "\uf1c5"},
+        {".svg", "\uf1c5"}, {".gif", "\uf1c5"},
+    };
+    for (size_t i = 0; i < sizeof icons / sizeof icons[0]; ++i)
+        if (strcasecmp(extension, icons[i].extension) == 0)
+            return icons[i].icon;
+    return "\uf15b";
+}
+
+static bool setIconMode(const char *mode) {
+    if (strcmp(mode, "nerd") != 0 && strcmp(mode, "plain") != 0) {
+        THROW("semicolon: icons must be nerd or plain");
+        return false;
+    }
+    gNerdIcons = strcmp(mode, "nerd") == 0;
+    return true;
+}
 
 // ---------------------------------------------------------------- file text
 
@@ -538,10 +591,12 @@ static TerminalPanel *buildChromeRow(Scene *scene) {
     scene->header = bar;
     scene->modeWidth = used;
     // The compact trick: the tab strip shares the chrome row, so it costs no row.
-    static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
+    static const char *tabLabels[] = { "helloWorld.c", "placeholder.txt", "terminal", "type.h" };
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
         bool open = i == TUI_ACTIVE_TAB;
-        TerminalText *tab = chip(open && gActiveTab[0] != '\0' ? gActiveTab : tabLabels[i]);
+        (void) snprintf(gTabLabels[i], sizeof gTabLabels[i], "%s %s  x",
+                         fileIcon(tabLabels[i]), tabLabels[i]);
+        TerminalText *tab = chip(open && gActiveTab[0] != '\0' ? gActiveTab : gTabLabels[i]);
         if (open)
             scene->activeTab = tab;
         (void) TerminalText_setForegroundColor(tab, open ? COL_TEXT : COL_MUTED);
@@ -847,7 +902,7 @@ static bool openFile(const char *path, TerminalTreeNodeId node) {
         breadcrumbFor(path, gBreadcrumb, sizeof gBreadcrumb);
         if (gScene->breadcrumb != nullptr)
             (void) TerminalText_setText(gScene->breadcrumb, gBreadcrumb, strlen(gBreadcrumb));
-        (void) snprintf(gActiveTab, sizeof gActiveTab, "%s  x", opened.name);
+        (void) snprintf(gActiveTab, sizeof gActiveTab, "%s %s  x", fileIcon(opened.name), opened.name);
         if (gScene->activeTab != nullptr)
             (void) TerminalText_setText(gScene->activeTab, gActiveTab, strlen(gActiveTab));
     }
@@ -1023,10 +1078,11 @@ static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width
     }
     // Disclosure shapes stay Unicode through the wide-character curses device boundary.
     if (row.folder)
-        (void) snprintf(out + at, size - at, "%s [] %s", row.expanded ? "⌄" : "›",
-                        row.label);
+        (void) snprintf(out + at, size - at, "%s %s %s", row.expanded ? "⌄" : "›",
+                         gNerdIcons ? (row.expanded ? "\uf07c" : "\uf07b") : "[]",
+                         row.label);
     else
-        (void) snprintf(out + at, size - at, "  %s", row.label);
+        (void) snprintf(out + at, size - at, "  %s %s", fileIcon(row.label), row.label);
     // Truncate on a CELL boundary and say so with one ellipsis: a row that silently loses
     // its tail cannot be told apart from a row with a shorter name.
     size_t available = width > 2u ? width - 2u : 0u;
@@ -2273,6 +2329,9 @@ static int runTerminal(FileText *file) {
 
 int main(int argc, char **argv) {
     initTextures();
+    const char *iconMode = getenv("SEMICOLON_ICONS");
+    if (iconMode != nullptr && !setIconMode(iconMode))
+        return 1;
     bool dump = false;
     bool fileGiven = false;
     int width = 0;
@@ -2284,12 +2343,18 @@ int main(int argc, char **argv) {
             puts("semicolon [--dump [WxH]] [--file PATH] [--help]");
             puts("  no arguments  draw the IDE shell on this terminal (Ctrl-C quits)");
             puts("  --root PATH   browse this project (default: the current directory)");
+            puts("  --icons MODE  nerd (default) or plain; overrides SEMICOLON_ICONS");
             puts("  --file PATH   open PATH in the editor (default: this project's session,"
                  " else its first file)");
             puts("  --dump        print one frame as plain text instead of using a terminal");
             puts("  --input-probe print the mouse and key events this terminal actually sends");
             puts("  --bg-probe    print the background colour this terminal reports (fades use it)");
             return 0;
+        }
+        if (strcmp(argv[i], "--icons") == 0 && i + 1 < argc) {
+            if (!setIconMode(argv[++i]))
+                return 1;
+            continue;
         }
         if (strcmp(argv[i], "--dump") == 0) {
             dump = true;
@@ -2356,7 +2421,7 @@ int main(int argc, char **argv) {
     }
     // The active tab names the file that is on screen. Set here, once, so the dumped frame
     // and the interactive shell cannot disagree about which file they are showing.
-    (void) snprintf(gActiveTab, sizeof gActiveTab, "%s  x", file.name);
+    (void) snprintf(gActiveTab, sizeof gActiveTab, "%s %s  x", fileIcon(file.name), file.name);
     int status = 0;
     if (dump) {
         if (width < 1)
