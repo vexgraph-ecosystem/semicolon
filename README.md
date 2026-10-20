@@ -92,6 +92,23 @@ overrides a valid environment setting. Unknown modes reject with a diagnostic.
 There is no settings screen or automatic font-coverage detection yet; terminal
 glyph appearance/width remains user acceptance. Icons do not replace `!!` warnings.
 
+### Icon colors and tree hover
+
+Only Nerd Font glyphs receive the file-type palette; folder and file names remain
+white at rest. The current palette follows the requested language associations:
+Java orange, JavaScript yellow, C# green, Python turquoise, TypeScript blue, R
+gray-blue, C/header gray-purple, C++ purple, Fortran purple, JSON lavender and
+Markdown blue. Other mapped languages have explicit colors; unknown icons use
+neutral gray. The same icon/color lookup is used in the project rail and tabs.
+The terminal's color capability may quantize these RGB values; on a 256-color
+terminal the renderer maps them to the nearest 6x6x6 cube entry.
+
+Hovering a visible project-tree filename or folder name changes just its text to
+gray while the pointer remains over its name. The icon keeps its file/folder color,
+and the name returns to white when the pointer leaves. Indentation, disclosure
+controls, whitespace and selected-row background are not recolored by hover. This
+is terminal pointer-cell hover, not editor-symbol hover or a graphical file dialog.
+
 Colour carries **real alpha**, which is what makes a fade possible. A terminal has no
 alpha channel — `SGR` sets *one* colour — so a translucent pen is composited by the
 shell before the device sees it: the background plane over the terminal's own
