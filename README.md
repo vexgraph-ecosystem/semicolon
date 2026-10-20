@@ -114,6 +114,13 @@ rail and tabs.
 The terminal's color capability may quantize these RGB values; on a 256-color
 terminal the renderer maps them to the nearest 6x6x6 cube entry.
 
+Markdown files open in rendered preview by default. The top editor controls are
+ordered `[code] [preview]`; either control is clickable to switch views. Empty
+language/run hints are omitted rather than leaving empty `[]` chips. Wrapped
+blockquote rows keep their colored left marker on each row, including soft wraps.
+The Semicolon PTY owner covers both control clicks and source-file selection from
+the rail; the Determinant Markdown owner covers wrapped quote markers.
+
 Hovering a visible project-tree filename or folder name changes just its text to
 gray while the pointer remains over its name. The icon keeps its file/folder color,
 and the name returns to white when the pointer leaves. Indentation, disclosure
