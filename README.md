@@ -21,7 +21,16 @@ directory it was started in (`--root PATH` overrides), so `cd <project> && semic
 shows that project; the **rail is its file tree**, read one directory at a time and
 folded by clicking; a click on a file opens it in the showable editor with live line
 numbers. `--file PATH` opens a specific file, and a per-project **session** (the open
-file, the divider) is remembered outside the project so the next run resumes.
+ file, the divider) is remembered outside the project so the next run resumes.
+
+`.md` and `.markdown` files start in a read-only rendered preview. The top-right
+`[preview]` and `[code]` controls replace the language hint chips for those files;
+the same control state follows files opened from the rail. Preview rows support the
+document's wrapped vertical scrolling, while Code shows the original bytes and
+keeps the shell's normal horizontal/vertical source scrolling. This uses
+Determinant's bounded GFM-ish terminal renderer, not a browser or a full CommonMark
+engine. Editing, saving, browser opening and Markdown features outside the
+renderer subset are not provided by this slice.
 
 **A present is a transaction.** Determinant brackets every frame that carries a
 change — the bracket opens only when there is something to send and closes even if a
