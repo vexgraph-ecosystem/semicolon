@@ -8,6 +8,7 @@
 #include "terminal/terminal_surface.h"
 #include "terminal/terminal_tree_view.h"
 #include "terminal/terminal_input.h"
+#include "terminal/terminal_markdown_view.h"
 #include "exception/throw.h"
 #include "annotation/definition.h"
 #include "annotation/overview.h"
@@ -57,8 +58,10 @@
  * the app does not paint keeps the terminal's own background. That is deliberate
  * — the theme belongs to whoever owns the terminal.
  *
- * The design itself is still a mock-up: the tree is a literal list, the tab strip
- * is static, and nothing is edited. The one real thing is the file in the editor. */
+ * The design itself is still a mock-up: the tab strip is static and nothing is
+ * edited. The project rail is read from the filesystem, and the editor shows one
+ * real file. Markdown files have a rendered, read-only terminal preview and a
+ * source toggle; editing and persistence remain future work. */
 ;;OVERVIEW
 /** ============================================================================
  * MODULE: semicolon terminal entry (src/main/tui-main.c)
@@ -77,7 +80,9 @@
  *   Scene     the tree, dynamic line-number field width, and runtime handles.
  *     root, header, rail, railId, tabSpacerId, modeWidth, rows[], rowCount,
  *     lineChip, railWidth, numberWidth, railRows[], railRowCount, railText[],
- *     breadcrumb, activeTab.
+ *     breadcrumb, activeTab, languageHints, runHint, codeMode, markdownModeSpacer,
+ *     previewMode, markdown, markdownFile, preview, codeModeWidth,
+ *     previewModeWidth, markdownModeGap.
  *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
  * ICON SETTINGS:
  *   bool gNerdIcons = true — current user setting, overridden by environment/CLI.
@@ -108,9 +113,17 @@
  *   static TerminalPanel *buildChromeRow(void) / buildStatusBar(Scene *, FileText *)
  *   static void railBuild(const char *)   the project as a tree, one level at a time
  *   static bool railReadChildren(id) / railRevealPath(path)
+ *   static unsigned fileSortGroup(const char *) / int compareDirEntries(...)
  *   static void railClick(y) / railScrollBy(rows)   the rail's pointer contract
  *   static void sceneSyncRail(Scene *)   point the row pool at the visible rows
  *   static bool openFile(path, node)   swap the editor's file, not the scene
+ *   static bool isMarkdownFile(name)  folded `.md`/`.markdown` extension gate
+ *   static void sceneMarkdownSource(Scene *, const FileText *)  borrow an admitted
+ *     Markdown file and update file-kind controls; default Markdown to preview
+ *   static void sceneSetMarkdownMode(Scene *, bool)  re-point active controls
+ *   static bool sceneMarkdownClick(Scene *, x, width)  map the top-right mode chips
+ *   static void sceneRenderMarkdown(Scene *, canvas, railWidth, numberWidth) cold
+ *     layout if needed, then hot paint into the content region
  *   static void cacheLoad/cacheSave(void)   the project's session, kept outside the tree
  *   static TerminalPanel *buildRail(Scene *, size_t rowCount)
  *   static TerminalPanel *buildEditor(Scene *, size_t)
@@ -155,7 +168,11 @@
  *   the terminal's own selection. Wheel scrolls three lines, a pointer resting on
  *   the top or bottom editor row scrolls one line per motion event, and a press
  *   within one cell of the divider begins a drag that resizes the rail. No file
- *   is written, no network is touched and no program is executed.
+ *   is written, no network is touched and no program is executed. A `.md` or
+ *   `.markdown` file starts in read-only Markdown preview; the top-right
+ *   `[preview]`/`[code]` controls switch presentation, and vertical scroll keys
+ *   and wheel move the wrapped preview rows. Opening another file updates the
+ *   controls and source borrow without rebuilding the scene.
  *   Colour carries REAL alpha: a translucent pen is composited over its cell's
  *   background, and that in turn over the device background, before the device is
  *   handed anything - a terminal has no alpha channel, so this is the only place a
@@ -329,6 +346,14 @@ static bool setIconMode(const char *mode) {
     return true;
 }
 
+static bool isMarkdownFile(const char *name) {
+    if (name == nullptr)
+        return false;
+    const char *extension = strrchr(name, '.');
+    return extension != nullptr
+        && (strcasecmp(extension, ".md") == 0 || strcasecmp(extension, ".markdown") == 0);
+}
+
 // ---------------------------------------------------------------- file text
 
 typedef struct FileText {
@@ -370,7 +395,49 @@ typedef struct Scene {
     // editor is not showing.
     TerminalText *breadcrumb;
     TerminalText *activeTab;
+    TerminalText *languageHints;
+    TerminalText *runHint;
+    TerminalText *codeMode;
+    TerminalText *markdownModeSpacer;
+    TerminalText *previewMode;
+    TerminalMarkdownView *markdown;
+    bool markdownFile;
+    bool preview;
+    size_t codeModeWidth;
+    size_t previewModeWidth;
+    size_t markdownModeGap;
 } Scene;
+
+static size_t editorFirstRow(void);
+static size_t codeLeftColumn(size_t railWidth, size_t numberWidth);
+
+static void sceneMarkdownSource(Scene *scene, const FileText *file) {
+    scene->markdownFile = isMarkdownFile(file->name);
+    if (scene->markdown == nullptr)
+        scene->markdown = TerminalMarkdownView();
+    if (scene->markdown == nullptr)
+        return;
+    (void) TerminalMarkdownView_setSource(scene->markdown,
+                                          scene->markdownFile ? file->lines : nullptr,
+                                          scene->markdownFile ? file->lineCount : 0u);
+    scene->preview = scene->markdownFile;
+    if (scene->languageHints != nullptr) {
+        const char *hints = scene->markdownFile ? "" : "20!!, 20!";
+        (void) TerminalText_setText(scene->languageHints, hints, strlen(hints));
+    }
+    if (scene->runHint != nullptr) {
+        const char *run = scene->markdownFile ? "" : "> run";
+        (void) TerminalText_setText(scene->runHint, run, strlen(run));
+    }
+    if (scene->codeMode != nullptr) {
+        const char *code = scene->markdownFile ? "[code]" : "";
+        (void) TerminalText_setText(scene->codeMode, code, strlen(code));
+    }
+    if (scene->previewMode != nullptr) {
+        const char *preview = scene->markdownFile ? "[preview]" : "";
+        (void) TerminalText_setText(scene->previewMode, preview, strlen(preview));
+    }
+}
 
 // SLOT RECORD: RailEntry
 typedef struct RailEntry {
@@ -955,6 +1022,7 @@ static bool openFile(const char *path, TerminalTreeNodeId node) {
     }
     gResetView = true;
     if (gScene != nullptr) {
+        sceneMarkdownSource(gScene, &opened);
         breadcrumbFor(path, gBreadcrumb, sizeof gBreadcrumb);
         if (gScene->breadcrumb != nullptr)
             (void) TerminalText_setText(gScene->breadcrumb, gBreadcrumb, strlen(gBreadcrumb));
@@ -1288,9 +1356,28 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     scene->rowCount = rowCount;
     // The action chips are a LAYERED sibling of the rows, so they paint on top of
     // the first editor row without taking a row of their own.
-    if (!putText(actions, plain("  ", COL_MUTED), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 2))
-        || !putText(actions, chip("20!!, 20!"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 11))
-        || !putText(actions, chip("> run"), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 8))) {
+    scene->languageHints = chip(scene->markdownFile ? "" : "20!!, 20!");
+    scene->runHint = chip(scene->markdownFile ? "" : "> run");
+    scene->codeMode = TerminalText(scene->markdownFile ? "[code]" : "");
+    scene->markdownModeSpacer = plain(" ", COL_MUTED);
+    scene->previewMode = TerminalText(scene->markdownFile ? "[preview]" : "");
+    scene->codeModeWidth = 6u;
+    scene->previewModeWidth = 9u;
+    scene->markdownModeGap = 1u;
+    if (scene->languageHints == nullptr || scene->runHint == nullptr || scene->codeMode == nullptr
+        || scene->markdownModeSpacer == nullptr || scene->previewMode == nullptr
+        || !putText(actions, scene->codeMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->codeModeWidth))
+        || !putText(actions, scene->markdownModeSpacer,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->markdownModeGap))
+        || !putText(actions, scene->previewMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->previewModeWidth))
+        || !putText(actions, plain("  ", COL_MUTED),
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 2u))
+        || !putText(actions, scene->languageHints,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 11u))
+        || !putText(actions, scene->runHint,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 8u))) {
         TerminalPanel_free(editor);
         TerminalPanel_free(gutter);
         TerminalPanel_free(code);
@@ -1336,6 +1423,8 @@ static TerminalPanel *buildCentre(Scene *scene, size_t rowCount) {
 
 static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t left,
                           size_t visible);
+static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth,
+                                size_t numberWidth);
 
 // Build the whole tree. Every child is built first and handed over afterwards, so
 // a refusal is detected before anything is partially wired. A failure here ends
@@ -1345,6 +1434,7 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
     *scene = (Scene) {0};
     scene->railWidth = 30;
     scene->numberWidth = GUTTER_MIN_NUMBER_WIDTH;
+    sceneMarkdownSource(scene, file);
     for (size_t largest = file->lineCount; largest >= 10u; largest /= 10u)
         ++scene->numberWidth;
     TerminalPanel *title = buildChromeRow(scene);
@@ -1397,6 +1487,11 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
                           size_t visible) {
     for (size_t i = 0; i < scene->rowCount; ++i) {
         TuiRow *row = &scene->rows[i];
+        if (scene->markdownFile && scene->preview) {
+            (void) TerminalText_setText(row->gutter, gEmptyLine, 0);
+            (void) TerminalText_setText(row->code, gEmptyLine, 0);
+            continue;
+        }
         if (i >= visible || first + i >= file->lineCount) {
             // Past the end: the gutter goes blank with the code, so the scroll-past
             // space reads as empty rather than as a continuation of the last line.
@@ -1444,7 +1539,53 @@ static void sceneSetRailWidth(Scene *scene, size_t width) {
 
 static void sceneFree(Scene *scene) {
     TerminalPanel_free(scene->root);   // frees every child, text and panel alike
+    TerminalMarkdownView_free(scene->markdown);
     scene->root = nullptr;
+    scene->markdown = nullptr;
+}
+
+static bool sceneSetMarkdownMode(Scene *scene, bool preview) {
+    if (scene == nullptr || !scene->markdownFile || scene->markdown == nullptr)
+        return false;
+    scene->preview = preview;
+    if (preview)
+        (void) TerminalMarkdownView_setScroll(scene->markdown, 0);
+    return true;
+}
+
+static bool sceneMarkdownClick(Scene *scene, size_t x, size_t width) {
+    if (scene == nullptr || !scene->markdownFile || scene->codeMode == nullptr
+        || scene->previewMode == nullptr || width < scene->codeModeWidth
+                                                   + scene->previewModeWidth
+                                                   + scene->markdownModeGap)
+        return false;
+    size_t first = width - scene->codeModeWidth - scene->previewModeWidth
+                 - scene->markdownModeGap;
+    if (x >= first && x < first + scene->previewModeWidth)
+        return sceneSetMarkdownMode(scene, true);
+    size_t second = first + scene->previewModeWidth + scene->markdownModeGap;
+    if (x >= second && x < second + scene->codeModeWidth)
+        return sceneSetMarkdownMode(scene, false);
+    return false;
+}
+
+static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth,
+                                size_t numberWidth) {
+    if (scene == nullptr || canvas == nullptr || !scene->markdownFile || !scene->preview
+        || scene->markdown == nullptr)
+        return;
+    size_t x = codeLeftColumn(railWidth, numberWidth);
+    size_t y = editorFirstRow() + 1u;
+    size_t width = TerminalCanvas_getWidth(canvas);
+    size_t height = TerminalCanvas_getHeight(canvas);
+    if (x >= width || y >= height)
+        return;
+    TerminalCanvas content = TerminalCanvas_sub(canvas, x, y, width - x, height - y - 1u);
+    if (!TerminalMarkdownView_setViewport(scene->markdown, TerminalCanvas_getWidth(&content)))
+        return;
+    (void) TerminalMarkdownView_setVisibleRows(scene->markdown, TerminalCanvas_getHeight(&content));
+    TerminalCanvas_fill(&content, ' ', TerminalPen());
+    TerminalMarkdownView_render(scene->markdown, &content);
 }
 
 // ---------------------------------------------------------------- ncurses side
@@ -1961,6 +2102,7 @@ static int dumpFrame(int width, int height, const FileText *file) {
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
+    sceneRenderMarkdown(&scene, &canvas, scene.railWidth, scene.numberWidth);
     paintRailColors(&scene, &canvas, false, 0, 0);
     drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth, false);
     for (int y = 0; y < height; ++y) {
@@ -2235,8 +2377,12 @@ static int runTerminal(FileText *file) {
                 // sequence instead of reaching the scroll step below.
 
                 ScrollStep step = scrollStepFor(key);
-                if (step.keyed)
-                    glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
+                if (step.keyed) {
+                    if (scene.preview && step.rows != 0)
+                        (void) TerminalMarkdownView_scrollBy(scene.markdown, step.rows);
+                    else
+                        glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
+                }
             }
             if (havePointer) {
                 TerminalPointerEvent event = TerminalInput_getEvent(&interaction.input);
@@ -2252,6 +2398,10 @@ static int runTerminal(FileText *file) {
                         // pointer says which list the user means, so no mode is needed.
                         if (event.x < divider) {
                             railScrollBy(down ? 1 : -1);
+                            break;
+                        }
+                        if (scene.preview && event.x >= codeLeft) {
+                            (void) TerminalMarkdownView_scrollBy(scene.markdown, down ? 1 : -1);
                             break;
                         }
                         // ANY modified wheel pans sideways, because terminals differ
@@ -2281,6 +2431,9 @@ static int runTerminal(FileText *file) {
                         // CATCH IT: a press ends any scroll in flight, which is what makes
                         // momentum safe to have - you can always stop it by touching.
                         glideHalt(&glide);
+                        if (event.y == 0u && scene.markdownFile
+                            && sceneMarkdownClick(&scene, event.x, (size_t) width))
+                            break;
                         // A press inside the rail is a file-browser click. Checked before
                         // the divider because the divider is its own edge: a rail row
                         // beside it must still open.
@@ -2394,6 +2547,7 @@ static int runTerminal(FileText *file) {
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         sceneSyncRail(&scene, visible);
         TerminalPanel_paint(scene.root, &back);
+        sceneRenderMarkdown(&scene, &back, scene.railWidth, scene.numberWidth);
         paintRailColors(&scene, &back, interaction.havePointer,
                          interaction.pointerX, interaction.pointerY);
         size_t divider = scene.railWidth - 1u;
