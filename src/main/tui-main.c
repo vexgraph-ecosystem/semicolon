@@ -75,8 +75,9 @@
  *   FileText  owned file bytes, line table, and the display name.
  *   TuiRow    one editor row: its gutter text and its code text.
  *   Scene     the tree, dynamic line-number field width, and runtime handles.
- *     root, rail, railId, rows[], rowCount, lineChip, railWidth, numberWidth,
- *     railRows[], railRowCount, railText[], breadcrumb, activeTab.
+ *     root, header, rail, railId, tabSpacerId, modeWidth, rows[], rowCount,
+ *     lineChip, railWidth, numberWidth, railRows[], railRowCount, railText[],
+ *     breadcrumb, activeTab.
  *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
@@ -255,8 +256,11 @@ typedef struct TuiRow {
 
 typedef struct Scene {
     TerminalPanel *root;
+    TerminalPanel *header;
     TerminalPanel *rail;
     TerminalChildId railId;
+    TerminalChildId tabSpacerId;
+    size_t modeWidth;
     TuiRow rows[TUI_MAX_ROWS];
     size_t rowCount;
     TerminalText *lineChip;
@@ -515,14 +519,24 @@ static TerminalPanel *buildChromeRow(Scene *scene) {
             ++used;
         }
     }
-    // The tab strip belongs to the CENTRE's columns, so the rest of the rail's width is
-    // reserved here rather than letting the tabs slide under the mode chips.
-    if (used < scene->railWidth
-        && !putText(bar, plain(" ", COL_TEXT),
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->railWidth - used))) {
+    // The tab strip follows the seam: this band reserves the current rail remainder and
+    // sceneSetRailWidth moves it when the user drags the divider.
+    TerminalText *tabSpacer = plain(" ", COL_TEXT);
+    if (tabSpacer == nullptr) {
         TerminalPanel_free(bar);
         return nullptr;
     }
+    scene->tabSpacerId = TerminalPanel_addText(
+        bar, tabSpacer,
+        TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                         scene->railWidth > used ? scene->railWidth - used : 0u));
+    if (!TerminalPanel_isChildId(scene->tabSpacerId)) {
+        TerminalText_free(tabSpacer);
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    scene->header = bar;
+    scene->modeWidth = used;
     // The compact trick: the tab strip shares the chrome row, so it costs no row.
     static const char *tabLabels[] = { "helloWorld.c  x", "placeholder.txt  x", "terminal  x", "type.h  x" };
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
@@ -1260,9 +1274,18 @@ static void sceneSetRailWidth(Scene *scene, size_t width) {
         width = TUI_RAIL_MIN;
     if (width == scene->railWidth)
         return;
+    size_t oldWidth = scene->railWidth;
+    if (!TerminalPanel_setAnchor(scene->root, scene->railId,
+                                 TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width)))
+        return;
+    size_t spacerWidth = width > scene->modeWidth ? width - scene->modeWidth : 0u;
+    if (!TerminalPanel_setAnchor(scene->header, scene->tabSpacerId,
+                                 TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, spacerWidth))) {
+        (void) TerminalPanel_setAnchor(scene->root, scene->railId,
+                                       TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, oldWidth));
+        return;
+    }
     scene->railWidth = width;
-    (void) TerminalPanel_setAnchor(scene->root, scene->railId,
-                                   TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width));
 }
 
 static void sceneFree(Scene *scene) {
@@ -1508,20 +1531,19 @@ static bool blitRun(void *context, TerminalRun run) {
     return true;
 }
 
-// The chrome the toolkit has no widget for yet: the rail's two verticals and the
-// panel's right edge, drawn over the painted tree. The divider moves with the
-// rail, which is why it takes the width rather than a constant.
+// The chrome the toolkit has no widget for yet: a compact hover grip at the rail seam.
 static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size_t railWidth,
                        bool dividerHovered) {
-    if (height < 3 || width < 4)
+    if (height < 5 || width < 4)
         return;
     if (!dividerHovered)
         return;
-    size_t rows = height - 2;
-    TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_MUTED);
-    // The seam is invisible at rest; hovering its drag target reveals the divider.
-    TerminalCanvas divider = TerminalCanvas_sub(canvas, railWidth - 1, 1, 1, rows);
-    TerminalCanvas_vline(&divider, 0, '|', pen);
+    size_t gripRows = height % 2u == 0u ? 4u : 3u;
+    size_t firstRow = (height - gripRows) / 2u;
+    TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_BOLD | TERMINAL_STYLE_MUTED);
+    // The seam stays invisible; hover reveals only a centered, parity-balanced handle.
+    for (size_t row = 0; row < gripRows; ++row)
+        TerminalCanvas_glyph(canvas, railWidth - 1u, firstRow + row, '|', pen);
 }
 
 // Row 0 is the chrome (title, undo/redo and the tab strip together) and the last
