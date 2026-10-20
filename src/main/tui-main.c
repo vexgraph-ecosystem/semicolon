@@ -121,7 +121,8 @@
  *   static void sceneMarkdownSource(Scene *, const FileText *)  borrow an admitted
  *     Markdown file and update file-kind controls; default Markdown to preview
  *   static void sceneSetMarkdownMode(Scene *, bool)  re-point active controls
- *   static bool sceneMarkdownClick(Scene *, x, width)  map the top-right mode chips
+ *   static bool sceneMarkdownClick(Scene *, x, width)  map the top-right [code]
+ *     then [preview] controls on the editor's first row
  *   static void sceneRenderMarkdown(Scene *, canvas, railWidth, numberWidth) cold
  *     layout if needed, then hot paint into the content region
  *   static void cacheLoad/cacheSave(void)   the project's session, kept outside the tree
@@ -424,10 +425,16 @@ static void sceneMarkdownSource(Scene *scene, const FileText *file) {
     if (scene->languageHints != nullptr) {
         const char *hints = scene->markdownFile ? "" : "20!!, 20!";
         (void) TerminalText_setText(scene->languageHints, hints, strlen(hints));
+        (void) TerminalText_setBrackets(scene->languageHints,
+                                        scene->markdownFile ? 0u : '[',
+                                        scene->markdownFile ? 0u : ']');
     }
     if (scene->runHint != nullptr) {
         const char *run = scene->markdownFile ? "" : "> run";
         (void) TerminalText_setText(scene->runHint, run, strlen(run));
+        (void) TerminalText_setBrackets(scene->runHint,
+                                        scene->markdownFile ? 0u : '[',
+                                        scene->markdownFile ? 0u : ']');
     }
     if (scene->codeMode != nullptr) {
         const char *code = scene->markdownFile ? "[code]" : "";
@@ -1358,6 +1365,12 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     // the first editor row without taking a row of their own.
     scene->languageHints = chip(scene->markdownFile ? "" : "20!!, 20!");
     scene->runHint = chip(scene->markdownFile ? "" : "> run");
+    (void) TerminalText_setBrackets(scene->languageHints,
+                                    scene->markdownFile ? 0u : '[',
+                                    scene->markdownFile ? 0u : ']');
+    (void) TerminalText_setBrackets(scene->runHint,
+                                    scene->markdownFile ? 0u : '[',
+                                    scene->markdownFile ? 0u : ']');
     scene->codeMode = TerminalText(scene->markdownFile ? "[code]" : "");
     scene->markdownModeSpacer = plain(" ", COL_MUTED);
     scene->previewMode = TerminalText(scene->markdownFile ? "[preview]" : "");
@@ -1366,12 +1379,12 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
     scene->markdownModeGap = 1u;
     if (scene->languageHints == nullptr || scene->runHint == nullptr || scene->codeMode == nullptr
         || scene->markdownModeSpacer == nullptr || scene->previewMode == nullptr
-        || !putText(actions, scene->codeMode,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->codeModeWidth))
-        || !putText(actions, scene->markdownModeSpacer,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->markdownModeGap))
         || !putText(actions, scene->previewMode,
                     TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->previewModeWidth))
+        || !putText(actions, scene->markdownModeSpacer,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->markdownModeGap))
+        || !putText(actions, scene->codeMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->codeModeWidth))
         || !putText(actions, plain("  ", COL_MUTED),
                     TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 2u))
         || !putText(actions, scene->languageHints,
@@ -1561,11 +1574,11 @@ static bool sceneMarkdownClick(Scene *scene, size_t x, size_t width) {
         return false;
     size_t first = width - scene->codeModeWidth - scene->previewModeWidth
                  - scene->markdownModeGap;
-    if (x >= first && x < first + scene->previewModeWidth)
-        return sceneSetMarkdownMode(scene, true);
-    size_t second = first + scene->previewModeWidth + scene->markdownModeGap;
-    if (x >= second && x < second + scene->codeModeWidth)
+    if (x >= first && x < first + scene->codeModeWidth)
         return sceneSetMarkdownMode(scene, false);
+    size_t previewStart = first + scene->codeModeWidth + scene->markdownModeGap;
+    if (x >= previewStart && x < previewStart + scene->previewModeWidth)
+        return sceneSetMarkdownMode(scene, true);
     return false;
 }
 
@@ -2431,7 +2444,7 @@ static int runTerminal(FileText *file) {
                         // CATCH IT: a press ends any scroll in flight, which is what makes
                         // momentum safe to have - you can always stop it by touching.
                         glideHalt(&glide);
-                        if (event.y == 0u && scene.markdownFile
+                        if (event.y == editorFirstRow() && scene.markdownFile
                             && sceneMarkdownClick(&scene, event.x, (size_t) width))
                             break;
                         // A press inside the rail is a file-browser click. Checked before
