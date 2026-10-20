@@ -77,6 +77,21 @@ terminal sends. The vertical edge zone sits two rows above it.
 
 The rail divider is **draggable**.
 
+### Icon setting
+
+Nerd Font icons are the default: distinct open/closed folders and filename-based
+file icons in the rail and tabs. Exact build names (Makefile, CMakeLists.txt) take
+precedence over case-insensitive extensions; unknown files get a generic icon.
+C and header files have distinct badges. This is presentation, not language detection.
+
+Select a Nerd Font in your terminal's font preferences. For an unpatched font,
+use `semicolon --icons plain` or persist `SEMICOLON_ICONS=plain` in your shell
+environment. Plain mode keeps Unicode disclosures and uses `[]` folders and `-`
+files, with no private-use icons. `--icons nerd` selects icons explicitly and
+overrides a valid environment setting. Unknown modes reject with a diagnostic.
+There is no settings screen or automatic font-coverage detection yet; terminal
+glyph appearance/width remains user acceptance. Icons do not replace `!!` warnings.
+
 Colour carries **real alpha**, which is what makes a fade possible. A terminal has no
 alpha channel — `SGR` sets *one* colour — so a translucent pen is composited by the
 shell before the device sees it: the background plane over the terminal's own
