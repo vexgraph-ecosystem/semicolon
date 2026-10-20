@@ -297,25 +297,25 @@ static const char *fileIcon(const char *name) {
 // Defaults are presentation policy; icon glyph identity is independent of colour.
 static uint32_t iconColor(uint32_t glyph) {
     switch (glyph) {
-        case 0xf07b: case 0xf07c: return 0xD7BA7DFFu; // folder gold
-        case 0xe738: return 0xE99545FFu; // Java orange
-        case 0xe74e: return 0xE5D45BFFu; // JavaScript yellow
-        case 0xe648: return 0x79B86AFFu; // C# green
-        case 0xe73c: return 0x56B6C2FFu; // Python turquoise
-        case 0xe628: case 0xe7ba: return 0x519ABAFFu; // TypeScript/React blue
-        case 0xe68a: return 0x8096B0FFu; // R gray-blue
-        case 0xe61e: case 0xf1dc: return 0x9993B5FFu; // C/header gray-purple
-        case 0xe61d: return 0xB18BDDFFu; // C++ purple
-        case 0xe69e: return 0xA074C4FFu; // Fortran purple
-        case 0xe60b: return 0xB294D6FFu; // JSON lavender
-        case 0xe73e: return 0x6BA6D9FFu; // Markdown blue
+        case 0xf07b: case 0xf07c: return 0xC58A52FFu; // folder brown
+        case 0xe738: return 0xF08A32FFu; // Java orange
+        case 0xe74e: return 0xF0D746FFu; // JavaScript yellow
+        case 0xe648: return 0x75C84DFFu; // C# green
+        case 0xe73c: return 0x28C5B0FFu; // Python turquoise
+        case 0xe628: case 0xe7ba: return 0x3399FFFFu; // TypeScript/React blue
+        case 0xe68a: return 0x769BCEFFu; // R gray-blue
+        case 0xe61e: case 0xf1dc: return 0xA88AF2FFu; // C/header gray-purple
+        case 0xe61d: return 0xC678DDFFu; // C++ purple
+        case 0xe69e: return 0xAB78E3FFu; // Fortran purple
+        case 0xe60b: return 0xC792EAFFu; // JSON lavender
+        case 0xe73e: return 0x5CA9FFFFu; // Markdown blue
         case 0xe627: return 0x56B6C2FFu; // Go cyan
         case 0xe7a8: return 0xDEA584FFu; // Rust warm neutral
         case 0xe755: case 0xe736: return 0xE99545FFu; // Swift/HTML orange
         case 0xe749: return 0xB18BDDFFu; // CSS purple
         case 0xf489: return 0x79B86AFFu; // shell green
         case 0xe615: return 0x9993B5FFu; // configuration
-        case 0xf425: return 0xD7BA7DFFu; // build
+        case 0xf425: return 0xC58A52FFu; // build
         default: return 0xA0A0AAFFu; // generic files, images and databases
     }
 }
@@ -723,12 +723,28 @@ typedef struct DirEntry {
     bool folder;
 } DirEntry;
 
+static unsigned fileSortGroup(const char *name) {
+    const char *extension = strrchr(name, '.');
+    if (extension != nullptr && strcasecmp(extension, ".c") == 0)
+        return 0u;
+    if (extension != nullptr && strcasecmp(extension, ".h") == 0)
+        return 1u;
+    return 2u;
+}
+
 static int compareDirEntries(const void *left, const void *right) {
     const DirEntry *a = left;
     const DirEntry *b = right;
     if ((*a).folder != (*b).folder)
         return (*a).folder ? -1 : 1;              // folders first, like every browser
-    return strcasecmp((*a).name, (*b).name);
+    if (!(*a).folder) {
+        unsigned groupA = fileSortGroup((*a).name);
+        unsigned groupB = fileSortGroup((*b).name);
+        if (groupA != groupB)
+            return groupA < groupB ? -1 : 1;
+    }
+    int folded = strcasecmp((*a).name, (*b).name);
+    return folded != 0 ? folded : strcmp((*a).name, (*b).name);
 }
 
 static RailEntry *railEntryFor(TerminalTreeNodeId id) {
