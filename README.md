@@ -95,11 +95,13 @@ glyph appearance/width remains user acceptance. Icons do not replace `!!` warnin
 ### Icon colors and tree hover
 
 Only Nerd Font glyphs receive the file-type palette; folder and file names remain
-white at rest. The current palette follows the requested language associations:
-Java orange, JavaScript yellow, C# green, Python turquoise, TypeScript blue, R
-gray-blue, C/header gray-purple, C++ purple, Fortran purple, JSON lavender and
-Markdown blue. Other mapped languages have explicit colors; unknown icons use
-neutral gray. The same icon/color lookup is used in the project rail and tabs.
+white at rest. Colors are deliberately more saturated for readable contrast, and
+folders use brown rather than gold. The palette follows the requested language
+associations: Java orange, JavaScript yellow, C# green, Python turquoise,
+TypeScript blue, R gray-blue, C/header gray-purple, C++ purple, Fortran purple,
+JSON lavender and Markdown blue. Other mapped languages have explicit colors;
+unknown icons use neutral gray. The same icon/color lookup is used in the project
+rail and tabs.
 The terminal's color capability may quantize these RGB values; on a 256-color
 terminal the renderer maps them to the nearest 6x6x6 cube entry.
 
@@ -108,6 +110,12 @@ gray while the pointer remains over its name. The icon keeps its file/folder col
 and the name returns to white when the pointer leaves. Indentation, disclosure
 controls, whitespace and selected-row background are not recolored by hover. This
 is terminal pointer-cell hover, not editor-symbol hover or a graphical file dialog.
+
+Within each directory, folders remain first; C source files then sort together
+alphabetically, followed by C headers sorted alphabetically, then all other files
+alphabetically. This keeps a project's `.c` files together instead of interleaving
+each source with its matching `.h` file. Case-insensitive names sort first, with an
+exact-case tie-break for deterministic ordering.
 
 Colour carries **real alpha**, which is what makes a fade possible. A terminal has no
 alpha channel — `SGR` sets *one* colour — so a translucent pen is composited by the
