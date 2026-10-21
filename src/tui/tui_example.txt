@@ -1,5 +1,5 @@
 ┌-[;]-[>w< agents]-----[<-|->]┐[helloworld.c  x][placeholder.txt  x][terminal  x][cmakelists.txt  x][another-...┐ <- three dots needed when it is being warped
-| v [] vexgraph               |   1.  #include "whatever.h"                                 [> run] [20!!, 20!] |
+| v [] vexgraph               |   1.   #include "whatever.h"                                 [> run] [20!!, 20!] |
 |   v [] src                  |   2.  int main() {                                                              |
 |       {} opencode.json      |   3.       Hello *h = Hello();                                                  |
 |       Aa hello.txt          |   4.       return 0;                                                            |
@@ -146,6 +146,11 @@ check      v x ! ? i
 blocks     # % @
 ```
 
+Direction,Character,Unicode,Name
+Right (closed dropdown),›,U+203A,Single Right-Pointing Angle Quotation Mark
+Down (open dropdown),⌄,U+2304,Down Arrowhead
+Up,⌃,U+2303,Up Arrowhead
+
 Two notes that matter for this workspace:
 
 - Cells in Determinant are **codepoints**, not bytes, so any of the above drops straight into `TerminalCanvas_glyph` / `TerminalRule` fields. The `CP_*` defines in `terminal_appearance.c` are just where the current presets spell their five or six glyphs.
@@ -202,8 +207,29 @@ Want me to drop this in as a `terminal_glyph.h` table of named codepoint constan
  bf - brainfuck idk
  im - any image format or anything...
 
+BONELESS, BORDERLESS, a much better design i think...
 
+[(); Code] [>w< agents]        |[helloworld.c  x][placeholder.txt  x][terminal  x][cmakelists.txt  x][another-...
+  ⌄ [] vexgraph (main proj...|{ Warning goes here! you might wanna do smth here               [label goes here]} <- header problems, if any
+    ⌄ [] src                 |   1.  #include "whatever.h"                              [>> run][20!!, 20!, 20?] <- errors, warnings, suggestions, run uses b btw...
+        {} opencode.json     |   2.  int main()                                                  [code][preview] <- if markdown
+        Aa hello.txt         |   3.       return 0;                                            [open in browser] <- opens in browser obv
+         J example.java      |   4.  }
+         C whatever.c        |   5.
+        C+ whatever.cpp      |   6.
+        oC shim.m            |   7.
+    › [] new folder          |   8.
+    › [] another folder      |   9.
+    › [] abcdefghijklmnopq...|  10.
+                           ^ ^  11.
+              trailing lines ^ this line is just invisible but this is the limit for the stuff... yknow...
+                               this is invisible, not supposed to show, but rather a line limit...
+                               only show when it is being hovered (thru an event, that way)
+                                15.
+                                16.
+                                17
+                                18.
+                                19.
+                                20.
 
-
-
-
+need that...

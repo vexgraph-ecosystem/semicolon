@@ -23,12 +23,17 @@
 #include <string.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <spawn.h>
 #include <strings.h>
+#include <time.h>
 #include <termios.h>
 #include <unistd.h>
 #include <ncurses.h>
+
+extern char **environ;
 
 ;;DEFINITION
 /** The semicolon IDE shell: the design from src/tui/tui_example.txt, drawing a
@@ -58,10 +63,10 @@
  * the app does not paint keeps the terminal's own background. That is deliberate
  * — the theme belongs to whoever owns the terminal.
  *
- * The design itself is still a mock-up: the tab strip is static and nothing is
- * edited. The project rail is read from the filesystem, and the editor shows one
- * real file. Markdown files have a rendered, read-only terminal preview and a
- * source toggle; editing and persistence remain future work. */
+ * The project rail is read from the filesystem, and the editor shows one real
+ * file. Markdown files have a rendered, read-only terminal preview and a source
+ * toggle. Code view edits UTF-8 rows and attempts a staged save one second after
+ * the last edit; a failure keeps the dirty buffer resident. */
 ;;OVERVIEW
 /** ============================================================================
  * MODULE: semicolon terminal entry (src/main/tui-main.c)
@@ -73,17 +78,58 @@
  *   gRule/gSpaces/emptyLine         static textures: separators and blank runs.
  *   gGutter[TUI_MAX_ROWS][16]       per-row line-number text buffers.
  *   gLineChip[16]                   the status bar's line-position text buffer.
+ *   gSaveLabel[16]                  saved/dirty/error status text.
  *   gPairs[]                        registered ncurses colour pairs.
- * STRUCTS:
- *   FileText  owned file bytes, line table, and the display name.
- *   TuiRow    one editor row: its gutter text and its code text.
- *   Scene     the tree, dynamic line-number field width, and runtime handles.
- *     root, header, rail, railId, tabSpacerId, modeWidth, rows[], rowCount,
- *     lineChip, railWidth, numberWidth, railRows[], railRowCount, railText[],
- *     breadcrumb, activeTab, languageHints, runHint, codeMode, markdownModeSpacer,
- *     previewMode, markdown, markdownFile, preview, codeModeWidth,
- *     previewModeWidth, markdownModeGap.
- *   Interaction  the mouse decoder, the grab flag and the last pointer cell.
+ * STRUCT FIELDS:
+ *   FileText (the open document, one heap-owned NUL-terminated row per line):
+ *     char **lineStorage — owned editable UTF-8 rows.
+ *     size_t length — serialized byte count including line endings.
+ *     const char **lines — borrowed aliases to rows for rendering and Markdown.
+ *     size_t *lineLengths — UTF-8 bytes excluding line endings.
+ *     size_t *lineCapacities — allocated bytes per row including NUL.
+ *     uint8_t *lineEndings — NONE/LF/CRLF serialization marker per row.
+ *     size_t lineCount, lineCapacity — live rows and growable directory capacity.
+ *     size_t longestCells, longestLine — horizontal extent and its row index.
+ *     size_t cursorLine, cursorByte — caret position; byte offset is a scalar boundary.
+ *     bool cursorVisible — paint the reverse-style caret after keyboard interaction.
+ *     uint64_t lastEditNs — monotonic time of last document mutation.
+ *     bool dirty, saveFailed, baselineValid — pending, refused and identity states.
+ *     struct stat baseline — original file identity/size/mtime for conflict detection.
+ *     char name[64] — breadcrumb display basename.
+ *   TuiRow:
+ *     TerminalText *gutter — line number object.
+ *     TerminalText *code — source text object.
+ *   Scene:
+ *     TerminalPanel *root, *header, *rail — retained component tree.
+ *     TerminalPanel *editor — borrowed child of centre, for live gutter geometry.
+ *     TerminalChildId railId, gutterId — child identities in their owning panels.
+ *     size_t modeWidth — top-row mode band.
+ *     TuiRow rows[TUI_MAX_ROWS]; size_t rowCount — fixed visible code-row objects.
+ *     TerminalText *lineChip, *saveChip — footer viewport and save-state labels.
+ *     size_t railWidth, numberWidth — current layout geometry.
+ *     TerminalText *railRows[TUI_MAX_ROWS]; size_t railRowCount — visible rail rows.
+ *     char railText[TUI_MAX_ROWS][TUI_RAIL_TEXT] — storage borrowed by those rows.
+ *     TerminalText *breadcrumb, *activeTab — current file identity labels.
+ *     TerminalText *languageHints, *runHint — code-mode action hints.
+ *     TerminalText *codeMode, *markdownModeSpacer, *previewMode — Markdown controls.
+ *     TerminalMarkdownView *markdown — borrowed-source renderer instance.
+ *     bool markdownFile, preview — file kind and active presentation mode.
+ *     size_t codeModeWidth, previewModeWidth, markdownModeGap — control geometry.
+ *     TerminalMarkdownCodeBlock hoverBlock — shaded block under the pointer.
+ *     bool hoverCopy — pointer rests on that block's Copy chip.
+ *     char markdownNotice[48]; uint64_t markdownNoticeUntilNs — transient copy notice.
+ *   RailEntry slot record: char label[TUI_RAIL_TEXT] (tree-borrowed name);
+ *     char path[1024] (opened path); TerminalTreeNodeId parent (tree parent);
+ *     bool loaded (children were read once).
+ *   Interaction: TerminalInput input (mouse decoder); bool grabbing, tracking,
+ *     pressed, havePointer (gesture state); size_t trackX, trackLeft, grabX,
+ *     grabWidth, pointerX, pointerY (gesture origin and last pointer cell).
+ *   ScrollGlide slot record: double rowShown, rowTarget, columnShown,
+ *     columnTarget (fractional and target viewport offsets).
+ *   DirEntry slot record: char name[TUI_RAIL_TEXT] (sorted entry name);
+ *     bool folder (directory classification).
+ *   ScrollStep slot record: bool keyed (recognized navigation key);
+ *     int rows, columns (viewport delta).
  * ICON SETTINGS:
  *   bool gNerdIcons = true — current user setting, overridden by environment/CLI.
  *   char gTabLabels[4][128] — resident icon-prefixed labels borrowed by tab texts.
@@ -95,11 +141,11 @@
  *     names do not inherit it.
  *   static size_t railIndent(TerminalTreeRow, size_t) — shared indent geometry.
  *   static void paintRailColors(Scene *, TerminalCanvas *, ...) — paint icon foregrounds
- *     and hover-gray names after layout, preserving the text and background planes.
+ *     after layout, preserving the text and background planes.
  *   Folder open/closed icons are selected from the visible row's expansion state;
  *   plain mode uses [] folders and - files. No automatic font detection is claimed.
- *   Tree labels are white at rest and gray only under the pointer; hover does not
- *     recolour the separate icon. The available terminal palette may quantize RGB.
+ *   Tree labels stay white under the pointer; pointer hover is reserved for the
+ *     divider grip and never recolours a file or folder name.
  * FUNCTION REGISTRY:
  * ----------------------------------------------------------------------------
  * Private helpers:
@@ -107,6 +153,16 @@
  *   static void initTextures(void)
  *   static bool fileLoad(FileText *, const char *)
  *   static void fileFree(FileText *)
+ *   static bool fileSave(FileText *, const char *)   staged atomic replacement + conflict check
+ *   static bool fileReserveLines/fileAddLine/fileReserveLine(...)
+ *   static bool fileInsertBytes/fileSplit/fileJoinPrevious/fileBackspace/fileDeleteForward(...)
+ *   static void fileMoveLeft/fileMoveRight/fileMoveVertical(...)
+ *   static uint64_t monotonicNowNs(void) / bool autosave(FileText *, const char *)
+ *   static bool writeAll(int, const char *, size_t) / statMatches(stat, stat)
+ *   static void setSaveStatus(Scene *, const FileText *)
+ *   static void keepCursorVisible(FileText *, ScrollGlide *, ...) / paintEditorCursor(...)
+ *   static bool editorKey(FileText *, int)
+ *   static void editorKey(FileText *, int) / autosave(FileText *, const char *)
  *   static TerminalText *chip(const char *)
  *   static TerminalText *plain(const char *, uint32_t)
  *   static bool putText(parent, text, anchor) / putPanel(parent, panel, anchor)
@@ -121,10 +177,24 @@
  *   static void sceneMarkdownSource(Scene *, const FileText *)  borrow an admitted
  *     Markdown file and update file-kind controls; default Markdown to preview
  *   static void sceneSetMarkdownMode(Scene *, bool)  re-point active controls
+ *   static bool sceneUpdateNumberWidth(Scene *, const FileText *)
+ *     resize the line-number band when the open file crosses a digit boundary
+ *   static void sceneUpdateEdgeRailHandle(Scene *) / folderHandleIcon(void)
+ *     keep the folder affordance tied to the file rail's hidden state
  *   static bool sceneMarkdownClick(Scene *, x, width)  map the top-right [code]
  *     then [preview] controls on the editor's first row
- *   static void sceneRenderMarkdown(Scene *, canvas, railWidth, numberWidth) cold
- *     layout if needed, then hot paint into the content region
+ *   static void sceneRenderMarkdown(Scene *, canvas, railWidth) cold layout if
+ *     needed, then hot paint into content three cells after the rail
+ *   static MarkdownContent sceneMarkdownContent(...) the one content rect shared by
+ *     render, hover and copy, so the three cannot drift apart
+ *   static void sceneMarkdownClearFeedback/ClearNotice/SetNotice(...) transient state
+ *   static void sceneMarkdownUpdateHover(...) map a pointer cell to a shaded block
+ *     and its top-right Copy chip; Scroll/Resize/mode/open clear it
+ *   static bool sceneMarkdownCopyClick(...) recompute hover, then copy its block
+ *   static bool sceneMarkdownCopyBlock(...) newline-join a bounded source block and
+ *     write OSC 52; an over-cap block refuses with a visible notice
+ *   static Base64Text base64Encode(...) owned clipboard text, freed by the caller
+ *   static void sceneMarkdownPaintChip/PaintNotice(...) cold overlays on that rect
  *   static void cacheLoad/cacheSave(void)   the project's session, kept outside the tree
  *   static TerminalPanel *buildRail(Scene *, size_t rowCount)
  *   static TerminalPanel *buildEditor(Scene *, size_t)
@@ -147,7 +217,8 @@
  *   static bool parsePackedHex(const char *, uint32_t *)
  *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
  *   static bool blitRun(void *, TerminalRun)   wide-character ncurses output
- *   static void drawChrome(canvas, width, height, size_t railWidth)
+ *   static void drawChrome(canvas, width, height, railWidth, markdownPreview,
+ *     dividerHovered)  paint the single-column preview seam or the code-mode grip
  *   static void handlePointer(Scene *, Interaction *, int width, int height)
  *   static int dumpFrame(int, int, FileText *)
  *   static void frameBracket(void *, TerminalPresentPhase)  the frame transaction
@@ -168,8 +239,10 @@
  *   drag both arrive; it is disabled again on exit, which hands the mouse back to
  *   the terminal's own selection. Wheel scrolls three lines, a pointer resting on
  *   the top or bottom editor row scrolls one line per motion event, and a press
- *   within one cell of the divider begins a drag that resizes the rail. No file
- *   is written, no network is touched and no program is executed. A `.md` or
+ *   within one cell of the divider begins a drag that resizes the rail. Code view
+ *   inserts printable UTF-8 bytes, splits/joins/deletes lines and autosaves after one
+ *   idle second; Markdown preview is read-only. Save conflicts preserve the open buffer.
+ *   No network is touched and no program is executed. A `.md` or
  *   `.markdown` file starts in read-only Markdown preview; the top-right
  *   `[preview]`/`[code]` controls switch presentation, and vertical scroll keys
  *   and wheel move the wrapped preview rows. Opening another file updates the
@@ -194,20 +267,44 @@
 #else
 #define TUI_STATE_DIR ".local/state/vexgraph/semicolon"
 #endif
-#define TUI_MAX_FILE_BYTES (4u * 1024u * 1024u)
+#define TUI_FILE_READ_CHUNK 65536u
+#define TUI_AUTOSAVE_DELAY_NS 1000000000ULL
+#define TUI_INITIAL_LINE_CAPACITY 64u
+#define TUI_DEFAULT_LINE_CAPACITY 64u
+#define TUI_LINE_ENDING_NONE 0u
+#define TUI_LINE_ENDING_LF 1u
+#define TUI_LINE_ENDING_CRLF 2u
+#define TUI_INDENT_SPACES 4u
 #define GUTTER_MIN_NUMBER_WIDTH 1u
 // The design puts TWO cells between the number field and the first code cell. It is a reserved band in the
 // editor's flow rather than padding copied into every line, which keeps the code text a
 // borrowed pointer into the file instead of a per-frame copy.
 #define TUI_CODE_PAD 2u
-// The breadcrumb's band. It is a FIXED width rather than the width of whatever it says,
-// because the crumb is re-pointed whenever the open file changes: a band measured once
-// would clip every later path, and the design draws the crumb area wide enough for exactly
-// that reason.
+#define TUI_MARKDOWN_DIVIDER_OFFSET 1u
+#define TUI_MARKDOWN_CONTENT_OFFSET 3u
+// A hovered fenced block grows a Copy chip at its top-right. The source cap keeps the
+// OSC 52 escape bounded: a clipboard write is a cold user action, but a terminal still
+// deserves a sequence it can actually swallow.
+#define TUI_MARKDOWN_COPY_LABEL "[copy]"
+#define TUI_MARKDOWN_COPY_MAX_BYTES 65536u
+#define TUI_MARKDOWN_NOTICE_NS 1500000000ULL
+#define TUI_MARKDOWN_CONTROLS_WIDTH 15u
+#define TUI_MARKDOWN_BROWSER_CELLS 17u
+#define TUI_RUN_CHIP_CELLS 8u
+#define TUI_HINT_CHIP_CELLS 16u
+#define TUI_WARNING_LABEL_CELLS 16u
+#define TUI_LINE_CHIP_CELLS 12u
+#define TUI_PROJECT_CHIP_CELLS 16u
+#define TUI_STATUS_LEFT_CELLS 11u
+// The breadcrumb's maximum band. The actual band is computed from the terminal width so
+// the footer keeps its chips on an 80-column terminal instead of clipping them.
 #define TUI_CRUMB_CELLS 44u
+#define TUI_CRUMB_MIN_CELLS 20u
 #define TUI_POLL_MS 100
 #define TUI_RAIL_MIN 12u
 #define TUI_RAIL_MARGIN 24u
+// Two clicks on the splitter within this window collapse the rail.
+#define TUI_DOUBLE_CLICK_NS 350000000ULL
 // One wheel notch asks for ONE line, not three. A trackpad quantises a single gesture
 // into dozens of notches, so three each was a screen-and-a-half per flick.
 #define TUI_SCROLL_ROWS 1u
@@ -267,14 +364,27 @@ static uint32_t gFrontCells[TUI_MAX_W * TUI_MAX_H];
 static uint8_t gFrontStyles[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontFg[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontBg[TUI_MAX_W * TUI_MAX_H];
-static char gRule[512];
 static char gGutter[TUI_MAX_ROWS][16];
-static char gLineChip[16];
+static char gLineChip[32];
+static char gProjectChip[64] = "[vexgraph]";
+static char gTimeChip[16] = "[--:--:--]";
+static char gWarningText[256];
+static char gWarningLabel[16];
+static char gWarningLabelText[32];
 static char gBreadcrumb[192];
 static const char *gEmptyLine = "";
+// The editor starts one row below the header. A warning header occupies a second row
+// and pushes only the centre down; the rail stays exactly where it was.
+static size_t gEditorFirstRow = 1u;
+// The live terminal width, so a header or footer built before its first paint can still
+// decide how much room it has for a tab strip or a breadcrumb.
+static int gTerminalWidth = 80;
 // User-selected presentation setting; the terminal cannot report missing font glyphs.
 static bool gNerdIcons = true;
 static char gTabLabels[4][128];
+// A tab that must be cut keeps its fitted text here: TerminalText borrows the glyph
+// string, so a stack buffer would be dangling by the time the frame is painted.
+static char gTabTruncated[4][128];
 
 // One filename vocabulary for the rail and tabs. Nerd Fonts v3 BMP glyphs avoid
 // supplementary-plane wchar_t assumptions. Unknown types remain ordinary files.
@@ -358,13 +468,24 @@ static bool isMarkdownFile(const char *name) {
 // ---------------------------------------------------------------- file text
 
 typedef struct FileText {
-    char *bytes;             // owned file bytes, NUL-terminated
+    char **lineStorage;      // individually owned editable UTF-8 lines
     size_t length;
-    const char **lines;      // owned pointers into `bytes`
-    size_t *lineLengths;     // owned per-line lengths
+    const char **lines;      // aliases lineStorage for existing renderer/Markdown seam
+    size_t *lineLengths;     // bytes per line, excluding line endings
+    size_t *lineCapacities;  // allocated bytes per line, including NUL
+    uint8_t *lineEndings;    // NONE, LF or CRLF after each line
     size_t lineCount;
     size_t lineCapacity;
     size_t longestCells;     // widest line in CELLS, so horizontal scroll has a bound
+    size_t longestLine;
+    size_t cursorLine;
+    size_t cursorByte;        // byte offset on a UTF-8 scalar boundary
+    bool cursorVisible;
+    uint64_t lastEditNs;
+    bool dirty;
+    bool saveFailed;
+    bool baselineValid;
+    struct stat baseline;
     char name[64];           // display name for the breadcrumb
 } FileText;
 
@@ -377,12 +498,27 @@ typedef struct Scene {
     TerminalPanel *root;
     TerminalPanel *header;
     TerminalPanel *rail;
+    TerminalPanel *centre;
+    TerminalPanel *editor;      // borrowed from centre
     TerminalChildId railId;
-    TerminalChildId tabSpacerId;
-    size_t modeWidth;
+    TerminalChildId gutterId;
+    TerminalChildId projectTextId;
+    TerminalChildId gripId;
+    TerminalChildId warningId;
+    size_t headerLeftWidth;
+    bool railVisible;
+    bool edgeRailHandle;
+    size_t railRestoreWidth;
+    bool warningVisible;
     TuiRow rows[TUI_MAX_ROWS];
     size_t rowCount;
     TerminalText *lineChip;
+    TerminalText *projectChip;
+    TerminalText *timeChip;
+    TerminalText *gripChip;
+    TerminalText *warningText;
+    TerminalText *warningLabel;
+    bool gripHovered;
     size_t railWidth;
     size_t numberWidth;
     // The rail's rows. One Text per VISIBLE row, created once and re-pointed, so folding
@@ -399,20 +535,42 @@ typedef struct Scene {
     TerminalText *languageHints;
     TerminalText *runHint;
     TerminalText *codeMode;
-    TerminalText *markdownModeSpacer;
     TerminalText *previewMode;
+    TerminalText *browserMode;
     TerminalMarkdownView *markdown;
     bool markdownFile;
     bool preview;
     size_t codeModeWidth;
     size_t previewModeWidth;
     size_t markdownModeGap;
+    // The code block under the pointer and whether the pointer rests on its Copy chip.
+    // Both are cleared whenever the content moves, so a chip can never be pressed at a
+    // stale coordinate.
+    TerminalMarkdownCodeBlock hoverBlock;
+    bool hoverCopy;
+    char markdownNotice[48];
+    uint64_t markdownNoticeUntilNs;
 } Scene;
 
 static size_t editorFirstRow(void);
+static size_t editorVisibleRows(int height);
+static size_t railVisibleRows(int height);
 static size_t codeLeftColumn(size_t railWidth, size_t numberWidth);
+static size_t codeColumns(size_t railWidth, size_t numberWidth, int width);
+static const char *projectRootName(void);
+
+// Defined beside the Markdown renderer; declared here because opening a file resets the
+// transient chip and notice before those helpers exist in the translation unit.
+static void sceneMarkdownClearFeedback(Scene *scene);
+static void sceneMarkdownSetNotice(Scene *scene, const char *text);
+static bool openInBrowser(Scene *scene);
+// Defined beside the scene builders; setSaveStatus reports a refused save through it.
+static void sceneSetWarning(Scene *scene, const char *text, const char *label);
+static bool sceneSetRailVisible(Scene *scene, bool visible);
+static void sceneSetGripHover(Scene *scene, bool hovered);
 
 static void sceneMarkdownSource(Scene *scene, const FileText *file) {
+    sceneMarkdownClearFeedback(scene);
     scene->markdownFile = isMarkdownFile(file->name);
     if (scene->markdown == nullptr)
         scene->markdown = TerminalMarkdownView();
@@ -423,14 +581,14 @@ static void sceneMarkdownSource(Scene *scene, const FileText *file) {
                                           scene->markdownFile ? file->lineCount : 0u);
     scene->preview = scene->markdownFile;
     if (scene->languageHints != nullptr) {
-        const char *hints = scene->markdownFile ? "" : "20!!, 20!";
+        const char *hints = scene->markdownFile ? "" : "20!!, 20!, 20?";
         (void) TerminalText_setText(scene->languageHints, hints, strlen(hints));
         (void) TerminalText_setBrackets(scene->languageHints,
                                         scene->markdownFile ? 0u : '[',
                                         scene->markdownFile ? 0u : ']');
     }
     if (scene->runHint != nullptr) {
-        const char *run = scene->markdownFile ? "" : "> run";
+        const char *run = scene->markdownFile ? "" : ">> run";
         (void) TerminalText_setText(scene->runHint, run, strlen(run));
         (void) TerminalText_setBrackets(scene->runHint,
                                         scene->markdownFile ? 0u : '[',
@@ -444,6 +602,50 @@ static void sceneMarkdownSource(Scene *scene, const FileText *file) {
         const char *preview = scene->markdownFile ? "[preview]" : "";
         (void) TerminalText_setText(scene->previewMode, preview, strlen(preview));
     }
+    if (scene->browserMode != nullptr) {
+        const char *browser = scene->markdownFile ? "[open in browser]" : "";
+        (void) TerminalText_setText(scene->browserMode, browser, strlen(browser));
+    }
+}
+
+static void setSaveStatus(Scene *scene, const FileText *file) {
+    // The footer's project chip names the project the session is based on, and carries
+    // the save state as one trailing mark rather than a second chip the design does not
+    // have. The root's name is stable, so the chip does not wander as files change.
+    const char *root = projectRootName();
+    (void) snprintf(gProjectChip, sizeof gProjectChip, "[%s%s]", root,
+                    file->saveFailed ? "!" : file->dirty ? "*" : "");
+    if (scene->projectChip != nullptr) {
+        (void) TerminalText_setText(scene->projectChip, gProjectChip, strlen(gProjectChip));
+        (void) TerminalText_setForegroundColor(scene->projectChip,
+                                               file->saveFailed ? COL_ERROR
+                                               : file->dirty ? COL_ACCENT : COL_MUTED);
+    }
+    // A refused save is the one condition the shell must shout about: the buffer is
+    // still only in memory. The warning is cleared when the save finally lands.
+    if (file->saveFailed && !scene->warningVisible)
+        sceneSetWarning(scene, "Save failed; changes are only in memory", "save");
+    else if (!file->saveFailed && strcmp(gWarningLabel, "save") == 0)
+        sceneSetWarning(scene, "", "");
+}
+
+// The live clock is one second of resolution, so it is re-formatted only when the
+// displayed text actually changes. It is still a per-frame call, but it is a localtime
+// read and a string compare, not an allocation or a terminal write.
+static void updateClock(Scene *scene) {
+    if (scene == nullptr || scene->timeChip == nullptr)
+        return;
+    time_t now = time(nullptr);
+    struct tm local;
+    if (localtime_r(&now, &local) == nullptr)
+        return;
+    char text[16];
+    (void) snprintf(text, sizeof text, "[%02d:%02d:%02d]",
+                    local.tm_hour, local.tm_min, local.tm_sec);
+    if (strcmp(text, gTimeChip) == 0)
+        return;
+    (void) snprintf(gTimeChip, sizeof gTimeChip, "%s", text);
+    (void) TerminalText_setText(scene->timeChip, gTimeChip, strlen(gTimeChip));
 }
 
 // SLOT RECORD: RailEntry
@@ -459,6 +661,17 @@ static RailEntry *gRailEntries;
 static size_t gRailEntryCount;
 static size_t gRailEntryCapacity;
 static char gRailRoot[1024];
+
+// The project's display name: the last component of the root, never the whole path.
+// A root of "/" has no component, so it keeps the slash rather than becoming empty.
+static const char *projectRootName(void) {
+    if (gRailRoot[0] == '\0')
+        return "project";
+    const char *name = strrchr(gRailRoot, '/');
+    name = name == nullptr ? gRailRoot : name + 1u;
+    return *name == '\0' ? "/" : name;
+}
+
 static TerminalTreeNodeId gRailRootNode;
 static TerminalTreeNodeId gRailOpenNode;
 static char gOpenPath[1024];
@@ -468,20 +681,38 @@ static bool gResetView;             // a newly opened file starts at its top-lef
 static char gActiveTab[TUI_RAIL_TEXT];
 static char gCachedOpen[1024];      // restored from the project's session
 static size_t gCachedRail;
+static bool gCachedRailValid;       // the session actually recorded a rail width
+static bool gCachedRailHidden;      // it recorded the text-based (rail-hidden) mode
 
 typedef struct Interaction {
     TerminalInput input;
     bool grabbing;          // the divider is held
+    bool dividerHovered;    // the short divider grip is under the pointer
     bool tracking;          // the bottom editor rows' horizontal slider is held
     size_t trackX;          // pointer cell where the tracking drag began
     size_t trackLeft;       // horizontal offset when the tracking drag began
     size_t grabX;           // pointer cell where the grab began
     size_t grabWidth;       // rail width when the grab began
+    bool gripPress;         // the press began on the hamburger
+    bool grabMoved;         // the hamburger press became a drag
+    uint64_t lastDividerClickNs;
+    bool haveLastDividerClick;
     bool pressed;           // any button is currently down
     bool havePointer;
     size_t pointerX;
     size_t pointerY;
+    bool mouseCapture;              // suffix bytes are still arriving
+    uint64_t mouseCaptureUntilNs;   // and this is when a stalled report is abandoned
+    bool mouseCaptureDetect;         // KEY_MOUSE fallback has not exposed its encoding yet
 } Interaction;
+
+// SLOT RECORD: ScrollGlide
+typedef struct ScrollGlide {
+    double rowShown;      // rows currently displayed, fractional
+    double rowTarget;     // rows headed for
+    double columnShown;
+    double columnTarget;
+} ScrollGlide;
 
 static void onSignal(int signalNumber) {
     (void) signalNumber;
@@ -489,9 +720,11 @@ static void onSignal(int signalNumber) {
 }
 
 static void initTextures(void) {
-    memset(gRule, '-', sizeof gRule - 1);
-    gRule[sizeof gRule - 1] = '\0';
     memset(gLineChip, 0, sizeof gLineChip);
+    (void) snprintf(gLineChip, sizeof gLineChip, "[ln:1:1]");
+    (void) snprintf(gTimeChip, sizeof gTimeChip, "[--:--:--]");
+    gWarningText[0] = '\0';
+    gWarningLabel[0] = '\0';
 }
 
 // Cells a byte span occupies, using the canvas's own locale-free width rule so a
@@ -531,93 +764,577 @@ static size_t bytesForCells(const char *bytes, size_t length, size_t cells) {
 }
 
 static void fileFree(FileText *file) {
+    for (size_t i = 0; i < file->lineCount; ++i)
+        free(file->lineStorage[i]);
+    free(file->lineStorage);
     free(file->lines);
     free(file->lineLengths);
-    free(file->bytes);
+    free(file->lineCapacities);
+    free(file->lineEndings);
     *file = (FileText) {0};
 }
 
-// Read the whole file, replace every control byte with a space (a cell cannot
-// draw one), then split on newlines. Tabs become spaces rather than '?' because
-// the canvas refuses control codepoints and a file full of '?' is worse than one
-// whose indentation is approximate.
+static bool fileReserveLines(FileText *file, size_t needed) {
+    if (needed <= file->lineCapacity)
+        return true;
+    size_t next = file->lineCapacity == 0 ? TUI_INITIAL_LINE_CAPACITY : file->lineCapacity;
+    while (next < needed) {
+        if (next > SIZE_MAX / 2u)
+            return false;
+        next *= 2u;
+    }
+    if (next > SIZE_MAX / sizeof(char *) || next > SIZE_MAX / sizeof(size_t))
+        return false;
+    char **storage = malloc(next * sizeof *storage);
+    const char **lines = malloc(next * sizeof *lines);
+    size_t *lengths = malloc(next * sizeof *lengths);
+    size_t *capacities = malloc(next * sizeof *capacities);
+    uint8_t *endings = malloc(next * sizeof *endings);
+    if (storage == nullptr || lines == nullptr || lengths == nullptr
+        || capacities == nullptr || endings == nullptr) {
+        free(storage);
+        free(lines);
+        free(lengths);
+        free(capacities);
+        free(endings);
+        return false;
+    }
+    if (file->lineCount != 0) {
+        memcpy(storage, file->lineStorage, file->lineCount * sizeof *storage);
+        memcpy(lines, file->lines, file->lineCount * sizeof *lines);
+        memcpy(lengths, file->lineLengths, file->lineCount * sizeof *lengths);
+        memcpy(capacities, file->lineCapacities, file->lineCount * sizeof *capacities);
+        memcpy(endings, file->lineEndings, file->lineCount * sizeof *endings);
+    }
+    free(file->lineStorage);
+    free(file->lines);
+    free(file->lineLengths);
+    free(file->lineCapacities);
+    free(file->lineEndings);
+    file->lineStorage = storage;
+    file->lines = lines;
+    file->lineLengths = lengths;
+    file->lineCapacities = capacities;
+    file->lineEndings = endings;
+    file->lineCapacity = next;
+    return true;
+}
+
+static bool fileAddLine(FileText *file, const char *bytes, size_t length, uint8_t ending) {
+    if (length == SIZE_MAX || !fileReserveLines(file, file->lineCount + 1u))
+        return false;
+    char *line = malloc(length + 1u);
+    if (line == nullptr)
+        return false;
+    if (length != 0)
+        memcpy(line, bytes, length);
+    line[length] = '\0';
+    size_t index = file->lineCount++;
+    file->lineStorage[index] = line;
+    file->lines[index] = line;
+    file->lineLengths[index] = length;
+    file->lineCapacities[index] = length + 1u;
+    file->lineEndings[index] = ending;
+    return true;
+}
+
+// Admit the complete file before publishing a view. The editor retains source bytes
+// exactly; rendering is a projection and never rewrites tabs or control bytes.
+static bool statMatches(const struct stat *left, const struct stat *right);
+
 static bool fileLoad(FileText *file, const char *path) {
     *file = (FileText) {0};
     const char *slash = strrchr(path, '/');
     const char *base = slash != nullptr ? slash + 1 : path;
     (void) snprintf(file->name, sizeof file->name, "%s", base);
+    struct stat initial;
+    if (lstat(path, &initial) != 0 || !S_ISREG(initial.st_mode))
+        return false;
     FILE *handle = fopen(path, "rb");
     if (handle == nullptr)
         return false;
-    char *bytes = malloc(TUI_MAX_FILE_BYTES + 1u);
-    if (bytes == nullptr) {
-        (void) fclose(handle);
-        return false;
-    }
-    size_t length = fread(bytes, 1, TUI_MAX_FILE_BYTES, handle);
-    (void) fclose(handle);
-    bytes[length] = '\0';
-    size_t lineCapacity = 64;
-    const char **lines = malloc(lineCapacity * sizeof *lines);
-    size_t *lineLengths = malloc(lineCapacity * sizeof *lineLengths);
-    if (lines == nullptr || lineLengths == nullptr) {
-        free(bytes);
-        free(lines);
-        free(lineLengths);
-        return false;
-    }
-    size_t count = 0;
-    size_t start = 0;
-    bool grew = true;
-    for (size_t at = 0; at <= length; ++at) {
-        unsigned char current = at < length ? (unsigned char) bytes[at] : '\n';
-        if (current != '\n') {
-            if (current < 32u || current == 127u)
-                bytes[at] = ' ';
-            continue;
-        }
-        if (count == lineCapacity) {
-            size_t next = lineCapacity * 2u;
-            const char **grownLines = realloc(lines, next * sizeof *lines);
-            size_t *grownLengths = realloc(lineLengths, next * sizeof *lineLengths);
-            if (grownLines == nullptr || grownLengths == nullptr) {
-                grew = false;
+    char *bytes = nullptr;
+    size_t length = 0;
+    size_t capacity = 0;
+    bool readOk = true;
+    for (;;) {
+        if (capacity - length < TUI_FILE_READ_CHUNK) {
+            size_t need = length + TUI_FILE_READ_CHUNK;
+            if (need < length || need == SIZE_MAX) {
+                readOk = false;
                 break;
             }
-            lines = grownLines;
-            lineLengths = grownLengths;
-            lineCapacity = next;
+            size_t next = capacity == 0 ? TUI_FILE_READ_CHUNK : capacity;
+            while (next < need) {
+                if (next > SIZE_MAX / 2u) {
+                    readOk = false;
+                    break;
+                }
+                next *= 2u;
+            }
+            if (!readOk)
+                break;
+            char *grown = realloc(bytes, next + 1u);
+            if (grown == nullptr) {
+                readOk = false;
+                break;
+            }
+            bytes = grown;
+            capacity = next;
         }
-        size_t end = at;
-        if (end > start && bytes[end - 1] == '\r')
-            --end;                                   // CRLF: the carriage is not a cell
-        bytes[at] = '\0';
-        lines[count] = bytes + start;
-        lineLengths[count] = end - start;
-        ++count;
-        start = at + 1;
+        size_t got = fread(bytes + length, 1, capacity - length, handle);
+        length += got;
+        if (got == 0) {
+            if (ferror(handle))
+                readOk = false;
+            break;
+        }
     }
-    if (!grew) {
+    int closeResult = fclose(handle);
+    if (!readOk || closeResult != 0) {
         free(bytes);
-        free(lines);
-        free(lineLengths);
         return false;
     }
-    file->bytes = bytes;
+    size_t start = 0;
+    for (size_t at = 0; at <= length; ++at) {
+        if (at != length && bytes[at] != '\n')
+            continue;
+        size_t end = at;
+        uint8_t ending = at == length ? TUI_LINE_ENDING_NONE : TUI_LINE_ENDING_LF;
+        if (at < length && end > start && bytes[end - 1u] == '\r') {
+            --end;
+            ending = TUI_LINE_ENDING_CRLF;
+        }
+        if (!fileAddLine(file, bytes != nullptr ? bytes + start : "", end - start, ending)) {
+            free(bytes);
+            fileFree(file);
+            return false;
+        }
+        start = at + 1u;
+    }
+    free(bytes);
+    if (file->lineCount == 0 && !fileAddLine(file, "", 0, TUI_LINE_ENDING_NONE)) {
+        fileFree(file);
+        return false;
+    }
     file->length = length;
-    file->lines = lines;
-    file->lineLengths = lineLengths;
-    file->lineCount = count;
-    file->lineCapacity = lineCapacity;
+    if (stat(path, &file->baseline) != 0 || !statMatches(&initial, &file->baseline)) {
+        fileFree(file);
+        return false;
+    }
+    file->baselineValid = true;
     size_t longest = 0;
-    for (size_t i = 0; i < count; ++i) {
-        size_t cells = cellsOf(lines[i], lineLengths[i]);
-        if (cells > longest)
+    for (size_t i = 0; i < file->lineCount; ++i) {
+        size_t cells = cellsOf(file->lines[i], file->lineLengths[i]);
+        if (cells > longest) {
             longest = cells;
+            file->longestLine = i;
+        }
     }
     file->longestCells = longest;
     return true;
 }
+
+static uint64_t monotonicNowNs(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec;
+}
+
+static bool fileReserveLine(FileText *file, size_t line, size_t needed) {
+    if (line >= file->lineCount || needed == SIZE_MAX)
+        return false;
+    size_t capacity = file->lineCapacities[line];
+    if (needed + 1u <= capacity)
+        return true;
+    size_t next = capacity == 0 ? TUI_DEFAULT_LINE_CAPACITY : capacity;
+    while (next < needed + 1u) {
+        if (next > SIZE_MAX / 2u)
+            return false;
+        next *= 2u;
+    }
+    char *grown = realloc(file->lineStorage[line], next);
+    if (grown == nullptr)
+        return false;
+    file->lineStorage[line] = grown;
+    file->lines[line] = grown;
+    file->lineCapacities[line] = next;
+    return true;
+}
+
+static void fileRefreshLengthAndWidth(FileText *file) {
+    file->length = 0;
+    file->longestCells = 0;
+    file->longestLine = 0;
+    for (size_t i = 0; i < file->lineCount; ++i) {
+        size_t ending = file->lineEndings[i] == TUI_LINE_ENDING_CRLF ? 2u
+                      : file->lineEndings[i] == TUI_LINE_ENDING_LF ? 1u : 0u;
+        if (file->lineLengths[i] <= SIZE_MAX - ending)
+            file->length += file->lineLengths[i] + ending;
+        size_t cells = cellsOf(file->lines[i], file->lineLengths[i]);
+        if (cells > file->longestCells) {
+            file->longestCells = cells;
+            file->longestLine = i;
+        }
+    }
+}
+
+static void fileRefreshEditedWidth(FileText *file, size_t line, size_t oldWidth) {
+    size_t width = cellsOf(file->lines[line], file->lineLengths[line]);
+    if (line == file->longestLine && width < oldWidth) {
+        file->longestCells = 0;
+        file->longestLine = 0;
+        for (size_t i = 0; i < file->lineCount; ++i) {
+            size_t candidate = cellsOf(file->lines[i], file->lineLengths[i]);
+            if (candidate > file->longestCells) {
+                file->longestCells = candidate;
+                file->longestLine = i;
+            }
+        }
+    } else if (width >= file->longestCells) {
+        file->longestCells = width;
+        file->longestLine = line;
+    }
+}
+
+static bool fileInsertBytes(FileText *file, size_t line, size_t at,
+                            const char *bytes, size_t count) {
+    if (line >= file->lineCount || at > file->lineLengths[line]
+        || count > SIZE_MAX - file->lineLengths[line])
+        return false;
+    if (count == 0)
+        return true;
+    size_t oldLength = file->lineLengths[line];
+    if (count > SIZE_MAX - file->length)
+        return false;
+    size_t oldWidth = cellsOf(file->lines[line], oldLength);
+    if (!fileReserveLine(file, line, oldLength + count))
+        return false;
+    char *text = file->lineStorage[line];
+    memmove(text + at + count, text + at, oldLength - at + 1u);
+    memcpy(text + at, bytes, count);
+    file->lineLengths[line] = oldLength + count;
+    file->length += count;
+    file->cursorLine = line;
+    file->cursorByte = at + count;
+    file->dirty = true;
+    file->saveFailed = false;
+    file->lastEditNs = monotonicNowNs();
+    fileRefreshEditedWidth(file, line, oldWidth);
+    return true;
+}
+
+static bool fileInsertRow(FileText *file, size_t index, char *text, size_t length,
+                          size_t capacity, uint8_t ending) {
+    if (index > file->lineCount || !fileReserveLines(file, file->lineCount + 1u))
+        return false;
+    size_t move = file->lineCount - index;
+    memmove(file->lineStorage + index + 1u, file->lineStorage + index, move * sizeof *file->lineStorage);
+    memmove(file->lines + index + 1u, file->lines + index, move * sizeof *file->lines);
+    memmove(file->lineLengths + index + 1u, file->lineLengths + index, move * sizeof *file->lineLengths);
+    memmove(file->lineCapacities + index + 1u, file->lineCapacities + index,
+            move * sizeof *file->lineCapacities);
+    memmove(file->lineEndings + index + 1u, file->lineEndings + index, move * sizeof *file->lineEndings);
+    file->lineStorage[index] = text;
+    file->lines[index] = text;
+    file->lineLengths[index] = length;
+    file->lineCapacities[index] = capacity;
+    file->lineEndings[index] = ending;
+    ++file->lineCount;
+    return true;
+}
+
+static bool fileSplit(FileText *file) {
+    size_t line = file->cursorLine;
+    size_t at = file->cursorByte;
+    if (line >= file->lineCount || at > file->lineLengths[line])
+        return false;
+    size_t oldLength = file->lineLengths[line];
+    size_t tailLength = oldLength - at;
+    char *tail = malloc(tailLength + 1u);
+    if (tail == nullptr)
+        return false;
+    memcpy(tail, file->lineStorage[line] + at, tailLength);
+    tail[tailLength] = '\0';
+    size_t tailCapacity = tailLength + 1u;
+    uint8_t oldEnding = file->lineEndings[line];
+    uint8_t newEnding = oldEnding == TUI_LINE_ENDING_NONE ? TUI_LINE_ENDING_LF : oldEnding;
+    if (!fileReserveLines(file, file->lineCount + 1u)) {
+        free(tail);
+        return false;
+    }
+    if (oldLength - at + 1u > file->lineCapacities[line]) {
+        free(tail);
+        return false;
+    }
+    file->lineStorage[line][at] = '\0';
+    file->lineLengths[line] = at;
+    file->lineEndings[line] = newEnding;
+    if (!fileInsertRow(file, line + 1u, tail, tailLength, tailCapacity, oldEnding)) {
+        free(tail);
+        return false;
+    }
+    file->cursorLine = line + 1u;
+    file->cursorByte = 0;
+    file->dirty = true;
+    file->saveFailed = false;
+    file->lastEditNs = monotonicNowNs();
+    fileRefreshLengthAndWidth(file);
+    return true;
+}
+
+static bool fileJoinPrevious(FileText *file) {
+    size_t line = file->cursorLine;
+    if (line == 0 || line >= file->lineCount)
+        return false;
+    size_t previous = line - 1u;
+    size_t prefix = file->lineLengths[previous];
+    size_t suffix = file->lineLengths[line];
+    if (suffix > SIZE_MAX - prefix || !fileReserveLine(file, previous, prefix + suffix))
+        return false;
+    memcpy(file->lineStorage[previous] + prefix, file->lineStorage[line], suffix + 1u);
+    file->lineLengths[previous] = prefix + suffix;
+    file->lineEndings[previous] = file->lineEndings[line];
+    free(file->lineStorage[line]);
+    memmove(file->lineStorage + line, file->lineStorage + line + 1u,
+            (file->lineCount - line - 1u) * sizeof *file->lineStorage);
+    memmove(file->lines + line, file->lines + line + 1u,
+            (file->lineCount - line - 1u) * sizeof *file->lines);
+    memmove(file->lineLengths + line, file->lineLengths + line + 1u,
+            (file->lineCount - line - 1u) * sizeof *file->lineLengths);
+    memmove(file->lineCapacities + line, file->lineCapacities + line + 1u,
+            (file->lineCount - line - 1u) * sizeof *file->lineCapacities);
+    memmove(file->lineEndings + line, file->lineEndings + line + 1u,
+            (file->lineCount - line - 1u) * sizeof *file->lineEndings);
+    --file->lineCount;
+    file->cursorLine = previous;
+    file->cursorByte = prefix;
+    file->dirty = true;
+    file->saveFailed = false;
+    file->lastEditNs = monotonicNowNs();
+    fileRefreshLengthAndWidth(file);
+    return true;
+}
+
+static bool writeAll(int descriptor, const char *bytes, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(descriptor, bytes + written, length - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return false;
+        written += (size_t) count;
+    }
+    return true;
+}
+
+static bool statMatches(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino
+        && left->st_size == right->st_size && left->st_mtime == right->st_mtime
+#if defined(__APPLE__)
+        && left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
+#else
+        && left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
+#endif
+}
+
+static bool fileSave(FileText *file, const char *path) {
+    if (file == nullptr || path == nullptr || path[0] == '\0' || !file->baselineValid)
+        return false;
+    struct stat current;
+    struct stat linkInfo;
+    if (lstat(path, &linkInfo) != 0 || !S_ISREG(linkInfo.st_mode) || linkInfo.st_nlink != 1
+        || stat(path, &current) != 0 || !statMatches(&file->baseline, &current)) {
+        THROW("semicolon: save refused because the source changed or is not a single regular file");
+        return false;
+    }
+    size_t pathLength = strlen(path);
+    static const char suffix[] = ".semicolon-save-XXXXXX";
+    if (pathLength > SIZE_MAX - sizeof suffix || pathLength + sizeof suffix > 1200u) {
+        THROW("semicolon: save path is too long");
+        return false;
+    }
+    char temporary[1200];
+    memcpy(temporary, path, pathLength);
+    memcpy(temporary + pathLength, suffix, sizeof suffix);
+    int descriptor = mkstemp(temporary);
+    if (descriptor < 0) {
+        THROW("semicolon: cannot create staged save file");
+        return false;
+    }
+    bool ok = fchmod(descriptor, current.st_mode & 07777) == 0;
+    for (size_t i = 0; ok && i < file->lineCount; ++i) {
+        ok = writeAll(descriptor, file->lines[i], file->lineLengths[i]);
+        if (ok && file->lineEndings[i] == TUI_LINE_ENDING_LF)
+            ok = writeAll(descriptor, "\n", 1u);
+        else if (ok && file->lineEndings[i] == TUI_LINE_ENDING_CRLF)
+            ok = writeAll(descriptor, "\r\n", 2u);
+    }
+    if (ok)
+        ok = fsync(descriptor) == 0;
+    int closeResult = close(descriptor);
+    if (closeResult != 0)
+        ok = false;
+    if (ok) {
+        // Recheck immediately before publication. This is conflict detection for
+        // ordinary concurrent edits, not hostile-writer race protection.
+        struct stat latest;
+        ok = stat(path, &latest) == 0 && statMatches(&file->baseline, &latest);
+    }
+    if (ok)
+        ok = rename(temporary, path) == 0;
+    if (!ok) {
+        int savedErrno = errno;
+        (void) unlink(temporary);
+        errno = savedErrno;
+        THROW("semicolon: staged save failed; edits remain unsaved");
+        return false;
+    }
+    if (stat(path, &file->baseline) != 0) {
+        file->baselineValid = false;
+        THROW("semicolon: save published but baseline refresh failed");
+        return false;
+    }
+    file->baselineValid = true;
+    file->dirty = false;
+    file->saveFailed = false;
+    return true;
+}
+
+static size_t previousScalar(const char *text, size_t at) {
+    if (at == 0)
+        return 0;
+    --at;
+    while (at > 0 && ((unsigned char) text[at] & 0xC0u) == 0x80u)
+        --at;
+    return at;
+}
+
+static size_t nextScalar(const char *text, size_t length, size_t at) {
+    if (at >= length)
+        return length;
+    TerminalCanvasDecodedScalar decoded = TerminalCanvas_utf8Decode(text + at, length - at);
+    return at + (decoded.bytes == 0 ? 1u : decoded.bytes);
+}
+
+static bool fileBackspace(FileText *file) {
+    size_t line = file->cursorLine;
+    if (line >= file->lineCount)
+        return false;
+    if (file->cursorByte == 0)
+        return fileJoinPrevious(file);
+    size_t previous = previousScalar(file->lineStorage[line], file->cursorByte);
+    size_t count = file->cursorByte - previous;
+    size_t oldWidth = cellsOf(file->lines[line], file->lineLengths[line]);
+    memmove(file->lineStorage[line] + previous, file->lineStorage[line] + file->cursorByte,
+            file->lineLengths[line] - file->cursorByte + 1u);
+    file->lineLengths[line] -= count;
+    file->length -= count;
+    file->cursorByte = previous;
+    file->dirty = true;
+    file->saveFailed = false;
+    file->lastEditNs = monotonicNowNs();
+    fileRefreshEditedWidth(file, line, oldWidth);
+    return true;
+}
+
+static bool fileDeleteForward(FileText *file) {
+    size_t line = file->cursorLine;
+    if (line >= file->lineCount)
+        return false;
+    if (file->cursorByte == file->lineLengths[line]) {
+        if (line + 1u >= file->lineCount)
+            return false;
+        size_t firstLength = file->lineLengths[line];
+        size_t secondLength = file->lineLengths[line + 1u];
+        size_t separatorLength = file->lineEndings[line] == TUI_LINE_ENDING_CRLF ? 2u
+                               : file->lineEndings[line] == TUI_LINE_ENDING_LF ? 1u : 0u;
+        if (secondLength > SIZE_MAX - firstLength
+            || !fileReserveLine(file, line, firstLength + secondLength))
+            return false;
+        memcpy(file->lineStorage[line] + firstLength, file->lineStorage[line + 1u], secondLength + 1u);
+        file->lineLengths[line] = firstLength + secondLength;
+        file->lineEndings[line] = file->lineEndings[line + 1u];
+        free(file->lineStorage[line + 1u]);
+        memmove(file->lineStorage + line + 1u, file->lineStorage + line + 2u,
+                (file->lineCount - line - 2u) * sizeof *file->lineStorage);
+        memmove(file->lines + line + 1u, file->lines + line + 2u,
+                (file->lineCount - line - 2u) * sizeof *file->lines);
+        memmove(file->lineLengths + line + 1u, file->lineLengths + line + 2u,
+                (file->lineCount - line - 2u) * sizeof *file->lineLengths);
+        memmove(file->lineCapacities + line + 1u, file->lineCapacities + line + 2u,
+                (file->lineCount - line - 2u) * sizeof *file->lineCapacities);
+        memmove(file->lineEndings + line + 1u, file->lineEndings + line + 2u,
+                (file->lineCount - line - 2u) * sizeof *file->lineEndings);
+        --file->lineCount;
+        file->length -= separatorLength;
+    } else {
+        size_t end = nextScalar(file->lineStorage[line], file->lineLengths[line], file->cursorByte);
+        size_t removed = end - file->cursorByte;
+        size_t oldWidth = cellsOf(file->lines[line], file->lineLengths[line]);
+        memmove(file->lineStorage[line] + file->cursorByte, file->lineStorage[line] + end,
+                file->lineLengths[line] - end + 1u);
+        file->lineLengths[line] -= removed;
+        file->length -= removed;
+        file->dirty = true;
+        file->saveFailed = false;
+        file->lastEditNs = monotonicNowNs();
+        fileRefreshEditedWidth(file, line, oldWidth);
+        return true;
+    }
+    file->dirty = true;
+    file->saveFailed = false;
+    file->lastEditNs = monotonicNowNs();
+    fileRefreshLengthAndWidth(file);
+    return true;
+}
+
+static void fileMoveLeft(FileText *file) {
+    if (file->cursorLine >= file->lineCount)
+        return;
+    if (file->cursorByte != 0) {
+        file->cursorByte = previousScalar(file->lineStorage[file->cursorLine], file->cursorByte);
+    } else if (file->cursorLine != 0) {
+        --file->cursorLine;
+        file->cursorByte = file->lineLengths[file->cursorLine];
+    }
+}
+
+static void fileMoveRight(FileText *file) {
+    if (file->cursorLine >= file->lineCount)
+        return;
+    size_t length = file->lineLengths[file->cursorLine];
+    if (file->cursorByte < length) {
+        file->cursorByte = nextScalar(file->lineStorage[file->cursorLine], length, file->cursorByte);
+    } else if (file->cursorLine + 1u < file->lineCount) {
+        ++file->cursorLine;
+        file->cursorByte = 0;
+    }
+}
+
+static void fileMoveVertical(FileText *file, int delta) {
+    if (delta < 0 && file->cursorLine > 0)
+        --file->cursorLine;
+    else if (delta > 0 && file->cursorLine + 1u < file->lineCount)
+        ++file->cursorLine;
+    if (file->cursorLine < file->lineCount && file->cursorByte > file->lineLengths[file->cursorLine])
+        file->cursorByte = file->lineLengths[file->cursorLine];
+}
+
+static bool autosave(FileText *file, const char *path) {
+    if (!file->dirty || file->saveFailed)
+        return true;
+    uint64_t now = monotonicNowNs();
+    if (now == 0 || now < file->lastEditNs || now - file->lastEditNs < TUI_AUTOSAVE_DELAY_NS)
+        return true;
+    if (fileSave(file, path))
+        return true;
+    file->saveFailed = true;
+    return false;
+}
+
 
 // ---------------------------------------------------------------- scene
 
@@ -657,70 +1374,105 @@ static bool putPanel(TerminalPanel *parent, TerminalPanel *child, TerminalAnchor
     return true;
 }
 
+// Fit a UTF-8 string into a CELL budget, ending with one ellipsis when it does not fit.
+// Truncating on bytes would split a scalar; truncating silently would make a short name
+// indistinguishable from a clipped one, so the ellipsis is the contract.
+static void copyCellsEllipsis(const char *source, size_t maxCells, char *out, size_t size) {
+    if (out == nullptr || size == 0u)
+        return;
+    if (source == nullptr) {
+        out[0] = '\0';
+        return;
+    }
+    size_t length = strlen(source);
+    if (cellsOf(source, length) <= maxCells) {
+        (void) snprintf(out, size, "%s", source);
+        return;
+    }
+    if (maxCells == 0u) {
+        out[0] = '\0';
+        return;
+    }
+    size_t at = 0u;
+    size_t used = 0u;
+    while (at < length) {
+        TerminalCanvasDecodedScalar decoded =
+            TerminalCanvas_utf8Decode(source + at, length - at);
+        size_t width = decoded.bytes == 0 ? 1u : TerminalCanvas_widthOf(decoded.codepoint);
+        size_t step = decoded.bytes == 0 ? 1u : decoded.bytes;
+        if (used + width + 1u > maxCells)
+            break;
+        used += width;
+        at += step;
+    }
+    if (at + 3u >= size)
+        at = size > 4u ? size - 4u : 0u;
+    memcpy(out, source, at);
+    memcpy(out + at, "…", 3u);
+    out[at + 3u] = '\0';
+}
+
 static TerminalPanel *buildChromeRow(Scene *scene) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    // TWO MODES and nothing else: no rule underlay, no dash runs, no undo/redo. The
-    // closed one is dim and the open one carries the shell's one highlight - a tint rather
-    // than a block, so the theme still shows through it.
-    static const char *modes[] = { "(); Code", ">w< agents" };
-    size_t used = 0;
-    for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
-        TerminalText *mode = chip(modes[i]);
-        (void) TerminalText_setForegroundColor(mode, i == 0 ? COL_ACCENT : COL_MUTED);
-        if (i == 0)
-            (void) TerminalText_setBackgroundColor(mode, COL_SELECT);
-        size_t cells = TerminalText_measure(mode);
-        if (!putText(bar, mode, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, cells))) {
-            TerminalPanel_free(bar);
-            return nullptr;
-        }
-        used += cells;
-        if (i == 0) {
-            if (!putText(bar, plain(" ", COL_TEXT),
-                         TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
-                TerminalPanel_free(bar);
-                return nullptr;
-            }
-            ++used;
-        }
-    }
-    // The tab strip follows the seam: this band reserves the current rail remainder and
-    // sceneSetRailWidth moves it when the user drags the divider.
-    TerminalText *tabSpacer = plain(" ", COL_TEXT);
-    if (tabSpacer == nullptr) {
+    // The chrome row holds tabs only. The project root belongs to the tree below it;
+    // reserve the rail's width here so the tabs align with the editor.
+    TerminalText *grip = plain("", COL_MUTED);
+    scene->gripChip = grip;
+    scene->gripId = TerminalPanel_addText(
+        bar, grip, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0));
+    if (!TerminalPanel_isChildId(scene->gripId)) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    scene->tabSpacerId = TerminalPanel_addText(
-        bar, tabSpacer,
-        TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
-                         scene->railWidth > used ? scene->railWidth - used : 0u));
-    if (!TerminalPanel_isChildId(scene->tabSpacerId)) {
-        TerminalText_free(tabSpacer);
+    TerminalText *projectSpacer = plain("", COL_TEXT);
+    size_t spacerCells = scene->headerLeftWidth;
+    scene->projectTextId = TerminalPanel_addText(
+        bar, projectSpacer, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, spacerCells));
+    if (!TerminalPanel_isChildId(scene->projectTextId)) {
+        TerminalText_free(projectSpacer);
         TerminalPanel_free(bar);
         return nullptr;
     }
     scene->header = bar;
-    scene->modeWidth = used;
-    // The compact trick: the tab strip shares the chrome row, so it costs no row.
+    // The compact trick: the tab strip shares the chrome row, so it costs no row. A tab
+    // that would cross the right edge is cut to the remaining cells and says so with an
+    // ellipsis; the next tabs are then simply not shown.
     static const char *tabLabels[] = { "helloWorld.c", "placeholder.txt", "terminal", "type.h" };
+    size_t used = scene->headerLeftWidth;
+    size_t width = gTerminalWidth > 0 ? (size_t) gTerminalWidth : 80u;
     for (size_t i = 0; i < sizeof tabLabels / sizeof tabLabels[0]; ++i) {
         bool open = i == TUI_ACTIVE_TAB;
         (void) snprintf(gTabLabels[i], sizeof gTabLabels[i], "%s %s  x",
                          fileIcon(tabLabels[i]), tabLabels[i]);
-        TerminalText *tab = chip(open && gActiveTab[0] != '\0' ? gActiveTab : gTabLabels[i]);
+        const char *shown = open && gActiveTab[0] != '\0' ? gActiveTab : gTabLabels[i];
+        TerminalText *tab = chip(shown);
         if (open)
             scene->activeTab = tab;
+        size_t cells = TerminalText_measure(tab);
+        if (used + cells > width) {
+            size_t available = width > used ? width - used : 0u;
+            if (available < 4u) {
+                TerminalText_free(tab);
+                break;
+            }
+            copyCellsEllipsis(shown, available - 2u, gTabTruncated[i],
+                              sizeof gTabTruncated[i]);
+            (void) TerminalText_setText(tab, gTabTruncated[i],
+                                        strlen(gTabTruncated[i]));
+            cells = TerminalText_measure(tab);
+        }
         (void) TerminalText_setForegroundColor(tab, open ? COL_TEXT : COL_MUTED);
         if (open)
             (void) TerminalText_setBackgroundColor(tab, COL_SELECT);
-        if (!putText(bar, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
-                                                TerminalText_measure(tab)))) {
+        if (!putText(bar, tab, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, cells))) {
             TerminalPanel_free(bar);
             return nullptr;
         }
+        used += cells;
+        if (used >= width)
+            break;
     }
     (void) TerminalPanel_setForegroundColor(bar, COL_TEXT);
     return bar;
@@ -730,49 +1482,83 @@ static TerminalPanel *buildChromeRow(Scene *scene) {
 // the project root and the open path.
 static void breadcrumbFor(const char *path, char *out, size_t size);
 
-static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file) {
+static TerminalPanel *buildStatusBar(Scene *scene, const FileText *file, int width) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    // NO RULE and NO DASH RUNS. The footer is the breadcrumb on the left and the chips on
-    // the right, with an otherwise transparent row between them - which is also what keeps
-    // the whole floor of the window draggable without drawing anything to drag.
-
-    // The chip BORROWS this string for the life of the tree, so it must outlive
-    // this function: a stack buffer here renders as garbage. The crumb describes the file
-    // on screen - a header naming a different file is a lie, not a placeholder.
+    // NO RULE and NO DASH RUNS. The footer is the two modes, the breadcrumb, then the
+    // project/position/time/encoding chips, with transparent cells between them. The
+    // empty cells are what keeps the whole floor draggable without drawing a line.
+    TerminalText *codeMode = chip("();");
+    (void) TerminalText_setForegroundColor(codeMode, COL_ACCENT);
+    (void) TerminalText_setBackgroundColor(codeMode, COL_SELECT);
+    if (!putText(bar, codeMode, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 5))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    TerminalText *agentsMode = chip(">w<");
+    (void) TerminalText_setForegroundColor(agentsMode, COL_MUTED);
+    if (!putText(bar, agentsMode, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 5))
+        || !putText(bar, plain(" ", COL_TEXT), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    // The right side is fixed so the breadcrumb can take whatever is left: at 80 columns
+    // it still keeps every chip, and at 112 it grows to its designed maximum.
+    size_t rightCells = 7u + 1u + 10u + 1u + TUI_LINE_CHIP_CELLS + 1u + TUI_PROJECT_CHIP_CELLS;
+    size_t available = width > (int) (TUI_STATUS_LEFT_CELLS + rightCells)
+                     ? (size_t) width - TUI_STATUS_LEFT_CELLS - rightCells : 0u;
+    size_t crumbCells = available < TUI_CRUMB_MIN_CELLS ? TUI_CRUMB_MIN_CELLS : available;
+    if (crumbCells > TUI_CRUMB_CELLS)
+        crumbCells = TUI_CRUMB_CELLS;
+    // The chip BORROWS this string for the life of the tree, so it must outlive this
+    // function: a stack buffer here renders as garbage. The crumb describes the file on
+    // screen - a header naming a different file is a lie, not a placeholder.
     breadcrumbFor(gOpenPath[0] != '\0' ? gOpenPath : file->name, gBreadcrumb,
                   sizeof gBreadcrumb);
     TerminalText *crumb = chip(gBreadcrumb);
     scene->breadcrumb = crumb;
     (void) TerminalText_setForegroundColor(crumb, COL_TEXT);
-    // A FIXED band, not the width of whatever the crumb says today: the crumb is
-    // re-pointed whenever the open file changes, and a band measured once would clip every
-    // later path. The design draws this area wide for exactly that reason.
-    if (!putText(bar, crumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CRUMB_CELLS))) {
+    if (!putText(bar, crumb, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, crumbCells))) {
         TerminalPanel_free(bar);
         return nullptr;
     }
-    static const size_t rightExtents[] = { 1, 7, 1, 6, 1, 8, 1, 10 };
-    static const char *rightLabels[] = { nullptr, "utf-8", nullptr, "time", nullptr, nullptr, nullptr, "c23/java" };
-    for (size_t i = 0; i < sizeof rightExtents / sizeof rightExtents[0]; ++i) {
-        TerminalText *child = nullptr;
-        if (rightLabels[i] != nullptr) {
-            child = chip(rightLabels[i]);
-        } else if (i == 5) {
-            // The line-position chip: its text is re-pointed every frame, so its
-            // extent is fixed and the number is always formatted to fit.
-            (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%3zu]", (size_t) 1);
-            child = TerminalText_1(gLineChip);
-            (void) TerminalText_setForegroundColor(child, COL_MUTED);
-            scene->lineChip = child;
-        } else {
-            child = plain(gRule, COL_MUTED);
-        }
-        if (!putText(bar, child, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, rightExtents[i]))) {
-            TerminalPanel_free(bar);
-            return nullptr;
-        }
+    // Placed from the right edge inward: encoding, clock, position, project. The order is
+    // the design's, and each extent is fixed so the row never reflows as the numbers grow.
+    TerminalText *encoding = chip("utf-8");
+    (void) TerminalText_setForegroundColor(encoding, COL_MUTED);
+    if (!putText(bar, encoding, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 7))
+        || !putText(bar, plain(" ", COL_TEXT), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    (void) snprintf(gTimeChip, sizeof gTimeChip, "[--:--:--]");
+    TerminalText *clockChip = TerminalText_1(gTimeChip);
+    (void) TerminalText_setForegroundColor(clockChip, COL_MUTED);
+    scene->timeChip = clockChip;
+    if (!putText(bar, clockChip, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 10))
+        || !putText(bar, plain(" ", COL_TEXT), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    (void) snprintf(gLineChip, sizeof gLineChip, "[ln:1:1]");
+    TerminalText *lineChip = TerminalText_1(gLineChip);
+    (void) TerminalText_setForegroundColor(lineChip, COL_MUTED);
+    scene->lineChip = lineChip;
+    if (!putText(bar, lineChip, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT,
+                                                 TUI_LINE_CHIP_CELLS))
+        || !putText(bar, plain(" ", COL_TEXT), TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))) {
+        TerminalPanel_free(bar);
+        return nullptr;
+    }
+    (void) snprintf(gProjectChip, sizeof gProjectChip, "[%s]", projectRootName());
+    TerminalText *projectChip = TerminalText_1(gProjectChip);
+    (void) TerminalText_setForegroundColor(projectChip, COL_MUTED);
+    scene->projectChip = projectChip;
+    if (!putText(bar, projectChip, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT,
+                                                    TUI_PROJECT_CHIP_CELLS))) {
+        TerminalPanel_free(bar);
+        return nullptr;
     }
     (void) TerminalPanel_setForegroundColor(bar, COL_TEXT);
     return bar;
@@ -1052,6 +1838,12 @@ static void breadcrumbFor(const char *path, char *out, size_t size) {
 static bool openFile(const char *path, TerminalTreeNodeId node) {
     if (gOpenFile == nullptr || path == nullptr)
         return false;
+    if (gOpenFile->dirty && !fileSave(gOpenFile, gOpenPath)) {
+        gOpenFile->saveFailed = true;
+        if (gScene != nullptr)
+            setSaveStatus(gScene, gOpenFile);
+        return false;
+    }
     FileText opened;
     if (!fileLoad(&opened, path))
         return false;
@@ -1123,6 +1915,8 @@ static bool ensureDirectory(const char *path) {
 static void cacheLoad(const char *root) {
     gCachedOpen[0] = '\0';
     gCachedRail = 0;
+    gCachedRailValid = false;
+    gCachedRailHidden = false;
     char path[1024];
     cachePathFor(root, path, sizeof path);
     FILE *handle = fopen(path, "r");
@@ -1139,8 +1933,12 @@ static void cacheLoad(const char *root) {
             sameRoot = strcmp(line + 5, root) == 0;
         else if (strncmp(line, "open ", 5) == 0)
             (void) snprintf(opened, sizeof opened, "%s", line + 5);
-        else if (strncmp(line, "rail ", 5) == 0)
+        else if (strncmp(line, "rail ", 5) == 0) {
             width = (size_t) strtoul(line + 5, nullptr, 10);
+            gCachedRailValid = true;
+        } else if (strncmp(line, "hidden ", 7) == 0) {
+            gCachedRailHidden = strtoul(line + 7, nullptr, 10) != 0;
+        }
     }
     (void) fclose(handle);
     if (!sameRoot)
@@ -1172,7 +1970,13 @@ static void cacheSave(void) {
         return;
     fprintf(handle, "root %s\n", gRailRoot);
     fprintf(handle, "open %s\n", gOpenPath);
-    fprintf(handle, "rail %zu\n", gScene != nullptr ? gScene->railWidth : 0u);
+    // A hidden rail still remembers the width it had, so the text-based mode is a state
+    // the next run can come back from rather than a one-way trip.
+    fprintf(handle, "rail %zu\n", gScene != nullptr
+                                  ? (gScene->railVisible ? gScene->railWidth
+                                                         : gScene->railRestoreWidth)
+                                  : 0u);
+    fprintf(handle, "hidden %d\n", gScene != nullptr && !gScene->railVisible ? 1 : 0);
     bool ok = fflush(handle) == 0;
     ok = fclose(handle) == 0 && ok;
     if (!ok || rename(staged, path) != 0)
@@ -1228,8 +2032,9 @@ static void railBuild(const char *root) {
 // Compose one rail row: indentation, the fold marker, and the name. Presentation lives
 // here and structure lives in the tree, which is why the tree never had to know what a
 // folder looks like.
-static size_t railIndent(TerminalTreeRow row, size_t width) {
-    size_t deepest = width > 8u ? (width - 6u) / 2u : 1u;
+static size_t railIndent(TerminalTreeRow row) {
+    // Preserve room for a disclosure marker, icon and useful filename at depth.
+    size_t deepest = 6u;
     size_t levels = row.depth + 1u;
     return levels > deepest ? deepest : levels;
 }
@@ -1240,10 +2045,9 @@ static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width
     // border. The design's rows have always carried it. One extra level of indent is
     // reserved for that margin; beyond that the indent stops growing so a deep node still
     // shows a name instead of nothing but spaces.
-    size_t levels = railIndent(row, width);
     size_t at = 0;
-    for (size_t level = 0; level < levels && at + 3u < size; ++level) {
-        out[at++] = ' ';
+    size_t levels = railIndent(row);
+    for (size_t level = 0; level < levels && at + 2u < size; ++level) {
         out[at++] = ' ';
     }
     // Disclosure shapes stay Unicode through the wide-character curses device boundary.
@@ -1292,8 +2096,9 @@ static void sceneSyncRail(Scene *scene, size_t visible) {
             continue;
         }
         TerminalTreeRow record = TerminalTreeView_rowAt(gRail, first + index);
+        size_t contentWidth = scene->railWidth;
         railFormat(scene->railText[index], sizeof scene->railText[index], record,
-                   scene->railWidth);
+                   contentWidth);
         (void) TerminalText_setText(row, scene->railText[index],
                                     strlen(scene->railText[index]));
         (void) TerminalText_setForegroundColor(row, 0xFFFFFFFFu);
@@ -1309,6 +2114,9 @@ static void sceneSyncRail(Scene *scene, size_t visible) {
 // survive because only the owned foreground plane changes. No allocation or IO.
 static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
                             bool havePointer, size_t pointerX, size_t pointerY) {
+    (void) havePointer;
+    (void) pointerX;
+    (void) pointerY;
     size_t width = TerminalCanvas_getWidth(canvas);
     size_t height = TerminalCanvas_getHeight(canvas);
     size_t railEnd = scene->railWidth < width ? scene->railWidth : width;
@@ -1317,18 +2125,8 @@ static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
     for (size_t index = 0; index < scene->railRowCount && index + 2u < height
                            && first + index < count; ++index) {
         TerminalTreeRow row = TerminalTreeView_rowAt(gRail, first + index);
-        size_t iconX = railIndent(row, scene->railWidth) * 2u + 2u;
-        size_t nameX = iconX + (row.folder && !gNerdIcons ? 3u : 2u);
+        size_t iconX = railIndent(row) + 2u;
         size_t y = index + 1u;
-        // Truncation ellipsis belongs to the visible name, not the row's whitespace.
-        size_t end = railEnd;
-        while (end > nameX && TerminalCanvas_glyphAt(canvas, end - 1u, y) == ' ')
-            --end;
-        bool hovered = havePointer && pointerY == y
-                    && pointerX >= nameX && pointerX < end;
-        if (hovered)
-            for (size_t x = nameX; x < end; ++x)
-                gFg[y * width + x] = 0xA0A0AAFFu;
         if (gNerdIcons && iconX < railEnd)
             gFg[y * width + iconX] = iconColor(TerminalCanvas_glyphAt(canvas, iconX, y));
     }
@@ -1340,6 +2138,25 @@ static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
             if (glyph >= 0xe000u && glyph <= 0xf8ffu)
                 gFg[x] = iconColor(glyph);
         }
+}
+
+// The divider is invisible at rest. Hover reveals only a three-cell grip at its
+// vertical midpoint, keeping the tree free of an always-on line.
+static void paintRailSplitter(const Scene *scene, TerminalCanvas *canvas, bool visible) {
+    if (scene == nullptr || canvas == nullptr)
+        return;
+    size_t width = TerminalCanvas_getWidth(canvas);
+    size_t height = TerminalCanvas_getHeight(canvas);
+    if (!visible || !scene->railVisible || scene->railWidth == 0u || scene->railWidth > width
+        || height < 5u)
+        return;
+    size_t x = scene->railWidth - 1u;
+    size_t middle = height / 2u;
+    for (size_t y = middle - 1u; y <= middle + 1u && y + 1u < height; ++y)
+        TerminalCanvas_text(canvas, x, y, "|", 1u,
+                            TerminalPen_3(TERMINAL_STYLE_NONE,
+                                          TERMINAL_RGB(0x55, 0x58, 0x62),
+                                          TERMINAL_COLOR_DEFAULT));
 }
 
 static TerminalPanel *buildRail(Scene *scene, size_t rowCount) {
@@ -1397,10 +2214,20 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
         scene->rows[i].code = line;
     }
     scene->rowCount = rowCount;
-    // The action chips are a LAYERED sibling of the rows, so they paint on top of
-    // the first editor row without taking a row of their own.
-    scene->languageHints = chip(scene->markdownFile ? "" : "20!!, 20!");
-    scene->runHint = chip(scene->markdownFile ? "" : "> run");
+    // Three control rows sit above the content and are a LAYERED sibling of the code
+    // rows, so they paint over the first three rows without consuming any of them:
+    //   row 0  [>> run][20!!, 20!, 20?]
+    //   row 1  [code][preview]                 (Markdown only)
+    //   row 2  [open in browser]               (Markdown only)
+    // The Markdown content itself starts on row 3 (sceneMarkdownContent), which is why
+    // a preview never sits under its own controls.
+    //
+    // Each row is its own FLEX band. That matters: a BAND_RIGHT chip RESERVES its
+    // slice for the next sibling, so one shared FLEX panel would push a later row's
+    // chip left by every empty chip on the rows above. Separate bands keep each row
+    // flush with the editor's right edge.
+    scene->languageHints = chip(scene->markdownFile ? "" : "20!!, 20!, 20?");
+    scene->runHint = chip(scene->markdownFile ? "" : ">> run");
     (void) TerminalText_setBrackets(scene->languageHints,
                                     scene->markdownFile ? 0u : '[',
                                     scene->markdownFile ? 0u : ']');
@@ -1408,25 +2235,25 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
                                     scene->markdownFile ? 0u : '[',
                                     scene->markdownFile ? 0u : ']');
     scene->codeMode = TerminalText(scene->markdownFile ? "[code]" : "");
-    scene->markdownModeSpacer = plain(" ", COL_MUTED);
     scene->previewMode = TerminalText(scene->markdownFile ? "[preview]" : "");
+    scene->browserMode = TerminalText(scene->markdownFile ? "[open in browser]" : "");
     scene->codeModeWidth = 6u;
     scene->previewModeWidth = 9u;
-    scene->markdownModeGap = 1u;
+    scene->markdownModeGap = 0u;
+    (void) TerminalText_setForegroundColor(scene->languageHints, COL_ERROR);
+    (void) TerminalText_setForegroundColor(scene->runHint, COL_ACCENT);
+    (void) TerminalText_setForegroundColor(scene->codeMode, COL_MUTED);
+    (void) TerminalText_setForegroundColor(scene->previewMode, COL_MUTED);
+    (void) TerminalText_setForegroundColor(scene->browserMode, COL_ACCENT);
+    TerminalPanel *hintRow = TerminalPanel();
+    TerminalPanel *modeRow = TerminalPanel();
+    TerminalPanel *browserRow = TerminalPanel();
     if (scene->languageHints == nullptr || scene->runHint == nullptr || scene->codeMode == nullptr
-        || scene->markdownModeSpacer == nullptr || scene->previewMode == nullptr
-        || !putText(actions, scene->previewMode,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->previewModeWidth))
-        || !putText(actions, scene->markdownModeSpacer,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->markdownModeGap))
-        || !putText(actions, scene->codeMode,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->codeModeWidth))
-        || !putText(actions, plain("  ", COL_MUTED),
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 2u))
-        || !putText(actions, scene->languageHints,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 11u))
-        || !putText(actions, scene->runHint,
-                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 8u))) {
+        || scene->previewMode == nullptr || scene->browserMode == nullptr
+        || hintRow == nullptr || modeRow == nullptr || browserRow == nullptr) {
+        TerminalPanel_free(hintRow);
+        TerminalPanel_free(modeRow);
+        TerminalPanel_free(browserRow);
         TerminalPanel_free(editor);
         TerminalPanel_free(gutter);
         TerminalPanel_free(code);
@@ -1434,6 +2261,63 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
         TerminalPanel_free(actions);
         return nullptr;
     }
+    // First row: diagnostics at the far right, then the run chip to its left, so the
+    // reading order is [>> run][20!!, 20!, 20?].
+    if (!putText(hintRow, scene->languageHints,
+                 TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, TUI_HINT_CHIP_CELLS))
+        || !putText(hintRow, scene->runHint,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, TUI_RUN_CHIP_CELLS))
+        // Second row: preview at the far right, then code.
+        || !putText(modeRow, scene->previewMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->previewModeWidth))
+        || !putText(modeRow, scene->codeMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, scene->codeModeWidth))
+        // Third row: the browser action alone.
+        || !putText(browserRow, scene->browserMode,
+                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, TUI_MARKDOWN_BROWSER_CELLS))) {
+        TerminalPanel_free(hintRow);
+        TerminalPanel_free(modeRow);
+        TerminalPanel_free(browserRow);
+        TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
+        TerminalPanel_free(code);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
+        return nullptr;
+    }
+    if (!putPanel(actions, hintRow, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
+        TerminalPanel_free(hintRow);
+        TerminalPanel_free(modeRow);
+        TerminalPanel_free(browserRow);
+        TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
+        TerminalPanel_free(code);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
+        return nullptr;
+    }
+    hintRow = nullptr;                              // actions owns it now
+    if (!putPanel(actions, modeRow, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
+        TerminalPanel_free(modeRow);
+        TerminalPanel_free(browserRow);
+        TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
+        TerminalPanel_free(code);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
+        return nullptr;
+    }
+    modeRow = nullptr;
+    if (!putPanel(actions, browserRow, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP, 1))) {
+        TerminalPanel_free(browserRow);
+        TerminalPanel_free(editor);
+        TerminalPanel_free(gutter);
+        TerminalPanel_free(code);
+        TerminalPanel_free(rows);
+        TerminalPanel_free(actions);
+        return nullptr;
+    }
+    browserRow = nullptr;
     (void) TerminalPanel_setForegroundColor(actions, COL_MUTED);
     if (!putPanel(code, rows, TerminalAnchor_0()) || !putPanel(code, actions, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
@@ -1442,55 +2326,129 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
         return nullptr;
     }
     (void) TerminalPanel_setLayout(code, TERMINAL_PANEL_LAYERED);
-    // The run chip sits left of the diagnostics chip in the same row.
     // The gutter is two spaces, a right-aligned per-file number, and a period; the reserved
     // two-cell gap after it keeps code aligned without rendering a divider at rest.
     TerminalText *gap = plain("  ", COL_TEXT);
-    if (!putPanel(editor, gutter,
-                  TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
-                                   scene->numberWidth + 2u + 1u))
-        || !putText(editor, gap, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CODE_PAD))
+    scene->gutterId = TerminalPanel_addPanel(
+        editor, gutter,
+        TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, scene->numberWidth + 2u + 1u));
+    if (!TerminalPanel_isChildId(scene->gutterId)) {
+        TerminalPanel_free(gutter);
+        TerminalText_free(gap);
+        TerminalPanel_free(editor);
+        return nullptr;
+    }
+    gutter = nullptr;
+    if (!putText(editor, gap, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, TUI_CODE_PAD))
         || !putPanel(editor, code, TerminalAnchor_0())) {
         TerminalPanel_free(editor);
         return nullptr;
     }
+    scene->editor = editor;
     return editor;
 }
 
-// The centre is only the editor: the tab strip and its separator moved into the
-// chrome row, which is the compaction.
+// The conditional warning header. It is a BAND_TOP child of the centre whose extent is
+// 0 when there is nothing to say, so the editor's first row is unchanged in the normal
+// case. The panel's own children are placed from the right first (the closing brace and
+// the label), then the opening brace and the message take the rest, which lets the
+// message absorb a rail resize without rebuilding the tree.
+static TerminalPanel *buildWarningHeader(Scene *scene) {
+    TerminalPanel *warning = TerminalPanel();
+    if (warning == nullptr)
+        return nullptr;
+    TerminalText *close = plain("}", COL_ACCENT);
+    TerminalText *label = chip("");
+    TerminalText *open = plain("{", COL_ACCENT);
+    TerminalText *message = plain(gWarningText, COL_TEXT);
+    scene->warningLabel = label;
+    scene->warningText = message;
+    (void) TerminalText_setForegroundColor(label, COL_MUTED);
+    if (close == nullptr || label == nullptr || open == nullptr || message == nullptr
+        || !putText(warning, close, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT, 1))
+        || !putText(warning, label, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_RIGHT,
+                                                     TUI_WARNING_LABEL_CELLS))
+        || !putText(warning, open, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 1))
+        || !putText(warning, message, TerminalAnchor_1(TERMINAL_ANCHOR_BAND_LEFT))) {
+        TerminalPanel_free(warning);
+        return nullptr;
+    }
+    (void) TerminalPanel_setForegroundColor(warning, COL_TEXT);
+    return warning;
+}
+
+// The centre is the warning header (zero rows when silent) over the editor. The tab
+// strip lives in the chrome row, which is the compaction.
 static TerminalPanel *buildCentre(Scene *scene, size_t rowCount) {
     TerminalPanel *centre = TerminalPanel();
-    if (centre == nullptr)
+    TerminalPanel *warning = buildWarningHeader(scene);
+    TerminalPanel *editor = buildEditor(scene, rowCount);
+    if (centre == nullptr || warning == nullptr || editor == nullptr) {
+        TerminalPanel_free(centre);
+        TerminalPanel_free(warning);
+        TerminalPanel_free(editor);
         return nullptr;
-    if (!putPanel(centre, buildEditor(scene, rowCount), TerminalAnchor_0())) {
+    }
+    scene->warningId = TerminalPanel_addPanel(
+        centre, warning, TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP,
+                                          scene->warningVisible ? 1u : 0u));
+    if (!TerminalPanel_isChildId(scene->warningId)
+        || !putPanel(centre, editor, TerminalAnchor_0())) {
         TerminalPanel_free(centre);
         return nullptr;
     }
+    scene->centre = centre;
     return centre;
 }
 
 static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size_t left,
                           size_t visible);
-static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth,
-                                size_t numberWidth);
+static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth);
+
+static size_t lineNumberWidth(size_t lineCount) {
+    size_t width = GUTTER_MIN_NUMBER_WIDTH;
+    for (size_t largest = lineCount; largest >= 10u; largest /= 10u)
+        ++width;
+    return width;
+}
+
+// The open file may cross a power-of-ten boundary while being edited. Resize the
+// retained gutter in place so the period stays inside its band and code keeps a stable
+// left edge for the new number width. Shrinking after deletions follows the same rule.
+static bool sceneUpdateNumberWidth(Scene *scene, const FileText *file) {
+    if (scene == nullptr || file == nullptr)
+        return false;
+    size_t width = lineNumberWidth(file->lineCount);
+    if (width == scene->numberWidth)
+        return true;
+    if (scene->editor == nullptr || !TerminalPanel_isChildId(scene->gutterId)
+        || !TerminalPanel_setAnchor(scene->editor, scene->gutterId,
+                                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                                    width + 2u + 1u))) {
+        THROW("semicolon: could not update line-number gutter width");
+        return false;
+    }
+    scene->numberWidth = width;
+    return true;
+}
 
 // Build the whole tree. Every child is built first and handed over afterwards, so
 // a refusal is detected before anything is partially wired. A failure here ends
 // the process with a diagnostic, which is why the not-yet-handed-over locals are
 // simply reclaimed by exit rather than untangled.
-static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
+static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount, int width, int height) {
     *scene = (Scene) {0};
     scene->railWidth = 30;
-    scene->numberWidth = GUTTER_MIN_NUMBER_WIDTH;
+    scene->headerLeftWidth = 30;
+    scene->railRestoreWidth = 30;
+    scene->railVisible = true;
+    scene->numberWidth = lineNumberWidth(file->lineCount);
+    gEditorFirstRow = 1u;
     sceneMarkdownSource(scene, file);
-    for (size_t largest = file->lineCount; largest >= 10u; largest /= 10u)
-        ++scene->numberWidth;
     TerminalPanel *title = buildChromeRow(scene);
-    TerminalPanel *status = buildStatusBar(scene, file);
-    TerminalPanel *rail = buildRail(scene, rowCount);
+    TerminalPanel *status = buildStatusBar(scene, file, width);
+    TerminalPanel *rail = buildRail(scene, railVisibleRows(height));
     TerminalPanel *centre = buildCentre(scene, rowCount);
-    TerminalText *border = nullptr;   // borderless: the right edge is not a line
     scene->root = TerminalPanel();
     if (title == nullptr || status == nullptr || rail == nullptr || centre == nullptr
         || scene->root == nullptr) {
@@ -1507,7 +2465,6 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
         TerminalPanel_free(scene->root);
         TerminalPanel_free(rail);
         TerminalPanel_free(centre);
-        TerminalText_free(border);
         *scene = (Scene) {0};
         return;
     }
@@ -1518,7 +2475,6 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
         TerminalPanel_free(scene->root);
         TerminalPanel_free(rail);
         TerminalPanel_free(centre);
-        TerminalText_free(border);
         *scene = (Scene) {0};
         return;
     }
@@ -1527,7 +2483,7 @@ static void sceneBuild(Scene *scene, const FileText *file, size_t rowCount) {
         *scene = (Scene) {0};
         return;
     }
-    sceneSyncRows(scene, file, 0, 0, rowCount);
+    sceneSyncRows(scene, file, 0, 0, editorVisibleRows(height));
 }
 
 // Point every visible row at the line it should show. No allocation, no tree
@@ -1562,28 +2518,164 @@ static void sceneSyncRows(Scene *scene, const FileText *file, size_t first, size
         (void) TerminalText_setText(row->code, bytes + skip, length - skip);
     }
     if (scene->lineChip != nullptr) {
-        (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%3zu]", first + 1);
+        // The position chip is the CURSOR, not the viewport: line first, then the
+        // cursor's cell column inside that line. It is the one footer field that
+        // answers "where am I typing?" rather than "what am I looking at?".
+        size_t line = file->cursorLine < file->lineCount ? file->cursorLine + 1u : 1u;
+        size_t column = 1u;
+        if (file->cursorLine < file->lineCount) {
+            size_t at = file->cursorByte;
+            size_t lineLength = file->lineLengths[file->cursorLine];
+            if (at > lineLength)
+                at = lineLength;
+            column = cellsOf(file->lines[file->cursorLine], at) + 1u;
+        }
+        (void) snprintf(gLineChip, sizeof gLineChip, "[ln:%zu:%zu]", line, column);
         (void) TerminalText_setText(scene->lineChip, gLineChip, strlen(gLineChip));
     }
 }
 
+// A rail resize moves the rail band and the blank tab spacer together, keeping tabs
+// aligned with the editor while the project root remains the first tree row.
 static void sceneSetRailWidth(Scene *scene, size_t width) {
+    if (scene == nullptr || scene->root == nullptr)
+        return;
     if (width < TUI_RAIL_MIN)
         width = TUI_RAIL_MIN;
-    if (width == scene->railWidth)
+    size_t maxWidth = gTerminalWidth > (int) (TUI_RAIL_MIN + TUI_RAIL_MARGIN)
+                    ? (size_t) gTerminalWidth - TUI_RAIL_MARGIN : TUI_RAIL_MIN;
+    if (width > maxWidth)
+        width = maxWidth;
+    if (scene->railVisible && width == scene->railWidth)
         return;
     size_t oldWidth = scene->railWidth;
-    if (!TerminalPanel_setAnchor(scene->root, scene->railId,
-                                 TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width)))
+    if (scene->railVisible
+        && !TerminalPanel_setAnchor(scene->root, scene->railId,
+                                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width)))
         return;
-    size_t spacerWidth = width > scene->modeWidth ? width - scene->modeWidth : 0u;
-    if (!TerminalPanel_setAnchor(scene->header, scene->tabSpacerId,
-                                 TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, spacerWidth))) {
-        (void) TerminalPanel_setAnchor(scene->root, scene->railId,
-                                       TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, oldWidth));
+    size_t titleCells = width;
+    if (scene->header != nullptr && TerminalPanel_isChildId(scene->projectTextId)
+        && !TerminalPanel_setAnchor(scene->header, scene->projectTextId,
+                                    TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, titleCells))) {
+        if (scene->railVisible)
+            (void) TerminalPanel_setAnchor(scene->root, scene->railId,
+                                           TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, oldWidth));
         return;
     }
-    scene->railWidth = width;
+    scene->headerLeftWidth = width;
+    scene->railRestoreWidth = width;
+    if (scene->railVisible)
+        scene->railWidth = width;
+    // The content rectangle moved with the divider, so any hover chip is at a stale
+    // coordinate now.
+    sceneMarkdownClearFeedback(scene);
+}
+
+static const char *folderHandleIcon(void) {
+    return gNerdIcons ? "\uf07b" : "📁";
+}
+
+static void sceneUpdateEdgeRailHandle(Scene *scene) {
+    if (scene == nullptr)
+        return;
+    scene->edgeRailHandle = !scene->railVisible;
+    size_t handleCells = scene->edgeRailHandle ? (gNerdIcons ? 1u : 2u) : 0u;
+    if (scene->gripChip != nullptr) {
+        const char *handle = scene->edgeRailHandle ? folderHandleIcon() : "";
+        (void) TerminalText_setText(scene->gripChip, handle, strlen(handle));
+        (void) TerminalText_setForegroundColor(scene->gripChip,
+                                               scene->edgeRailHandle ? COL_ACCENT : COL_MUTED);
+    }
+    if (scene->header != nullptr && TerminalPanel_isChildId(scene->gripId))
+        (void) TerminalPanel_setAnchor(scene->header, scene->gripId,
+                                       TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                                        handleCells));
+    scene->headerLeftWidth = scene->railVisible ? scene->railWidth : handleCells;
+    if (scene->header != nullptr && TerminalPanel_isChildId(scene->projectTextId)) {
+        size_t spacerCells = scene->headerLeftWidth > handleCells
+                           ? scene->headerLeftWidth - handleCells : 0u;
+        (void) TerminalPanel_setAnchor(scene->header, scene->projectTextId,
+                                       TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT,
+                                                        spacerCells));
+    }
+}
+
+// Show or hide the file rail. A hidden rail always exposes the folder affordance.
+static bool sceneSetRailVisible(Scene *scene, bool visible) {
+    if (scene == nullptr || scene->root == nullptr || scene->railVisible == visible)
+        return false;
+    if (visible) {
+        size_t width = scene->railRestoreWidth >= TUI_RAIL_MIN
+                     ? scene->railRestoreWidth : TUI_RAIL_MIN;
+        size_t maxWidth = gTerminalWidth > (int) (TUI_RAIL_MIN + TUI_RAIL_MARGIN)
+                        ? (size_t) gTerminalWidth - TUI_RAIL_MARGIN : TUI_RAIL_MIN;
+        if (width > maxWidth)
+            width = maxWidth;
+        if (!TerminalPanel_setAnchor(scene->root, scene->railId,
+                                     TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, width)))
+            return false;
+        scene->railVisible = true;
+        scene->railWidth = width;
+        scene->railRestoreWidth = width;
+    } else {
+        if (!TerminalPanel_setAnchor(scene->root, scene->railId,
+                                     TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0)))
+            return false;
+        scene->railVisible = false;
+        scene->railWidth = 0;
+    }
+    sceneUpdateEdgeRailHandle(scene);
+    sceneMarkdownClearFeedback(scene);
+    return true;
+}
+
+static void sceneSetGripHover(Scene *scene, bool hovered) {
+    if (scene == nullptr || scene->gripHovered == hovered)
+        return;
+    scene->gripHovered = hovered;
+    if (scene->gripChip == nullptr)
+        return;
+    (void) TerminalText_setStyle(scene->gripChip,
+                                 hovered ? TERMINAL_STYLE_BOLD : TERMINAL_STYLE_NONE);
+    (void) TerminalText_setForegroundColor(scene->gripChip, hovered ? COL_ACCENT : COL_MUTED);
+}
+
+// The warning is a real row only when it has something to say. Showing it moves the
+// centre's first row down by one; the rail never moves, because the folders stay where
+// the user left them. The message is fitted to the centre's width so the label and the
+// closing brace always survive.
+static void sceneSetWarning(Scene *scene, const char *text, const char *label) {
+    if (scene == nullptr)
+        return;
+    const char *message = text == nullptr ? "" : text;
+    const char *tag = label == nullptr ? "" : label;
+    bool visible = message[0] != '\0';
+    size_t rail = scene->railVisible ? scene->railWidth : 0u;
+    size_t centreWidth = gTerminalWidth > (int) rail ? (size_t) gTerminalWidth - rail : 0u;
+    size_t messageCells = centreWidth > 1u + TUI_WARNING_LABEL_CELLS + 1u
+                        ? centreWidth - 1u - TUI_WARNING_LABEL_CELLS - 1u : 0u;
+    char fitted[256];
+    copyCellsEllipsis(message, messageCells, fitted, sizeof fitted);
+    (void) snprintf(gWarningText, sizeof gWarningText, "%s", fitted);
+    (void) snprintf(gWarningLabel, sizeof gWarningLabel, "%s", tag);
+    if (scene->warningText != nullptr)
+        (void) TerminalText_setText(scene->warningText, gWarningText, strlen(gWarningText));
+    if (scene->warningLabel != nullptr) {
+        if (tag[0] != '\0')
+            (void) snprintf(gWarningLabelText, sizeof gWarningLabelText, "[%s]", tag);
+        else
+            gWarningLabelText[0] = '\0';
+        (void) TerminalText_setText(scene->warningLabel, gWarningLabelText,
+                                    strlen(gWarningLabelText));
+        (void) TerminalText_setBrackets(scene->warningLabel, 0u, 0u);
+    }
+    if (scene->centre != nullptr && TerminalPanel_isChildId(scene->warningId))
+        (void) TerminalPanel_setAnchor(scene->centre, scene->warningId,
+                                       TerminalAnchor_2(TERMINAL_ANCHOR_BAND_TOP,
+                                                        visible ? 1u : 0u));
+    scene->warningVisible = visible;
+    gEditorFirstRow = visible ? 2u : 1u;
+    sceneMarkdownClearFeedback(scene);
 }
 
 static void sceneFree(Scene *scene) {
@@ -1596,17 +2688,22 @@ static void sceneFree(Scene *scene) {
 static bool sceneSetMarkdownMode(Scene *scene, bool preview) {
     if (scene == nullptr || !scene->markdownFile || scene->markdown == nullptr)
         return false;
+    if (preview && gOpenFile != nullptr
+        && !TerminalMarkdownView_setSource(scene->markdown, gOpenFile->lines,
+                                            gOpenFile->lineCount))
+        return false;
     scene->preview = preview;
     if (preview)
         (void) TerminalMarkdownView_setScroll(scene->markdown, 0);
+    sceneMarkdownClearFeedback(scene);
     return true;
 }
 
-static bool sceneMarkdownClick(Scene *scene, size_t x, size_t width) {
+static bool sceneMarkdownClick(Scene *scene, size_t x, size_t y, size_t width) {
     if (scene == nullptr || !scene->markdownFile || scene->codeMode == nullptr
-        || scene->previewMode == nullptr || width < scene->codeModeWidth
-                                                   + scene->previewModeWidth
-                                                   + scene->markdownModeGap)
+        || scene->previewMode == nullptr || y != editorFirstRow() + 1u
+        || width < scene->codeModeWidth + scene->previewModeWidth
+                   + scene->markdownModeGap)
         return false;
     size_t first = width - scene->codeModeWidth - scene->previewModeWidth
                  - scene->markdownModeGap;
@@ -1618,23 +2715,288 @@ static bool sceneMarkdownClick(Scene *scene, size_t x, size_t width) {
     return false;
 }
 
-static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth,
-                                size_t numberWidth) {
-    if (scene == nullptr || canvas == nullptr || !scene->markdownFile || !scene->preview
-        || scene->markdown == nullptr)
+// The browser chip is the third control row, right-aligned. It is a cold action: the
+// shell hands the path to the host's opener and returns to the terminal immediately.
+static bool sceneMarkdownBrowserClick(Scene *scene, size_t x, size_t y, size_t width) {
+    if (scene == nullptr || !scene->markdownFile || scene->browserMode == nullptr
+        || y != editorFirstRow() + 2u || width < TUI_MARKDOWN_BROWSER_CELLS)
+        return false;
+    size_t first = width - TUI_MARKDOWN_BROWSER_CELLS;
+    if (x < first || x >= width)
+        return false;
+    return openInBrowser(scene);
+}
+
+// VALUE RECORD: MarkdownContent (no behaviour).
+// The one Markdown content rectangle: one row under the editor header, one cell right
+// of the rail divider, and above the frame's bottom border. Rendering, hover mapping and
+// overlay painting all resolve through this record so their geometry cannot drift apart.
+typedef struct MarkdownContent {
+    size_t x;
+    size_t y;
+    size_t width;
+    size_t height;
+} MarkdownContent;
+
+static MarkdownContent sceneMarkdownContent(size_t railWidth, size_t canvasWidth,
+                                            size_t canvasHeight) {
+    MarkdownContent content = {0};
+    size_t x = railWidth + TUI_MARKDOWN_CONTENT_OFFSET;
+    size_t y = editorFirstRow() + 3u;
+    if (x >= canvasWidth || y >= canvasHeight || canvasHeight - y < 2u)
+        return content;
+    content.x = x;
+    content.y = y;
+    content.width = canvasWidth - x;
+    content.height = canvasHeight - y - 1u;
+    return content;
+}
+
+// VALUE RECORD: Base64Text (owned text; the caller releases it with free).
+// The clipboard escape needs the base64 text between its prefix and its terminator, so
+// the text is returned as one owned value rather than written into a caller destination.
+typedef struct Base64Text {
+    char *text;
+    size_t length;
+} Base64Text;
+
+static Base64Text base64Encode(const unsigned char *bytes, size_t length) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Base64Text encoded = {0};
+    if (bytes == nullptr || length == 0u)
+        return encoded;
+    size_t capacity = ((length + 2u) / 3u) * 4u;
+    char *text = malloc(capacity + 1u);
+    if (text == nullptr)
+        return encoded;
+    size_t at = 0u;
+    for (size_t index = 0u; index < length; index += 3u) {
+        size_t remaining = length - index;
+        uint32_t chunk = (uint32_t) bytes[index] << 16;
+        if (remaining > 1u)
+            chunk |= (uint32_t) bytes[index + 1u] << 8;
+        if (remaining > 2u)
+            chunk |= (uint32_t) bytes[index + 2u];
+        text[at++] = alphabet[(chunk >> 18) & 0x3Fu];
+        text[at++] = alphabet[(chunk >> 12) & 0x3Fu];
+        text[at++] = remaining > 1u ? alphabet[(chunk >> 6) & 0x3Fu] : '=';
+        text[at++] = remaining > 2u ? alphabet[chunk & 0x3Fu] : '=';
+    }
+    text[at] = '\0';
+    encoded.text = text;
+    encoded.length = at;
+    return encoded;
+}
+
+static void sceneMarkdownClearNotice(Scene *scene) {
+    if (scene == nullptr)
         return;
-    size_t x = codeLeftColumn(railWidth, numberWidth);
-    size_t y = editorFirstRow() + 1u;
+    (*scene).markdownNotice[0] = '\0';
+    (*scene).markdownNoticeUntilNs = 0u;
+}
+
+static void sceneMarkdownClearFeedback(Scene *scene) {
+    if (scene == nullptr)
+        return;
+    (*scene).hoverBlock = (TerminalMarkdownCodeBlock) {0};
+    (*scene).hoverCopy = false;
+    sceneMarkdownClearNotice(scene);
+}
+
+static void sceneMarkdownSetNotice(Scene *scene, const char *text) {
+    if (scene == nullptr || text == nullptr)
+        return;
+    (void) snprintf((*scene).markdownNotice, sizeof (*scene).markdownNotice, "%s", text);
+    (*scene).markdownNoticeUntilNs = monotonicNowNs() + TUI_MARKDOWN_NOTICE_NS;
+}
+
+// Hand the open file to the host's browser. The child is fire-and-forget: SIGCHLD is
+// ignored so it is reaped by the OS, and the terminal is never blocked on it. A
+// failure is a notice on the content rectangle, not a reason to leave the shell.
+static bool openInBrowser(Scene *scene) {
+    if (scene == nullptr || !(*scene).markdownFile || gOpenPath[0] == '\0')
+        return false;
+#if defined(__APPLE__)
+    char *const argv[] = { (char *) "open", gOpenPath, nullptr };
+#else
+    char *const argv[] = { (char *) "xdg-open", gOpenPath, nullptr };
+#endif
+    signal(SIGCHLD, SIG_IGN);
+    pid_t pid = 0;
+    if (posix_spawnp(&pid, argv[0], nullptr, nullptr, argv, environ) != 0) {
+        sceneMarkdownSetNotice(scene, "Open in browser failed");
+        return false;
+    }
+    sceneMarkdownSetNotice(scene, "Opened in browser");
+    return true;
+}
+
+// Map a pointer cell onto the shaded code block under it and, when it rests on that
+// block's first visible row's rightmost cells, onto the Copy chip. The hover is
+// recomputed from the same content rectangle the renderer paints, so scrolling, a rail
+// drag, a resize or a mode switch invalidates it instead of leaving a stale coordinate.
+static void sceneMarkdownUpdateHover(Scene *scene, size_t pointerX, size_t pointerY,
+                                     size_t canvasWidth, size_t canvasHeight) {
+    if (scene == nullptr)
+        return;
+    (*scene).hoverBlock = (TerminalMarkdownCodeBlock) {0};
+    (*scene).hoverCopy = false;
+    if (!(*scene).markdownFile || !(*scene).preview || (*scene).markdown == nullptr)
+        return;
+    MarkdownContent content = sceneMarkdownContent((*scene).railWidth, canvasWidth, canvasHeight);
+    if (content.width == 0u || content.height == 0u)
+        return;
+    if (pointerX < content.x || pointerX >= content.x + content.width
+        || pointerY < content.y || pointerY >= content.y + content.height)
+        return;
+    size_t scroll = TerminalMarkdownView_getScroll((*scene).markdown);
+    TerminalMarkdownCodeBlock block =
+        TerminalMarkdownView_codeBlockAt((*scene).markdown, scroll + (pointerY - content.y));
+    if (!block.valid)
+        return;
+    (*scene).hoverBlock = block;
+    size_t labelLength = strlen(TUI_MARKDOWN_COPY_LABEL);
+    if (content.width < labelLength)
+        return;
+    size_t firstVisible = block.firstRow > scroll ? block.firstRow - scroll : 0u;
+    size_t chipRow = content.y + firstVisible;
+    size_t chipStart = content.x + content.width - labelLength;
+    (*scene).hoverCopy = pointerY == chipRow && pointerX >= chipStart
+                      && pointerX < content.x + content.width;
+}
+
+// Copy the hovered block as one newline-terminated source text, capped before any
+// allocation or escape is written. A refusal is a visible notice, never a truncated
+// clipboard or an unbounded OSC 52 sequence.
+static bool sceneMarkdownCopyBlock(Scene *scene, TerminalMarkdownCodeBlock block) {
+    if (scene == nullptr || (*scene).markdown == nullptr || !block.valid)
+        return false;
+    size_t total = 0u;
+    for (size_t line = 0u; line < block.sourceLineCount; ++line) {
+        TerminalMarkdownCodeLine row =
+            TerminalMarkdownView_codeBlockLine((*scene).markdown, block, line);
+        if (!row.valid) {
+            sceneMarkdownSetNotice(scene, "Code block changed; copy cancelled");
+            return false;
+        }
+        if (total > TUI_MARKDOWN_COPY_MAX_BYTES
+            || row.length + 1u > TUI_MARKDOWN_COPY_MAX_BYTES - total) {
+            sceneMarkdownSetNotice(scene, "Code block too large to copy");
+            return false;
+        }
+        total += row.length + 1u;
+    }
+    if (total == 0u) {
+        sceneMarkdownSetNotice(scene, "Code block is empty");
+        return false;
+    }
+    char *joined = malloc(total);
+    if (joined == nullptr) {
+        sceneMarkdownSetNotice(scene, "Copy failed: no memory");
+        return false;
+    }
+    size_t at = 0u;
+    for (size_t line = 0u; line < block.sourceLineCount; ++line) {
+        TerminalMarkdownCodeLine row =
+            TerminalMarkdownView_codeBlockLine((*scene).markdown, block, line);
+        if (!row.valid) {
+            free(joined);
+            sceneMarkdownSetNotice(scene, "Code block changed; copy cancelled");
+            return false;
+        }
+        memcpy(joined + at, row.text, row.length);
+        at += row.length;
+        joined[at++] = '\n';
+    }
+    Base64Text encoded = base64Encode((const unsigned char*) joined, total);
+    free(joined);
+    if (encoded.text == nullptr) {
+        sceneMarkdownSetNotice(scene, "Copy failed: no memory");
+        return false;
+    }
+    bool written = writeAll(STDOUT_FILENO, "\x1b]52;c;", 7u)
+                && writeAll(STDOUT_FILENO, encoded.text, encoded.length)
+                && writeAll(STDOUT_FILENO, "\x07", 1u);
+    free(encoded.text);
+    if (!written) {
+        sceneMarkdownSetNotice(scene, "Copy failed: clipboard write");
+        return false;
+    }
+    sceneMarkdownSetNotice(scene, "Copied to clipboard");
+    return true;
+}
+
+// Recompute the hover from the press coordinates, then copy only when the press landed
+// on the Copy chip. True means the press was a Markdown interaction even when the copy
+// itself refused, so the click cannot fall through and start a divider drag.
+static bool sceneMarkdownCopyClick(Scene *scene, size_t pointerX, size_t pointerY,
+                                   size_t canvasWidth, size_t canvasHeight) {
+    sceneMarkdownUpdateHover(scene, pointerX, pointerY, canvasWidth, canvasHeight);
+    if (scene == nullptr || !(*scene).hoverCopy || !(*scene).hoverBlock.valid)
+        return false;
+    (void) sceneMarkdownCopyBlock(scene, (*scene).hoverBlock);
+    return true;
+}
+
+static TerminalPen sceneMarkdownOverlayPen(void) {
+    return TerminalPen_3(TERMINAL_STYLE_BOLD, TERMINAL_RGB(0x1A, 0x1A, 0x1A),
+                         TERMINAL_RGB(0xE6, 0xE6, 0xE6));
+}
+
+// The chip rides the rightmost cells of the block's first visible row. It is painted
+// after the document, so the shaded band never hides it.
+static void sceneMarkdownPaintChip(Scene *scene, TerminalCanvas *content) {
+    if (scene == nullptr || content == nullptr || !(*scene).hoverBlock.valid)
+        return;
+    size_t width = TerminalCanvas_getWidth(content);
+    size_t height = TerminalCanvas_getHeight(content);
+    size_t labelLength = strlen(TUI_MARKDOWN_COPY_LABEL);
+    if (width < labelLength || height == 0u)
+        return;
+    size_t scroll = TerminalMarkdownView_getScroll((*scene).markdown);
+    size_t firstVisible = (*scene).hoverBlock.firstRow > scroll
+                        ? (*scene).hoverBlock.firstRow - scroll : 0u;
+    if (firstVisible >= height)
+        return;
+    TerminalCanvas_text(content, width - labelLength, firstVisible, TUI_MARKDOWN_COPY_LABEL,
+                        labelLength, sceneMarkdownOverlayPen());
+}
+
+// The notice sits on the content rectangle's bottom-right cell. A dynamic notice that
+// nothing displays is a silent failure, so it is painted over the document rather than
+// written raw to stdout where the managed screen would hide it.
+static void sceneMarkdownPaintNotice(Scene *scene, TerminalCanvas *content) {
+    if (scene == nullptr || content == nullptr || (*scene).markdownNotice[0] == '\0')
+        return;
+    size_t width = TerminalCanvas_getWidth(content);
+    size_t height = TerminalCanvas_getHeight(content);
+    size_t length = strlen((*scene).markdownNotice);
+    if (width == 0u || height == 0u || length > width)
+        return;
+    TerminalCanvas_text(content, width - length, height - 1u, (*scene).markdownNotice, length,
+                        sceneMarkdownOverlayPen());
+}
+
+static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t railWidth) {
+    if (scene == nullptr || canvas == nullptr || !(*scene).markdownFile || !(*scene).preview
+        || (*scene).markdown == nullptr)
+        return;
     size_t width = TerminalCanvas_getWidth(canvas);
     size_t height = TerminalCanvas_getHeight(canvas);
-    if (x >= width || y >= height)
+    MarkdownContent contentRect = sceneMarkdownContent(railWidth, width, height);
+    if (contentRect.width == 0u || contentRect.height == 0u)
         return;
-    TerminalCanvas content = TerminalCanvas_sub(canvas, x, y, width - x, height - y - 1u);
-    if (!TerminalMarkdownView_setViewport(scene->markdown, TerminalCanvas_getWidth(&content)))
+    TerminalCanvas content = TerminalCanvas_sub(canvas, contentRect.x, contentRect.y,
+                                                contentRect.width, contentRect.height);
+    if (!TerminalMarkdownView_setViewport((*scene).markdown, TerminalCanvas_getWidth(&content)))
         return;
-    (void) TerminalMarkdownView_setVisibleRows(scene->markdown, TerminalCanvas_getHeight(&content));
+    (void) TerminalMarkdownView_setVisibleRows((*scene).markdown,
+                                               TerminalCanvas_getHeight(&content));
     TerminalCanvas_fill(&content, ' ', TerminalPen());
-    TerminalMarkdownView_render(scene->markdown, &content);
+    TerminalMarkdownView_render((*scene).markdown, &content);
+    sceneMarkdownPaintChip(scene, &content);
+    sceneMarkdownPaintNotice(scene, &content);
 }
 
 // ---------------------------------------------------------------- ncurses side
@@ -1875,29 +3237,23 @@ static bool blitRun(void *context, TerminalRun run) {
     return true;
 }
 
-// The chrome the toolkit has no widget for yet: a compact hover grip at the rail seam.
-static void drawChrome(TerminalCanvas *canvas, size_t width, size_t height, size_t railWidth,
-                       bool dividerHovered) {
-    if (height < 5 || width < 4)
-        return;
-    if (!dividerHovered)
-        return;
-    size_t gripRows = height % 2u == 0u ? 4u : 3u;
-    size_t firstRow = (height - gripRows) / 2u;
-    TerminalPen pen = TerminalPen_1(TERMINAL_STYLE_BOLD | TERMINAL_STYLE_MUTED);
-    // The seam stays invisible; hover reveals only a centered, parity-balanced handle.
-    for (size_t row = 0; row < gripRows; ++row)
-        TerminalCanvas_glyph(canvas, railWidth - 1u, firstRow + row, '|', pen);
-}
-
-// Row 0 is the chrome (title, undo/redo and the tab strip together) and the last
-// row is the status border; everything between is editor.
-static size_t editorFirstRow(void) { return 1; }
+// Row 0 is the chrome (title, undo/redo and the tab strip together); the warning header,
+// when present, owns the next row, and the last row is the status bar. Everything
+// between is editor, so the first editor row is 1 normally and 2 under a warning.
+static size_t editorFirstRow(void) { return gEditorFirstRow; }
 
 static size_t editorRowCount(int height) {
     if (height < (int) (editorFirstRow() + 2u))
         return 0;
     return (size_t) height - editorFirstRow() - 1u;
+}
+
+// The rail lives between the chrome and the status bar and never moves for a warning:
+// folders stay where the user left them while the code/text shifts down.
+static size_t railVisibleRows(int height) {
+    if (height < 3)
+        return 0;
+    return (size_t) height - 2u;
 }
 
 // The scene owns at most TUI_MAX_ROWS row texts, so a very tall terminal shows
@@ -1915,6 +3271,101 @@ static size_t codeColumns(size_t railWidth, size_t numberWidth, int width) {
     return (size_t) width - codeLeftColumn(railWidth, numberWidth);
 }
 
+static void keepCursorVisible(const FileText *file, ScrollGlide *glide,
+                              size_t visible, size_t columns, const Scene *scene) {
+    size_t codeWidth = codeColumns(scene->railWidth, scene->numberWidth, (int) columns);
+    if (visible == 0 || codeWidth == 0 || file->lineCount == 0)
+        return;
+    size_t top = glide->rowTarget > 0.0 ? (size_t) glide->rowTarget : 0u;
+    if (file->cursorLine < top)
+        glide->rowTarget = (double) file->cursorLine;
+    else if (file->cursorLine >= top + visible)
+        glide->rowTarget = (double) (file->cursorLine - visible + 1u);
+    size_t cursorCells = cellsOf(file->lines[file->cursorLine], file->cursorByte);
+    size_t left = glide->columnTarget > 0.0 ? (size_t) glide->columnTarget : 0u;
+    if (cursorCells < left)
+        glide->columnTarget = (double) cursorCells;
+    else if (cursorCells >= left + codeWidth)
+        glide->columnTarget = (double) (cursorCells - codeWidth + 1u);
+}
+
+static void paintEditorCursor(TerminalCanvas *canvas, const FileText *file,
+                              size_t top, size_t left, size_t railWidth,
+                              size_t numberWidth) {
+    if (!file->cursorVisible || file->cursorLine < top
+        || file->cursorLine - top >= editorVisibleRows((int) canvas->gridHeight))
+        return;
+    size_t cells = cellsOf(file->lines[file->cursorLine], file->cursorByte);
+    if (cells < left)
+        return;
+    size_t x = codeLeftColumn(railWidth, numberWidth) + cells - left;
+    size_t y = editorFirstRow() + file->cursorLine - top;
+    if (x >= canvas->gridWidth || y >= canvas->gridHeight)
+        return;
+    size_t index = y * canvas->gridWidth + x;
+    if (canvas->styles != nullptr)
+        canvas->styles[index] |= TERMINAL_STYLE_REVERSE;
+}
+
+static bool editorKey(FileText *file, int key) {
+    if (key == KEY_LEFT) {
+        fileMoveLeft(file);
+        file->cursorVisible = true;
+        return true;
+    }
+    if (key == KEY_RIGHT) {
+        fileMoveRight(file);
+        file->cursorVisible = true;
+        return true;
+    }
+    if (key == KEY_UP) {
+        fileMoveVertical(file, -1);
+        file->cursorVisible = true;
+        return true;
+    }
+    if (key == KEY_DOWN) {
+        fileMoveVertical(file, 1);
+        file->cursorVisible = true;
+        return true;
+    }
+    size_t line = file->cursorLine;
+    if (line >= file->lineCount)
+        return false;
+    if (key == KEY_HOME) {
+        file->cursorByte = 0;
+        file->cursorVisible = true;
+        return true;
+    }
+    if (key == KEY_END) {
+        file->cursorByte = file->lineLengths[line];
+        file->cursorVisible = true;
+        return true;
+    }
+    if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+        file->cursorVisible = true;
+        return fileBackspace(file);
+    }
+    if (key == KEY_DC) {
+        file->cursorVisible = true;
+        return fileDeleteForward(file);
+    }
+    if (key == '\n' || key == '\r') {
+        file->cursorVisible = true;
+        return fileSplit(file);
+    }
+    if (key == '\t') {
+        static const char spaces[TUI_INDENT_SPACES] = { ' ', ' ', ' ', ' ' };
+        file->cursorVisible = true;
+        return fileInsertBytes(file, line, file->cursorByte, spaces, sizeof spaces);
+    }
+    if ((key >= 32 && key != 127) || key >= 128) {
+        char byte = (char) key;
+        file->cursorVisible = true;
+        return fileInsertBytes(file, line, file->cursorByte, &byte, 1u);
+    }
+    return false;
+}
+
 static size_t editorVisibleRows(int height) {
     size_t rows = editorRowCount(height);
     return rows > TUI_MAX_ROWS ? TUI_MAX_ROWS : rows;
@@ -1924,9 +3375,11 @@ static size_t editorVisibleRows(int height) {
 // is resolved by the tree from the viewport offset, so the rail's scroll is already
 // accounted for and a click past the last row is not a click on anything.
 static void railClick(size_t y) {
-    if (gRail == nullptr || y < editorFirstRow())
+    // The rail starts on the row under the chrome and is independent of the editor's
+    // first row, so a warning never shifts the file tree.
+    if (gRail == nullptr || y < 1u)
         return;
-    TerminalTreeNodeId id = TerminalTreeView_nodeAtOffset(gRail, y - editorFirstRow());
+    TerminalTreeNodeId id = TerminalTreeView_nodeAtOffset(gRail, y - 1u);
     if (id == TERMINAL_TREE_NO_NODE)
         return;
     if (TerminalTreeView_isFolder(gRail, id)) {
@@ -1951,6 +3404,14 @@ static void railScrollBy(long rows) {
 
 #define TUI_MOUSE_SGR (KEY_MAX + 1)
 #define TUI_MOUSE_X10 (KEY_MAX + 2)
+// A mouse report is one contiguous escape sequence, but ncurses hands us the
+// introducer as soon as it matches the prefix. The suffix can therefore still be
+// in flight when the next read happens; under timeout(0) it would be left in the
+// queue and typed into the editor as ordinary digits. Wait briefly for each suffix
+// byte, and if the terminal stalls mid-report, keep feeding the remaining bytes to
+// the decoder for this long instead of treating them as text.
+#define TUI_MOUSE_SUFFIX_MS 25
+#define TUI_MOUSE_CAPTURE_NS 5000000000ULL
 
 // One normalized key-scroll step, as a value (the Value Return Law: no destination
 // parameters).
@@ -1985,21 +3446,106 @@ static ScrollStep scrollStepFor(int key) {
 // so the bytes it consumed are re-injected before the suffix is read. This keeps
 // ncurses as the KEY decoder and Determinant as the MOUSE decoder, which is the
 // layering the toolkit's lawbook asks for.
-static bool readMouseSuffix(TerminalInput *input, bool sgr) {
+//
+// The suffix must not be read with timeout(0): every byte would race the input
+// queue, and the bytes that lose the race would be typed into the editor. Wait a
+// slice for them here; the caller keeps a capture window for the stragglers.
+static bool readMouseSuffix(TerminalInput *input, bool sgr, bool blocking) {
     static const char *sgrPrefix = "\x1b[<";
     static const char *x10Prefix = "\x1b[M";
     const char *prefix = sgr ? sgrPrefix : x10Prefix;
     for (size_t i = 0; prefix[i] != '\0'; ++i)
         (void) TerminalInput_feed(input, (unsigned char) prefix[i]);
+    if (!blocking)
+        timeout(TUI_MOUSE_SUFFIX_MS);
+    bool ready = false;
     for (size_t i = 0; i < 24; ++i) {
         int byte = getch();
         if (byte == ERR)
-            return false;
-        if (TerminalInput_feed(input, byte))
-            return true;
+            break;
+        if (TerminalInput_feed(input, byte)) {
+            ready = true;
+            break;
+        }
         if (!sgr && i == 2)
-            return false;   // X10 is exactly three bytes; anything else is malformed
+            break;   // X10 is exactly three bytes; anything else is malformed
     }
+    if (!blocking)
+        timeout(0);
+    return ready;
+}
+
+static void beginMouseSequence(TerminalInput *input, bool sgr) {
+    static const char *sgrPrefix = "\x1b[<";
+    static const char *x10Prefix = "\x1b[M";
+    const char *prefix = sgr ? sgrPrefix : x10Prefix;
+    for (size_t i = 0; prefix[i] != '\0'; ++i)
+        (void) TerminalInput_feed(input, (unsigned char) prefix[i]);
+}
+
+static TerminalPointerEvent ncursesMouseEvent(void) {
+    MEVENT mouse;
+    if (getmouse(&mouse) != OK || mouse.x < 0 || mouse.y < 0)
+        return (TerminalPointerEvent) {0};
+    TerminalPointerEvent event = {
+        .kind = TERMINAL_POINTER_NONE,
+        .button = TERMINAL_BUTTON_NONE,
+        .x = (size_t) mouse.x,
+        .y = (size_t) mouse.y,
+        .shift = (mouse.bstate & BUTTON_SHIFT) != 0,
+        .meta = (mouse.bstate & BUTTON_ALT) != 0,
+        .ctrl = (mouse.bstate & BUTTON_CTRL) != 0
+    };
+    if ((mouse.bstate & BUTTON4_PRESSED) != 0) {
+        event.kind = TERMINAL_POINTER_WHEEL_UP;
+#if defined(BUTTON5_PRESSED)
+    } else if ((mouse.bstate & BUTTON5_PRESSED) != 0) {
+        event.kind = TERMINAL_POINTER_WHEEL_DOWN;
+#endif
+#if defined(BUTTON6_PRESSED)
+    } else if ((mouse.bstate & BUTTON6_PRESSED) != 0) {
+        event.kind = TERMINAL_POINTER_WHEEL_LEFT;
+#endif
+#if defined(BUTTON7_PRESSED)
+    } else if ((mouse.bstate & BUTTON7_PRESSED) != 0) {
+        event.kind = TERMINAL_POINTER_WHEEL_RIGHT;
+#endif
+    } else if ((mouse.bstate & (BUTTON1_RELEASED | BUTTON2_RELEASED | BUTTON3_RELEASED)) != 0) {
+        event.kind = TERMINAL_POINTER_RELEASE;
+        if ((mouse.bstate & BUTTON1_RELEASED) != 0)
+            event.button = TERMINAL_BUTTON_LEFT;
+        else if ((mouse.bstate & BUTTON2_RELEASED) != 0)
+            event.button = TERMINAL_BUTTON_MIDDLE;
+        else
+            event.button = TERMINAL_BUTTON_RIGHT;
+    } else if ((mouse.bstate & (BUTTON1_PRESSED | BUTTON1_CLICKED
+                                | BUTTON1_DOUBLE_CLICKED | BUTTON1_TRIPLE_CLICKED)) != 0) {
+        event.kind = TERMINAL_POINTER_PRESS;
+        event.button = TERMINAL_BUTTON_LEFT;
+    } else if ((mouse.bstate & (BUTTON2_PRESSED | BUTTON2_CLICKED
+                                | BUTTON2_DOUBLE_CLICKED | BUTTON2_TRIPLE_CLICKED)) != 0) {
+        event.kind = TERMINAL_POINTER_PRESS;
+        event.button = TERMINAL_BUTTON_MIDDLE;
+    } else if ((mouse.bstate & (BUTTON3_PRESSED | BUTTON3_CLICKED
+                                | BUTTON3_DOUBLE_CLICKED | BUTTON3_TRIPLE_CLICKED)) != 0) {
+        event.kind = TERMINAL_POINTER_PRESS;
+        event.button = TERMINAL_BUTTON_RIGHT;
+    } else if ((mouse.bstate & REPORT_MOUSE_POSITION) != 0) {
+        event.kind = TERMINAL_POINTER_MOVE;
+    }
+    return event;
+}
+
+static bool isMouseContinuation(const TerminalInput *input, int key) {
+    if (input == nullptr || key < 0 || key > 255)
+        return false;
+    TerminalInputState state = TerminalInput_getState(input);
+    unsigned char byte = (unsigned char) key;
+    if (state == TERMINAL_INPUT_SGR_BUTTON || state == TERMINAL_INPUT_SGR_X
+        || state == TERMINAL_INPUT_SGR_Y)
+        return (byte >= '0' && byte <= '9') || byte == ';' || byte == 'M' || byte == 'm';
+    if (state == TERMINAL_INPUT_X10)
+        return byte >= 32u;
     return false;
 }
 
@@ -2070,14 +3616,6 @@ static size_t applyScroll(size_t value, int delta, size_t maximum) {
 // it gets, and `glideHalt` is what a press does: it drops the target onto the position
 // and the motion is over at once.
 //
-// SLOT RECORD: ScrollGlide
-typedef struct ScrollGlide {
-    double rowShown;      // rows currently displayed, fractional
-    double rowTarget;     // rows headed for
-    double columnShown;
-    double columnTarget;
-} ScrollGlide;
-
 static double clampDouble(double value, double minimum, double maximum) {
     if (value < minimum)
         return minimum;
@@ -2137,12 +3675,15 @@ static int dumpFrame(int width, int height, const FileText *file) {
         return 1;
     }
     Scene scene;
-    sceneBuild(&scene, file, TUI_MAX_ROWS);
+    gTerminalWidth = width;
+    sceneBuild(&scene, file, TUI_MAX_ROWS, width, height);
     // The dump renders the same scene, so it needs the same project: a rail that is empty
     // here would be a different frame from the one the shell shows.
     railBuild(gRailRoot);
     (void) railRevealPath(gOpenPath);
-    sceneSyncRail(&scene, editorVisibleRows(height));
+    setSaveStatus(&scene, file);
+    updateClock(&scene);
+    sceneSyncRail(&scene, railVisibleRows(height));
     if (scene.root == nullptr) {
         fprintf(stderr, "[vex] semicolon: scene construction failed\n");
         return 1;
@@ -2151,9 +3692,8 @@ static int dumpFrame(int width, int height, const FileText *file) {
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
-    sceneRenderMarkdown(&scene, &canvas, scene.railWidth, scene.numberWidth);
+    sceneRenderMarkdown(&scene, &canvas, scene.railWidth);
     paintRailColors(&scene, &canvas, false, 0, 0);
-    drawChrome(&canvas, (size_t) width, (size_t) height, scene.railWidth, false);
     for (int y = 0; y < height; ++y) {
         TerminalCanvasTextRow row = TerminalCanvas_copyRow(&canvas, (size_t) y);
         fwrite(row.data, 1, row.bytes, stdout);
@@ -2206,9 +3746,9 @@ static int runInputProbe(void) {
             continue;
         bool havePointer = false;
         if (key == TUI_MOUSE_SGR)
-            havePointer = readMouseSuffix(&input, true);
+            havePointer = readMouseSuffix(&input, true, true);
         else if (key == TUI_MOUSE_X10)
-            havePointer = readMouseSuffix(&input, false);
+            havePointer = readMouseSuffix(&input, false, true);
         if (line >= LINES - 1)
             line = 3;
         if (havePointer) {
@@ -2331,13 +3871,19 @@ static int runTerminal(FileText *file) {
     if (height > TUI_MAX_H)
         height = TUI_MAX_H;
     Scene scene;
-    sceneBuild(&scene, file, TUI_MAX_ROWS);
+    gTerminalWidth = width;
+    sceneBuild(&scene, file, TUI_MAX_ROWS, width, height);
     gScene = &scene;
     gOpenFile = file;
+    setSaveStatus(&scene, file);
+    updateClock(&scene);
     // The cached divider width, applied where the terminal's width is known so it can be
-    // checked rather than trusted.
+    // checked rather than trusted. The hidden flag is applied after the width, so a
+    // text-based session restores its rail width without showing the rail.
     if (gCachedRail >= TUI_RAIL_MIN && gCachedRail + TUI_RAIL_MARGIN < (size_t) width)
         sceneSetRailWidth(&scene, gCachedRail);
+    if (gCachedRailHidden)
+        (void) sceneSetRailVisible(&scene, false);
     // The project, one level at a time, then the open file revealed down it.
     railBuild(gRailRoot);
     TerminalTreeNodeId opening = railRevealPath(gOpenPath);
@@ -2355,7 +3901,16 @@ static int runTerminal(FileText *file) {
     if (!ok)
         THROW("semicolon: scene construction failed");
 
-    while (ok && !gQuit) {
+    while (ok) {
+        if (gQuit) {
+            if (file->dirty && !fileSave(file, gOpenPath)) {
+                file->saveFailed = true;
+                gQuit = 0;
+                setSaveStatus(&scene, file);
+            } else {
+                break;
+            }
+        }
         // ncurses caches the screen size and only refreshes it on resizeterm - and
         // resizeterm(0, 0) is not accepted, while KEY_RESIZE is not guaranteed to
         // arrive at all. So the size is read from the tty directly. It is applied
@@ -2380,6 +3935,15 @@ static int runTerminal(FileText *file) {
             rows = TUI_MAX_H;
         width = columns;
         height = rows;
+        gTerminalWidth = width;
+        if (file->dirty && !file->saveFailed && autosave(file, gOpenPath))
+            setSaveStatus(&scene, file);
+        else if (file->saveFailed)
+            setSaveStatus(&scene, file);
+        if (!sceneUpdateNumberWidth(&scene, file)) {
+            ok = false;
+            break;
+        }
         size_t visible = editorVisibleRows(height);
         size_t codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
         size_t codeRight = width > 0 ? (size_t) width - 2u : 0;
@@ -2403,9 +3967,39 @@ static int runTerminal(FileText *file) {
         // exposes.
         // 60fps while a scroll is in flight, and a long sleep when nothing is moving.
         // Present-on-demand is preserved: an idle shell still emits nothing at all.
-        timeout(glideActive(&glide) ? TUI_FRAME_MS : TUI_POLL_MS);
+        int waitMs = glideActive(&glide) ? TUI_FRAME_MS : TUI_POLL_MS;
+        if (file->dirty && !file->saveFailed) {
+            uint64_t now = monotonicNowNs();
+            uint64_t elapsed = now >= file->lastEditNs ? now - file->lastEditNs : 0;
+            uint64_t remaining = elapsed < TUI_AUTOSAVE_DELAY_NS
+                               ? TUI_AUTOSAVE_DELAY_NS - elapsed : 0;
+            int deadlineMs = (int) ((remaining + 999999u) / 1000000u);
+            if (deadlineMs < waitMs)
+                waitMs = deadlineMs;
+            if (waitMs < 1)
+                waitMs = 1;
+        }
+        // A live copy notice is the only other timed paint: wake exactly when it must
+        // disappear instead of spinning or lingering until the next input event.
+        if (scene.markdownNotice[0] != '\0') {
+            uint64_t now = monotonicNowNs();
+            uint64_t remaining = now < scene.markdownNoticeUntilNs
+                               ? scene.markdownNoticeUntilNs - now : 0u;
+            int deadlineMs = (int) ((remaining + 999999u) / 1000000u);
+            if (deadlineMs < waitMs)
+                waitMs = deadlineMs;
+            if (waitMs < 1)
+                waitMs = 1;
+        }
+        timeout(waitMs);
         int key = getch();
         timeout(0);
+        if (key == ERR && interaction.mouseCapture
+            && monotonicNowNs() > interaction.mouseCaptureUntilNs) {
+            interaction.mouseCapture = false;
+            interaction.mouseCaptureDetect = false;
+            TerminalInput_reset(&interaction.input);
+        }
         size_t handled = 0;
         while (key != ERR && handled < TUI_EVENTS_PER_FRAME) {
             ++handled;
@@ -2414,43 +4008,124 @@ static int runTerminal(FileText *file) {
             // to want to type.
 
             bool havePointer = false;
-            if (key == KEY_RESIZE) {
+            bool captured = false;
+            TerminalPointerEvent directPointer = {0};
+            if (interaction.mouseCapture) {
+                uint64_t now = monotonicNowNs();
+                bool continuation = false;
+                if (interaction.mouseCaptureDetect && key >= 0 && key <= 255
+                    && now <= interaction.mouseCaptureUntilNs) {
+                    bool sgr = key >= '0' && key <= '9';
+                    beginMouseSequence(&interaction.input, sgr);
+                    interaction.mouseCaptureDetect = false;
+                    continuation = true;
+                } else if (!interaction.mouseCaptureDetect
+                           && now <= interaction.mouseCaptureUntilNs) {
+                    continuation = isMouseContinuation(&interaction.input, key);
+                }
+                if (continuation) {
+                    captured = true;
+                    if (TerminalInput_feed(&interaction.input, key)) {
+                        interaction.mouseCapture = false;
+                        havePointer = true;
+                    } else if (!TerminalInput_isPending(&interaction.input)) {
+                        interaction.mouseCapture = false;
+                    }
+                } else {
+                    interaction.mouseCapture = false;
+                    interaction.mouseCaptureDetect = false;
+                    TerminalInput_reset(&interaction.input);
+                }
+            }
+            if (!captured && key == KEY_RESIZE) {
                 (void) clear();
-            } else if (key == TUI_MOUSE_SGR) {
-                havePointer = readMouseSuffix(&interaction.input, true);
-            } else if (key == TUI_MOUSE_X10) {
-                havePointer = readMouseSuffix(&interaction.input, false);
-            } else {
+                sceneMarkdownClearFeedback(&scene);
+            } else if (!captured && key == TUI_MOUSE_SGR) {
+                havePointer = readMouseSuffix(&interaction.input, true, false);
+                interaction.mouseCaptureDetect = false;
+                if (!havePointer && TerminalInput_isPending(&interaction.input)) {
+                    interaction.mouseCapture = true;
+                    interaction.mouseCaptureUntilNs = monotonicNowNs() + TUI_MOUSE_CAPTURE_NS;
+                }
+            } else if (!captured && key == TUI_MOUSE_X10) {
+                havePointer = readMouseSuffix(&interaction.input, false, false);
+                interaction.mouseCaptureDetect = false;
+                if (!havePointer && TerminalInput_isPending(&interaction.input)) {
+                    interaction.mouseCapture = true;
+                    interaction.mouseCaptureDetect = false;
+                    interaction.mouseCaptureUntilNs = monotonicNowNs() + TUI_MOUSE_CAPTURE_NS;
+                }
+            } else if (!captured && key == KEY_MOUSE) {
+                directPointer = ncursesMouseEvent();
+                havePointer = directPointer.kind != TERMINAL_POINTER_NONE;
+                if (!havePointer) {
+                    int suffix = getch();
+                    if (suffix == ERR) {
+                        interaction.mouseCapture = true;
+                        interaction.mouseCaptureDetect = true;
+                        interaction.mouseCaptureUntilNs = monotonicNowNs() + TUI_MOUSE_CAPTURE_NS;
+                    } else if (suffix >= 0 && suffix <= 255) {
+                        bool sgr = suffix >= '0' && suffix <= '9';
+                        beginMouseSequence(&interaction.input, sgr);
+                        if (TerminalInput_feed(&interaction.input, suffix)) {
+                            havePointer = true;
+                        } else if (TerminalInput_isPending(&interaction.input)) {
+                            interaction.mouseCapture = true;
+                            interaction.mouseCaptureDetect = false;
+                            interaction.mouseCaptureUntilNs = monotonicNowNs() + TUI_MOUSE_CAPTURE_NS;
+                        }
+                    } else if (suffix != ERR) {
+                        (void) ungetch(suffix);
+                    }
+                }
+            } else if (!captured && key == 19 && !scene.preview) {
+                file->saveFailed = false;
+                if (!fileSave(file, gOpenPath))
+                    file->saveFailed = true;
+                setSaveStatus(&scene, file);
+            } else if (!captured) {
                 // Deliberately NOT fed to TerminalInput: it owns "ESC [", so an arrow
                 // it did not recognise would be swallowed as a malformed mouse
                 // sequence instead of reaching the scroll step below.
 
                 ScrollStep step = scrollStepFor(key);
-                if (step.keyed) {
-                    if (scene.preview && step.rows != 0)
+                if (scene.preview && step.keyed) {
+                    if (step.rows != 0) {
                         (void) TerminalMarkdownView_scrollBy(scene.markdown, step.rows);
-                    else
-                        glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
+                        sceneMarkdownClearFeedback(&scene);
+                    }
+                } else if (key == KEY_PPAGE || key == KEY_NPAGE) {
+                    glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
+                } else if (!scene.preview && editorKey(file, key)) {
+                    keepCursorVisible(file, &glide, visible, (size_t) width, &scene);
                 }
             }
             if (havePointer) {
-                TerminalPointerEvent event = TerminalInput_getEvent(&interaction.input);
+                TerminalPointerEvent event = directPointer.kind != TERMINAL_POINTER_NONE
+                    ? directPointer : TerminalInput_getEvent(&interaction.input);
                 interaction.havePointer = true;
                 interaction.pointerX = event.x;
                 interaction.pointerY = event.y;
-                size_t divider = scene.railWidth - 1u;
+                // The rail's seam is the last cell of the rail when it is visible. When
+                // the rail is hidden there is no rail target at all; the editor owns the
+                // full width; the project root is the first tree row when visible.
+                size_t railEdge = scene.railVisible ? scene.railWidth : 0u;
+                size_t seam = railEdge > 0u ? railEdge - 1u : 0u;
+                interaction.dividerHovered = scene.railVisible && event.x == seam
+                    && event.y > 0u && event.y + 1u < (size_t) height;
                 switch (event.kind) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
                         // A wheel over the RAIL scrolls the rail, not the editor: the
                         // pointer says which list the user means, so no mode is needed.
-                        if (event.x < divider) {
+                        if (scene.railVisible && event.x < railEdge) {
                             railScrollBy(down ? 1 : -1);
                             break;
                         }
                         if (scene.preview && event.x >= codeLeft) {
                             (void) TerminalMarkdownView_scrollBy(scene.markdown, down ? 1 : -1);
+                            sceneMarkdownClearFeedback(&scene);
                             break;
                         }
                         // ANY modified wheel pans sideways, because terminals differ
@@ -2480,13 +4155,41 @@ static int runTerminal(FileText *file) {
                         // CATCH IT: a press ends any scroll in flight, which is what makes
                         // momentum safe to have - you can always stop it by touching.
                         glideHalt(&glide);
-                        if (event.y == editorFirstRow() && scene.markdownFile
-                            && sceneMarkdownClick(&scene, event.x, (size_t) width))
+                        // A press on a fenced block's Copy chip is handled before the
+                        // divider and tracking-line targets; content rows never overlap
+                        // those, and a refused copy still consumes the click.
+                        if (scene.markdownFile && scene.preview
+                            && sceneMarkdownCopyClick(&scene, event.x, event.y,
+                                                      (size_t) width, (size_t) height))
                             break;
+                        // The Markdown controls are their own rows: [code][preview] on the
+                        // second and [open in browser] on the third.
+                        if (scene.markdownFile
+                            && (sceneMarkdownClick(&scene, event.x, event.y, (size_t) width)
+                                || sceneMarkdownBrowserClick(&scene, event.x, event.y,
+                                                             (size_t) width)))
+                            break;
+                        // The collapsed folder handle opens the file list; while open,
+                        // this blank hit target remains available for a resize drag.
+                        if (event.x <= 2u && event.y <= 1u) {
+                            interaction.gripPress = true;
+                            interaction.grabMoved = false;
+                            interaction.grabX = event.x;
+                            interaction.grabWidth = scene.railRestoreWidth >= TUI_RAIL_MIN
+                                                  ? scene.railRestoreWidth : TUI_RAIL_MIN;
+                            if (!scene.railVisible && sceneSetRailVisible(&scene, true)) {
+                                codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                         scene.numberWidth,
+                                                                         columns));
+                                glideClamp(&glide, maxTop, maxLeft);
+                            }
+                            break;
+                        }
                         // A press inside the rail is a file-browser click. Checked before
                         // the divider because the divider is its own edge: a rail row
                         // beside it must still open.
-                        if (event.x < divider) {
+                        if (scene.railVisible && event.x < seam) {
                             railClick(event.y);
                             break;
                         }
@@ -2504,18 +4207,73 @@ static int runTerminal(FileText *file) {
                         // RELATIVE to where the grab began. Resizing to the absolute
                         // pointer cell made the divider jump whenever the grab
                         // landed a cell off centre.
-                        if (event.x + 1u >= divider && event.x <= divider + 1u) {
+                        if (scene.railVisible && event.x == seam) {
                             interaction.grabbing = true;
+                            interaction.dividerHovered = true;
                             interaction.grabX = event.x;
                             interaction.grabWidth = scene.railWidth;
                         }
                         break;
-                    case TERMINAL_POINTER_RELEASE:
+                    case TERMINAL_POINTER_RELEASE: {
+                        bool wasGrip = interaction.gripPress;
+                        bool moved = interaction.grabMoved;
+                        bool wasDivider = interaction.grabbing;
+                        interaction.gripPress = false;
+                        interaction.grabMoved = false;
+                        if (wasGrip && !moved && !scene.railVisible) {
+                            (void) sceneSetRailVisible(&scene, true);
+                            codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                            maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                     scene.numberWidth,
+                                                                     columns));
+                            glideClamp(&glide, maxTop, maxLeft);
+                        }
+                        if (wasDivider && !moved) {
+                            uint64_t now = monotonicNowNs();
+                            bool doubleClick = interaction.haveLastDividerClick
+                                            && now >= interaction.lastDividerClickNs
+                                            && now - interaction.lastDividerClickNs
+                                               <= TUI_DOUBLE_CLICK_NS;
+                            if (doubleClick) {
+                                interaction.haveLastDividerClick = false;
+                                (void) sceneSetRailVisible(&scene, false);
+                                codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                         scene.numberWidth,
+                                                                         columns));
+                                glideClamp(&glide, maxTop, maxLeft);
+                            } else {
+                                interaction.haveLastDividerClick = true;
+                                interaction.lastDividerClickNs = now;
+                            }
+                        }
                         interaction.grabbing = false;
+                        interaction.dividerHovered = scene.railVisible
+                            && event.x == (scene.railWidth > 0u ? scene.railWidth - 1u : 0u);
                         interaction.tracking = false;
                         interaction.pressed = false;
                         break;
+                    }
                     case TERMINAL_POINTER_DRAG: {
+                        if (interaction.gripPress) {
+                            long moved = (long) event.x - (long) interaction.grabX;
+                            if (moved != 0) {
+                                interaction.grabMoved = true;
+                                if (!scene.railVisible)
+                                    (void) sceneSetRailVisible(&scene, true);
+                                long wanted = (long) interaction.grabWidth + moved;
+                                if (wanted >= (long) TUI_RAIL_MIN
+                                    && wanted <= (long) columns - (long) TUI_RAIL_MARGIN) {
+                                    sceneSetRailWidth(&scene, (size_t) wanted);
+                                    codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                                    maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                             scene.numberWidth,
+                                                                             columns));
+                                    glideClamp(&glide, maxTop, maxLeft);
+                                }
+                            }
+                            break;
+                        }
                         if (interaction.tracking) {
                             // RELATIVE, by the pointer's own delta. Mapping the absolute
                             // pointer position onto the offset flung the view to
@@ -2532,8 +4290,20 @@ static int runTerminal(FileText *file) {
                         if (interaction.grabbing) {
                             long moved = (long) event.x - (long) interaction.grabX;
                             long wanted = (long) interaction.grabWidth + moved;
-                            if (wanted >= (long) TUI_RAIL_MIN
+                            if (moved != 0)
+                                interaction.grabMoved = true;
+                            if (event.x <= 1u || wanted < (long) TUI_RAIL_MIN) {
+                                if (scene.railVisible)
+                                    (void) sceneSetRailVisible(&scene, false);
+                                codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
+                                maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
+                                                                         scene.numberWidth,
+                                                                         columns));
+                                glideClamp(&glide, maxTop, maxLeft);
+                            } else if (wanted >= (long) TUI_RAIL_MIN
                                 && wanted <= (long) columns - (long) TUI_RAIL_MARGIN) {
+                                if (!scene.railVisible)
+                                    (void) sceneSetRailVisible(&scene, true);
                                 sceneSetRailWidth(&scene, (size_t) wanted);
                                 // The code area moved with the rail, so its bounds did.
                                 codeLeft = codeLeftColumn(scene.railWidth, scene.numberWidth);
@@ -2559,13 +4329,26 @@ static int runTerminal(FileText *file) {
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
+                        sceneSetGripHover(&scene, event.x <= 2u && event.y <= 1u);
+                        interaction.dividerHovered = scene.railVisible
+                            && event.x == (scene.railWidth > 0u ? scene.railWidth - 1u : 0u)
+                            && event.y > 0u && event.y + 1u < (size_t) height;
+                        if (scene.markdownFile && scene.preview)
+                            sceneMarkdownUpdateHover(&scene, event.x, event.y,
+                                                     (size_t) width, (size_t) height);
                         break;
                     default:
                         break;
                 }
             }
-            key = getch();
+            key = handled < TUI_EVENTS_PER_FRAME ? getch() : ERR;
         }
+
+        // A notice is feedback, not retained state: once its window closes it is gone
+        // before the frame paints, so no later present can resurrect it.
+        if (scene.markdownNotice[0] != '\0'
+            && monotonicNowNs() >= scene.markdownNoticeUntilNs)
+            sceneMarkdownClearNotice(&scene);
 
         TerminalCanvas back = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
         TerminalCanvas front = TerminalCanvas(gFrontCells, gFrontStyles, gFrontFg, gFrontBg,
@@ -2594,17 +4377,17 @@ static int runTerminal(FileText *file) {
         size_t scrollTop = (size_t) (glideStep(&glide.rowShown, glide.rowTarget) + 0.5);
         size_t scrollLeft = (size_t) (glideStep(&glide.columnShown, glide.columnTarget) + 0.5);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
-        sceneSyncRail(&scene, visible);
+        sceneSyncRail(&scene, railVisibleRows(height));
+        updateClock(&scene);
         TerminalPanel_paint(scene.root, &back);
-        sceneRenderMarkdown(&scene, &back, scene.railWidth, scene.numberWidth);
+        sceneRenderMarkdown(&scene, &back, scene.railWidth);
+        if (!scene.preview)
+            paintEditorCursor(&back, file, scrollTop, scrollLeft,
+                              scene.railWidth, scene.numberWidth);
         paintRailColors(&scene, &back, interaction.havePointer,
                          interaction.pointerX, interaction.pointerY);
-        size_t divider = scene.railWidth - 1u;
-        bool dividerHovered = interaction.havePointer
-                           && interaction.pointerX + 1u >= divider
-                           && interaction.pointerX <= divider + 1u;
-        drawChrome(&back, (size_t) width, (size_t) height, scene.railWidth,
-                   dividerHovered);
+        paintRailSplitter(&scene, &back,
+                          interaction.dividerHovered || interaction.grabbing);
         TerminalPresentResult presented = TerminalSurface_present(&surface);
         if (!presented.ok)
             ok = false;
