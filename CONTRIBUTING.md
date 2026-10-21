@@ -12,3 +12,14 @@ See README.md for the staged Vexspoke/Relational Engine split. Tests belong in
 the shared tests repository. Document actual proof and gaps; never promote a
 blueprint from compilation alone. Commit locally under the Git Workflow Law;
 never push without an explicit one-off instruction.
+
+## Language consumer boundary
+
+Language owns reusable document, project-analysis, adapter and index contracts;
+Semicolon owns opening projects, discovering and presenting their files, and
+the IDE workflow. The current Language engine accepts a caller-fed project
+inventory and exposes an explicit `c23` lexer adapter. See the [Language
+engine status and limitations](../../ecosystem/language/README.md) before
+building a consumer: parsing, automatic file discovery and the Semicolon UI
+integration are still in progress, and C99 or another dialect must not be
+selected implicitly as C23.
