@@ -955,60 +955,96 @@ static TerminalTreeNodeId railRevealPath(const char *path) {
     return current;
 }
 
-// The breadcrumb is `root>dir>file` - the shape the design uses, and the only one that
-// fits beside the status chips. A full path would push them off the row.
+// The breadcrumb keeps BOTH ends of the path: the checkout and its first child, then the
+// last directory and the file, with an ellipsis standing in for whatever is omitted. A
+// file deep inside the workspace therefore reads `vexgraph > suite > … > discord > file.h`
+// - neither the checkout nor the directory that owns the file is hidden. A shallow path
+// has no middle to omit, so it is written out whole. The crumb band is fixed
+// (TUI_CRUMB_CELLS); a crumb that outgrows it is clipped by that band, never allowed to
+// run under the status chips.
 static void breadcrumbFor(const char *path, char *out, size_t size) {
-    const char *relative = path;
-    bool inside = false;
+    if (path == nullptr || out == nullptr || size == 0u)
+        return;
     size_t rootLength = strlen(gRailRoot);
-    if (rootLength != 0 && strncmp(path, gRailRoot, rootLength) == 0 && path[rootLength] == '/') {
-        relative = path + rootLength + 1u;
-        inside = true;
-    }
-    size_t slashes = 0;
-    for (const char *at = relative; *at != '\0'; ++at)
-        if (*at == '/')
-            ++slashes;
-    const char *tail = relative;
-    size_t keep = slashes > 1u ? slashes - 1u : 0u;
-    for (const char *at = relative; *at != '\0' && keep != 0u; ++at)
-        if (*at == '/') {
-            tail = at + 1;
-            --keep;
+    bool inside = rootLength != 0 && strncmp(path, gRailRoot, rootLength) == 0
+                  && path[rootLength] == '/';
+    const char *relative = inside ? path + rootLength + 1u : path;
+    // One pass over the components records the first two and the last two; those are all
+    // the crumb can show, so no component array is needed. `last[0]` trails one segment
+    // behind `last[1]`, which is what keeps the final directory beside the file name.
+    const char *first[2] = { nullptr, nullptr };
+    const char *last[2] = { nullptr, nullptr };
+    size_t firstLength[2] = { 0, 0 };
+    size_t lastLength[2] = { 0, 0 };
+    size_t count = 0;
+    const char *at = relative;
+    while (*at != '\0') {
+        const char *end = strchr(at, '/');
+        size_t length = end == nullptr ? strlen(at) : (size_t) (end - at);
+        if (length != 0) {
+            if (count < 2) {
+                first[count] = at;
+                firstLength[count] = length;
+            }
+            last[0] = last[1];
+            lastLength[0] = lastLength[1];
+            last[1] = at;
+            lastLength[1] = length;
+            ++count;
         }
+        if (end == nullptr)
+            break;
+        at = end + 1;
+    }
     // A file opened from OUTSIDE the project - the default file, or an explicit --file -
     // is shown as outside it. Prefixing it with the project's name would claim a path that
     // does not exist, and a header that lies about where a file is, is worse than a short
     // one.
     const char *rootName = strrchr(gRailRoot, '/');
     rootName = rootName == nullptr ? gRailRoot : rootName + 1u;
-    // The tail is copied with its separators rewritten, so the crumb uses ONE separator
-    // throughout: mixing `>` and `/` in the same string reads as two different things.
-    char normalised[512];
-    size_t at = 0;
-    for (const char *source = tail; *source != '\0' && at + 1u < sizeof normalised; ++source)
-        normalised[at++] = *source == '/' ? '>' : *source;
-    normalised[at] = '\0';
-    // `project > file`: spaced separators, because the crumb is read as words rather than
-    // parsed as a path. The design also shows a trailing `::symbol`; nothing here resolves
-    // a symbol yet, so the crumb stops at the file rather than inventing one.
-    char spaced[512];
-    size_t spacedAt = 0;
-    for (size_t index = 0; normalised[index] != '\0' && spacedAt + 4u < sizeof spaced;
-         ++index) {
-        if (normalised[index] == '>') {
-            spaced[spacedAt++] = ' ';
-            spaced[spacedAt++] = '>';
-            spaced[spacedAt++] = ' ';
+    if (!inside) {
+        if (count >= 2) {
+            (void) snprintf(out, size, "… > %.*s > %.*s",
+                            (int) lastLength[0], last[0],
+                            (int) lastLength[1], last[1]);
+        } else if (count == 1) {
+            (void) snprintf(out, size, "… > %.*s", (int) lastLength[1], last[1]);
         } else {
-            spaced[spacedAt++] = normalised[index];
+            (void) snprintf(out, size, "…");
         }
+        return;
     }
-    spaced[spacedAt] = '\0';
-    if (inside)
+    if (count == 0) {
+        (void) snprintf(out, size, "%s", rootName);
+        return;
+    }
+    if (count <= 4) {
+        // No middle to omit: write the whole relative path with spaced separators.
+        // Mixing `>` and `/` in the same string reads as two different things.
+        char spaced[512];
+        size_t written = 0;
+        for (const char *source = relative; *source != '\0' && written + 4u < sizeof spaced;
+             ++source) {
+            if (*source == '/') {
+                spaced[written++] = ' ';
+                spaced[written++] = '>';
+                spaced[written++] = ' ';
+            } else {
+                spaced[written++] = *source;
+            }
+        }
+        spaced[written] = '\0';
         (void) snprintf(out, size, "%s > %s", rootName, spaced);
-    else
-        (void) snprintf(out, size, "… > %s", spaced);
+        return;
+    }
+    // Spaced separators, because the crumb is read as words rather than parsed as a path.
+    // The design also shows a trailing `::symbol`; nothing here resolves a symbol yet, so
+    // the crumb stops at the file rather than inventing one.
+    (void) snprintf(out, size, "%s > %.*s > … > %.*s > %.*s",
+                    rootName,
+                    (int) firstLength[0], first[0],
+                    (int) lastLength[0], last[0],
+                    (int) lastLength[1], last[1]);
 }
 
 // Open a file in the editor. The OLD file stays open when the new one cannot be read: a
