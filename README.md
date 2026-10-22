@@ -18,6 +18,22 @@ open in a rendered preview with a source view available. Code view supports
 basic text editing and attempts to save after one idle second; failed saves keep
 the edited buffer available and show an error state.
 
+C23 lexical coloring now consumes the real Language lexer through
+`src/editor/semicolon_syntax.{h,c}`. The initial host policy selects C23 for
+lowercase `.c` and `.h` files, not C++ or Objective-C. Keywords are dark green,
+strings/characters/numbers light green, comments muted green, and brackets bold
+white; these are screenshot-inspired defaults, not an exact imported theme.
+The bridge's role pens have a validated configuration API, but no theme settings
+screen or persistent syntax palette exists yet. Each tab owns a copied complete
+analysis snapshot; edits request cold refresh, while scrolling and caret movement
+reuse it. A failed refresh keeps editing available without stale highlighting.
+Coloring changes ink/weight only, never source, saved bytes or caret positions.
+Identifiers remain plain: function/parameter/macro classification, italic comments,
+parameter inlays, diagnostics, completion and cross-file semantics are not wired.
+The live presenter currently maps RGB to the terminal palette, not exact truecolor.
+`python3 tests/semicolon/editor/run.py` owns strict C23, ASan/UBSan, injected
+allocation-failure recovery and editor-cell/PTY proof; appearance remains yours.
+
 The tree shows `.gitignore`, `.gitkeep`, and the `.github` directory while
 keeping other dot entries such as `.idea` and `.vscode` hidden. It reads the
 project-root `.gitignore` as text and colors matching visible tree entries orange;
@@ -86,7 +102,7 @@ the generic file icon, and glyph rendering depends on the terminal font.
 
 The GUI is also planned, but it is a substantial longer-term effort: it needs to
 communicate and compose with Darling rather than grow a competing widget and
-windowing stack inside Semicolon. Language support and a future optional
+windowing stack inside Semicolon. Broader Language services and a future optional
 Primeagen agent workflow are planned too.
 Those integrations are not implemented just because Semicolon is intended to
 compose them. Primeagen remains a standalone R5 application and does not depend
@@ -129,7 +145,7 @@ What crosses the levels *today* is narrower than the final R6 design:
 | :--- | :--- | :--- |
 | Relational Engine + Vexspoke (R2) | The shell build links engine native Memory and Vexspoke CPU primitives. | Live storage residency or schema migration through Hotcwap. |
 | Determinant (R3) | Terminal panels, cells, caller-fed input and Markdown presentation. | Complete editor language services or physical-terminal visual approval. |
-| Language (R3) | No Semicolon runtime call or include. | Its explicit `c23` lexical adapter, snapshot/project/index contracts and future parser/LSP need a separately tested consumer bridge. |
+| Language (R3) | Its public C23Lexer is linked into SemicolonSyntax for live `.c`/`.h` lexical ink and bold brackets; host-owned row snapshots preserve multiline context. | Generic adapter registry/project/index integration, semantic classification, parameter inlays, parser and LSP remain unwired. |
 | Hotcwap (R1), Graphvex (R3), Darling/Harness/Sesh (R4) | The workspace `b` graph may build their owners and tests, but invoking `b` does not link them into this TUI. | Supervised reload, GPU GUI, widgets, agent and session workflows. |
 | Primeagen (R5) | Independent standalone application. | Optional registered workflow; no reverse dependency. |
 | Semicolon (R6) | File browser/editor, separate bounded run console and user-triggered `b` child invocation. | Full superapp composition and GUI. |
@@ -155,6 +171,7 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 ## Layout
 
 - `src/main/tui-main.c` — current terminal shell and basic editor.
+- `src/editor/semicolon_syntax.{h,c}` — copied C23 lexical snapshot and configurable role-to-pen consumer bridge.
 - `src/tui/tui_example.txt` — the hand-made terminal design and its notes.
 - `semicolon`, `build.py`, `install-command.sh` — launcher, explicit build, and
   optional per-user `semicolon`/`smc` command links.
@@ -164,9 +181,15 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 
 The current shell is an initial file browser and editor, not a complete IDE or
 the finished TUI. The GUI and its Darling integration are not implemented.
-Editing is intentionally basic: there is no selection, undo history, or syntax
-highlighting. General build integration beyond the workspace C-test route,
-language support, agent workflows, and
+Editing is intentionally basic: there is no selection or undo history. Syntax
+coloring is the documented C23 lexical subset, not full semantic highlighting.
+Whole-document refresh is synchronous cold work, not incremental analysis or a
+large-project latency guarantee; malformed/unsupported lexical spans remain plain.
+Standalone builds may set `SEMICOLON_LANGUAGE_SOURCE_DIR` to the Language repository
+root (the directory containing `adapters/`, not a nonexistent `src/`). The launcher
+watches that dependency's sources and headers for rebuilding, with no downloads.
+General build integration beyond the workspace C-test route,
+broader language services, agent workflows, and
 the broader multi-window application are not implemented. The `b` run console
 supports bounded scrollback and cancellation, but no child stdin, terminal
 emulation, background-job management, or cross-platform PTY proof.
