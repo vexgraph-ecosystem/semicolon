@@ -21,12 +21,13 @@ binary=$root/.build/semicolon-tui
 determinant=${SEMICOLON_DETERMINANT_SOURCE_DIR:-$root/../../ecosystem/determinant/src}
 vexspoke=${SEMICOLON_VEXSPOKE_SOURCE_DIR:-$root/../../ecosystem/vexspoke/src}
 engine=${SEMICOLON_ENGINE_SOURCE_DIR:-$root/../../ecosystem/relational-engine/src}
+language=${SEMICOLON_LANGUAGE_SOURCE_DIR:-$root/../../ecosystem/language}
 rebuild=false
 if [ ! -x "$binary" ]; then
     rebuild=true
 elif [ "$root/build.py" -nt "$binary" ] || [ "$root/semicolon" -nt "$binary" ]; then
     rebuild=true
-elif find "$root/src" "$determinant" "$vexspoke" "$engine" -type f \
+elif find "$root/src" "$determinant" "$vexspoke" "$engine" "$language" -type f \
         \( -name '*.c' -o -name '*.h' \) -newer "$binary" -print -quit | grep -q .; then
     rebuild=true
 fi
