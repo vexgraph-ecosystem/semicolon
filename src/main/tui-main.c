@@ -9,6 +9,7 @@
 #include "terminal/terminal_tree_view.h"
 #include "terminal/terminal_input.h"
 #include "terminal/terminal_markdown_view.h"
+#include "editor/semicolon_syntax.h"
 #include "icon/icon_catalog.h"
 #include "exception/throw.h"
 #include "annotation/definition.h"
@@ -75,7 +76,13 @@ extern char **environ;
  * the last edit; a failure keeps the dirty buffer resident. The console is a
  * separate centre-panel presentation, not source text: a fixed ring keeps the
  * last 10,000 bounded lines, and a finished child leaves a scrollable snapshot
- * until its tab closes. The rail and file buffers outlive that snapshot. */
+ * until its tab closes. The rail and file buffers outlive that snapshot.
+ *
+ * C23 code coloring consumes Language through SemicolonSyntax: a copied complete
+ * document snapshot is refreshed cold after edits, not during scrolling or cell
+ * paint. It changes cell ink/weight only, never source bytes, caret coordinates,
+ * glyphs or saved text. .c/.h explicitly select the initial C23-only host mode;
+ * identifiers remain unclassified, with no diagnostic or hint integration yet. */
 ;;OVERVIEW
 /** ============================================================================
  * MODULE: semicolon terminal entry (src/main/tui-main.c)
@@ -114,12 +121,15 @@ extern char **environ;
  *     bool dirty, saveFailed, baselineValid — pending, refused and identity states.
  *     struct stat baseline — original file identity/size/mtime for conflict detection.
  *     char name[64] — breadcrumb display basename.
+ *     SemicolonSyntax *syntax — owned copied C23 analysis, travels with the tab.
+ *     bool syntaxPending, syntaxCurrent — refresh requested / matches live bytes.
  *   TuiRow:
  *     TerminalText *gutter — line number object.
  *     TerminalText *code — source text object.
  *   Scene:
  *     TerminalPanel *root, *header, *rail — retained component tree.
  *     TerminalPanel *editor — borrowed child of centre, for live gutter geometry.
+ *     TerminalPanel *codeActions — borrowed code overlay; repainted after ink projection.
  *     TerminalChildId railId, gutterId, editorId — child identities in their
  *       owning panels; editorId collapses while the console owns the centre.
  *     bool editorPanelVisible — last admitted editor anchor mode, changed only
@@ -220,6 +230,10 @@ extern char **environ;
  *   static bool writeAll(int, const char *, size_t) / statMatches(stat, stat)
  *   static void setSaveStatus(Scene *, const FileText *)
  *   static void keepCursorVisible(FileText *, ScrollGlide *, ...) / paintEditorCursor(...)
+ *   static void fileSyntaxRefresh(FileText *) — cold pending snapshot replacement;
+ *     allocation refusal leaves source editable and disables stale ink until next edit.
+ *   static void paintEditorSyntax(canvas,file,scene,top,left) — allocation-free
+ *     byte-to-cell pen projection, then restore action chips above source ink.
  *   static bool editorKey(FileText *, int)
  *   static void editorKey(FileText *, int) / autosave(FileText *, const char *)
  *   static char *workspaceRunSource(const char *) / runBPath(bool)
@@ -634,6 +648,9 @@ typedef struct FileText {
     bool baselineValid;
     struct stat baseline;
     char name[64];           // display name for the breadcrumb
+    SemicolonSyntax *syntax;
+    bool syntaxPending;
+    bool syntaxCurrent;
 } FileText;
 
 // SLOT RECORD: EditorTab
@@ -661,6 +678,7 @@ typedef struct Scene {
     TerminalPanel *rail;
     TerminalPanel *centre;
     TerminalPanel *editor;      // borrowed from centre
+    TerminalPanel *codeActions; // borrowed from editor's code layer
     TerminalChildId railId;
     TerminalChildId gutterId;
     TerminalChildId editorId;
@@ -1438,6 +1456,7 @@ static size_t bytesForCells(const char *bytes, size_t length, size_t cells) {
 }
 
 static void fileFree(FileText *file) {
+    SemicolonSyntax_free((*file).syntax);
     for (size_t i = 0; i < file->lineCount; ++i)
         free(file->lineStorage[i]);
     free(file->lineStorage);
@@ -1646,7 +1665,21 @@ static bool fileLoad(FileText *file, const char *path) {
         }
     }
     file->longestCells = longest;
+    if (SemicolonSyntax_acceptsPath(path)) {
+        (*file).syntax = SemicolonSyntax();
+        (*file).syntaxPending = (*file).syntax != nullptr;
+    }
     return true;
+}
+
+// Only document mutation requests analysis; a rejected replacement never paints
+// yesterday's spans over today's source. The next edit permits a fresh attempt.
+static void fileSyntaxRefresh(FileText *file) {
+    if (!(*file).syntaxPending)
+        return;
+    (*file).syntaxPending = false;
+    (*file).syntaxCurrent = SemicolonSyntax_setLines((*file).syntax, (*file).lines,
+                                                    (*file).lineLengths, (*file).lineCount);
 }
 
 static uint64_t monotonicNowNs(void) {
@@ -1678,6 +1711,8 @@ static bool fileReserveLine(FileText *file, size_t line, size_t needed) {
 }
 
 static void fileRefreshLengthAndWidth(FileText *file) {
+    (*file).syntaxPending = (*file).syntax != nullptr;
+    (*file).syntaxCurrent = false;
     file->length = 0;
     file->longestCells = 0;
     file->longestLine = 0;
@@ -1695,6 +1730,8 @@ static void fileRefreshLengthAndWidth(FileText *file) {
 }
 
 static void fileRefreshEditedWidth(FileText *file, size_t line, size_t oldWidth) {
+    (*file).syntaxPending = (*file).syntax != nullptr;
+    (*file).syntaxCurrent = false;
     size_t width = cellsOf(file->lines[line], file->lineLengths[line]);
     if (line == file->longestLine && width < oldWidth) {
         file->longestCells = 0;
@@ -3611,6 +3648,7 @@ static TerminalPanel *buildEditor(Scene *scene, size_t rowCount) {
         return nullptr;
     }
     (void) TerminalPanel_setLayout(code, TERMINAL_PANEL_LAYERED);
+    (*scene).codeActions = actions;
     // The gutter is two spaces, a right-aligned per-file number, and a period; the reserved
     // two-cell gap after it keeps code aligned without rendering a divider at rest.
     TerminalText *gap = plain("  ", COL_TEXT);
@@ -4535,6 +4573,50 @@ static size_t codeColumns(size_t railWidth, size_t numberWidth, int width) {
     return (size_t) width - codeLeftColumn(railWidth, numberWidth);
 }
 
+// Preserve the existing glyph projection, including malformed-byte replacement,
+// wide-cell clipping and exact source caret geometry. Only ink/weight changes.
+static void paintEditorSyntax(TerminalCanvas *canvas, const FileText *file,
+                               const Scene *scene, size_t top, size_t left) {
+    if (!(*file).syntaxCurrent || (*scene).preview)
+        return;
+    size_t first = editorFirstRow();
+    size_t codeLeft = codeLeftColumn((*scene).railWidth, (*scene).numberWidth);
+    size_t width = TerminalCanvas_getWidth(canvas);
+    size_t height = TerminalCanvas_getHeight(canvas);
+    if (codeLeft >= width || first >= height)
+        return;
+    size_t visible = editorVisibleRows((int) height);
+    if (visible > (*scene).rowCount)
+        visible = (*scene).rowCount;
+    for (size_t row = 0u; row < visible && top + row < (*file).lineCount; ++row) {
+        size_t line = top + row;
+        const char *text = (*file).lines[line];
+        size_t length = (*file).lineLengths[line];
+        size_t at = bytesForCells(text, length, left);
+        size_t x = codeLeft;
+        while (at < length && x < width) {
+            TerminalCanvasDecodedScalar scalar = TerminalCanvas_utf8Decode(text + at, length - at);
+            size_t cells = scalar.bytes == 0u ? 1u : TerminalCanvas_widthOf(scalar.codepoint);
+            TerminalPen pen = SemicolonSyntax_penAt((*file).syntax, line, at);
+            for (size_t cell = 0u; cell < cells && x + cell < width; ++cell) {
+                size_t index = ((*canvas).y + first + row) * (*canvas).gridWidth
+                             + (*canvas).x + x + cell;
+                if ((*canvas).fg != nullptr)
+                    (*canvas).fg[index] = pen.fg;
+                if ((*canvas).styles != nullptr)
+                    (*canvas).styles[index] = pen.style;
+            }
+            x += cells;
+            at += scalar.bytes == 0u ? 1u : scalar.bytes;
+        }
+    }
+    // The existing action layer intentionally covers source on the first rows.
+    // Restore it through its real layout rather than guessing chip hit rectangles.
+    TerminalCanvas code = TerminalCanvas_sub(canvas, codeLeft, first, width - codeLeft,
+                                            height - first - 1u);
+    TerminalPanel_paint((*scene).codeActions, &code);
+}
+
 static void keepCursorVisible(const FileText *file, ScrollGlide *glide,
                               size_t visible, size_t columns, const Scene *scene) {
     size_t codeWidth = codeColumns(scene->railWidth, scene->numberWidth, (int) columns);
@@ -4932,12 +5014,13 @@ static double glideStep(double *shown, double target) {
 }
 
 ;;TEST
-static int dumpFrame(int width, int height, const FileText *file) {
+static int dumpFrame(int width, int height, FileText *file) {
     if (width < 1 || height < 1 || width > TUI_MAX_W || height > TUI_MAX_H) {
         fprintf(stderr, "[vex] semicolon: dump size %dx%d out of range (max %dx%d)\n",
                 width, height, TUI_MAX_W, TUI_MAX_H);
         return 1;
     }
+    fileSyntaxRefresh(file);
     Scene scene;
     gTerminalWidth = width;
     sceneBuild(&scene, file, TUI_MAX_ROWS, width, height);
@@ -4956,6 +5039,7 @@ static int dumpFrame(int width, int height, const FileText *file) {
     TerminalCanvas canvas = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
     TerminalCanvas_fill(&canvas, ' ', TerminalPen());
     TerminalPanel_paint(scene.root, &canvas);
+    paintEditorSyntax(&canvas, file, &scene, 0u, 0u);
     sceneRenderMarkdown(&scene, &canvas, scene.railWidth);
     paintRailColors(&scene, &canvas, false, 0, 0);
     for (int y = 0; y < height; ++y) {
@@ -5732,6 +5816,7 @@ static int runTerminal(FileText *file) {
         }
         size_t scrollTop = (size_t) (glideStep(&glide.rowShown, glide.rowTarget) + 0.5);
         size_t scrollLeft = (size_t) (glideStep(&glide.columnShown, glide.columnTarget) + 0.5);
+        fileSyntaxRefresh(file);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         if (scene.editorPanelVisible == gRunSelected) {
             if (!TerminalPanel_setAnchor(scene.centre, scene.editorId,
@@ -5745,6 +5830,8 @@ static int runTerminal(FileText *file) {
         sceneSyncRail(&scene, railVisibleRows(height));
         updateClock(&scene);
         TerminalPanel_paint(scene.root, &back);
+        if (!gRunSelected)
+            paintEditorSyntax(&back, file, &scene, scrollTop, scrollLeft);
         if (!gRunSelected)
             sceneRenderMarkdown(&scene, &back, scene.railWidth);
         if (!scene.preview && !gRunSelected)
@@ -5931,5 +6018,8 @@ int main(int argc, char **argv) {
         status = runTerminal(&file);
     }
     fileFree(&file);
+    for (size_t index = 0u; index < gTabCount; ++index)
+        fileFree(&gTabs[index].suspended);
+    free(gTabs);
     return status;
 }
