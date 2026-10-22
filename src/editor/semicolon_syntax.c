@@ -137,9 +137,10 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
     char *source = malloc(length + 1u);
     size_t *starts = malloc((count + 1u) * sizeof *starts);
     if (source == nullptr || starts == nullptr) {
+        size_t request = source == nullptr ? length + 1u : (count + 1u) * sizeof *starts;
         free(source);
         free(starts);
-        return refuse(self, length + 1u);
+        return refuse(self, request);
     }
     size_t at = 0u;
     for (size_t line = 0u; line < count; ++line) {
@@ -164,17 +165,20 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
         return false;
     }
     bool success = true;
+    size_t refusedRequest = 0u;
     {
         C23LexStep step = C23Lexer_next(lexer);
         while (step.hasSpan) {
             if (used == capacity) {
                 size_t next = capacity == 0u ? SYNTAX_SPAN_INITIAL_CAPACITY : capacity * 2u;
                 if (next < capacity || next > SIZE_MAX / sizeof *spans) {
+                    refusedRequest = SIZE_MAX;
                     success = false;
                     break;
                 }
                 SyntaxSpan *grown = realloc(spans, next * sizeof *spans);
                 if (grown == nullptr) {
+                    refusedRequest = next * sizeof *spans;
                     success = false;
                     break;
                 }
@@ -190,7 +194,7 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
         free(source);
         free(starts);
         free(spans);
-        return refuse(self, length + 1u);
+        return refuse(self, refusedRequest);
     }
     free((*self).source);
     free((*self).starts);
