@@ -89,6 +89,8 @@ extern char **environ;
  *   gLineChip[16]                   the status bar's line-position text buffer.
  *   gSaveLabel[16]                  saved/dirty/error status text.
  *   gPairs[]                        registered ncurses colour pairs.
+ *   gRailLocation[PATH_MAX + 2] — canonical project location, HOME abbreviated
+ *     only on a complete path-component match; painted gray beside the pinned root.
  *   gConsoleLines[10000][2048], gConsoleLengths[10000] — bounded line ring;
  *     head/count/top/follow track retained and viewed output independently of
  *     editor scroll, omitted/clipped counts make both limits observable.
@@ -173,7 +175,11 @@ extern char **environ;
   *     overrides the 40-cell default; legacy cached defaults are ignored.
   * ICON SETTINGS:
  *   bool gNerdIcons = true — current user setting, overridden by environment/CLI.
-  *   EditorTab *gTabs, gTabCount, gTabCapacity — growable open-file tab stack.
+ *   EditorTab *gTabs, gTabCount, gTabCapacity — growable open-file tab stack.
+ *   gTabFirst / gTabReveal — whole-tab viewport and one-shot selected-tab reveal;
+ *     hidden tabs have zero geometry, clipped labels retain their close control.
+ *   gRailColumn / gRailMaxColumn — bounded horizontal child-list viewport;
+ *     the pinned project/location header never pans with child rows.
   *   size_t gActiveTabIndex — active tab identity in that stack.
  *   static const char *fileIcon(const char *name) — exact build names, then folded
  *     extensions, then generic file; borrowed static UTF-8, no IO or allocation.
@@ -183,7 +189,10 @@ extern char **environ;
  *     names do not inherit it.
  *   static size_t railIndent(TerminalTreeRow, size_t) — shared indent geometry.
   *   static void paintRailColors(Scene *, TerminalCanvas *, ...) — paint icon palette
-  *     and orange foreground for root-.gitignore matches after layout.
+  *     and orange foreground for root-.gitignore matches after layout. The root
+  *     stays on row zero beside its clipped gray location while children scroll;
+  *     body row y maps to tree scrollRow + y, independent of editor/tab geometry.
+  *     Child indentation advances two spaces per level (six levels maximum).
   *   static bool visibleDotEntry(name, folder) — admits only .github, .gitignore,
   *     and .gitkeep; other dot entries stay hidden.
   *   static bool ignorePatternAdd(line) / void ignorePatternsClear/Reload(void)
@@ -252,6 +261,7 @@ extern char **environ;
   *     keep the top-row spacer aligned with the rail; collapsed grip is canvas-painted
   *   static void paintRailSplitter(Scene *, canvas, visible)
   *     draw the hover divider grip or the persistent collapsed three-line left grip
+  *     at x=railWidth, outside the list's last cell; hit-testing uses that same seam.
  *   static bool sceneMarkdownClick(Scene *, x, width)  map the top-right [code]
  *     then [preview] controls on the editor's first row
  *   static void sceneRenderMarkdown(Scene *, canvas, railWidth) cold layout if
@@ -718,6 +728,7 @@ static char gOpenPath[1024];
 static bool parsePackedHex(const char *text, uint32_t *color);
 static bool sceneSetMarkdownMode(Scene *scene, bool preview);
 static void syncTabViews(Scene *scene);
+static void tabScrollBy(bool forward);
 static bool runEligible(const char *path, const FileText *file);
 static void syncRunControls(Scene *scene, const char *path, const FileText *file);
 static bool runStart(const char *path, const FileText *file);
@@ -822,6 +833,7 @@ static RailEntry *gRailEntries;
 static size_t gRailEntryCount;
 static size_t gRailEntryCapacity;
 static char gRailRoot[1024];
+static char gRailLocation[PATH_MAX + 2u]; // canonical location; ~/... when under HOME
 
 // The project's display name: the last component of the root, never the whole path.
 // A root of "/" has no component, so it keeps the slash rather than becoming empty.
@@ -842,6 +854,10 @@ static bool gResetView;             // a newly opened file starts at its top-lef
 static EditorTab *gTabs;
 static size_t gTabCount;
 static size_t gTabCapacity;
+static size_t gTabFirst; // first admitted tab in the horizontal viewport
+static bool gTabReveal; // explicit selection/open requests visibility once
+static size_t gRailColumn; // horizontal child-list viewport, in terminal cells
+static size_t gRailMaxColumn; // recomputed from admitted visible tree labels
 static size_t gActiveTabIndex;
 static char gCachedOpen[1024];      // restored from the project's session
 static bool gCachedMarkdownPreview;
@@ -1048,6 +1064,7 @@ static bool runStart(const char *path, const FileText *file) {
         return false;
     if (gRunPid > 0 || gRunOutputFd >= 0) {
         gRunSelected = true;
+        gTabReveal = true;
         return true;
     }
     int outputPipe[2];
@@ -1133,6 +1150,7 @@ static bool runStart(const char *path, const FileText *file) {
     gRunEscapeState = 0u;
     gRunTabVisible = true;
     gRunSelected = true;
+    gTabReveal = true;
     const char *name = strrchr(path, '/');
     name = name == nullptr ? path : name + 1u;
     (void) snprintf(gRunLabel, sizeof gRunLabel, "%s", name);
@@ -2112,8 +2130,8 @@ static TerminalPanel *buildChromeRow(Scene *scene) {
     TerminalPanel *bar = TerminalPanel();
     if (bar == nullptr)
         return nullptr;
-    // The chrome row holds tabs only. The project root belongs to the tree below it;
-    // reserve the rail's width here so the tabs align with the editor.
+    // The project root is painted into the rail's top row after layout; reserve its
+    // width here so file tabs still begin at the editor seam.
     TerminalText *grip = plain("", COL_MUTED);
     scene->gripChip = grip;
     scene->gripId = TerminalPanel_addText(
@@ -2767,6 +2785,7 @@ static bool openFile(const char *path, TerminalTreeNodeId node) {
         opened = (FileText) {0};
     }
     gActiveTabIndex = target;
+    gTabReveal = true;
     (void) snprintf(gOpenPath, sizeof gOpenPath, "%s", path);
     gRailOpenNode = node;
     if (gRail != nullptr) {
@@ -2793,8 +2812,42 @@ static bool openFile(const char *path, TerminalTreeNodeId node) {
 static void syncTabViews(Scene *scene) {
     if (scene == nullptr || scene->header == nullptr)
         return;
+    // File tabs opened after the console must precede it in both paint and hit
+    // order. Detach only for cold admission, not ordinary viewport refreshes.
+    bool appendRunTab = false;
+    for (size_t index = 0u; index < gTabCount && scene->runTab != nullptr; ++index)
+        if (gTabs[index].view == nullptr) {
+            scene->runTab = TerminalPanel_detachText(scene->header, scene->runTabId);
+            appendRunTab = scene->runTab != nullptr;
+            break;
+        }
     size_t used = scene->headerLeftWidth;
     size_t width = gTerminalWidth > 0 ? (size_t) gTerminalWidth : 80u;
+    size_t totalTabs = gTabCount + (gRunTabVisible ? 1u : 0u);
+    if (gTabFirst >= totalTabs)
+        gTabFirst = totalTabs > 0u ? totalTabs - 1u : 0u;
+    if (gTabReveal) {
+        size_t selected = gRunSelected && gRunTabVisible ? gTabCount : gActiveTabIndex;
+        if (selected < gTabFirst)
+            gTabFirst = selected;
+        size_t available = width > used ? width - used : 0u;
+        size_t needed = 0u;
+        for (size_t index = gTabFirst; index <= selected && index < totalTabs; ++index) {
+            if (index < gTabCount)
+                needed += cellsOf(gTabs[index].label, strlen(gTabs[index].label))
+                        + cellsOf(fileIcon(gTabs[index].label), strlen(fileIcon(gTabs[index].label)))
+                        + 6u;
+            else
+                needed += strlen(gRunStatus) + cellsOf(gRunLabel, strlen(gRunLabel)) + 6u;
+        }
+        while (needed > available && gTabFirst < selected) {
+            EditorTab *first = &gTabs[gTabFirst];
+            needed -= cellsOf((*first).label, strlen((*first).label))
+                    + cellsOf(fileIcon((*first).label), strlen(fileIcon((*first).label))) + 6u;
+            ++gTabFirst;
+        }
+        gTabReveal = false;
+    }
     scene->activeTab = nullptr;
     for (size_t index = 0; index < gTabCount; ++index) {
         EditorTab *record = &gTabs[index];
@@ -2808,6 +2861,20 @@ static void syncTabViews(Scene *scene) {
         } else {
             (void) TerminalText_setText(view, (*record).display, strlen((*record).display));
         }
+        if (index < gTabFirst || used >= width || width - used < 5u) {
+            (*record).x = used;
+            (*record).width = 0u;
+            if ((*record).view == nullptr)
+                TerminalText_free(view);
+            else {
+                (void) TerminalText_setText(view, "", 0u);
+                (void) TerminalText_setBrackets(view, 0u, 0u);
+                (void) TerminalPanel_setAnchor(scene->header, (*record).child,
+                                               TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0u));
+            }
+            continue;
+        }
+        (void) TerminalText_setBrackets(view, '[', ']');
         size_t cells = TerminalText_measure(view);
         if (used + cells > width) {
             size_t available = width > used ? width - used : 0u;
@@ -2816,13 +2883,19 @@ static void syncTabViews(Scene *scene) {
                     TerminalText_free(view);
                 } else {
                     (void) TerminalText_setText(view, "", 0u);
+                    (void) TerminalText_setBrackets(view, 0u, 0u);
+                    (void) TerminalPanel_setAnchor(scene->header, (*record).child,
+                                                   TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0u));
                 }
                 (*record).x = used;
                 (*record).width = 0u;
                 continue;
             }
-            copyCellsEllipsis((*record).display, available - 2u, (*record).shown,
+            copyCellsEllipsis((*record).display, available - 4u, (*record).shown,
                               sizeof (*record).shown);
+            size_t shownLength = strlen((*record).shown);
+            (void) snprintf((*record).shown + shownLength, sizeof (*record).shown - shownLength,
+                            " \uf00d");
             (void) TerminalText_setText(view, (*record).shown, strlen((*record).shown));
             cells = TerminalText_measure(view);
         } else {
@@ -2852,6 +2925,9 @@ static void syncTabViews(Scene *scene) {
         used += cells;
     }
     if (gRunTabVisible) {
+        if (appendRunTab)
+            scene->runTabId = TerminalPanel_addText(scene->header, scene->runTab,
+                                                   TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0u));
         (void) snprintf((*scene).runTabText, sizeof (*scene).runTabText,
                         "%s %s  \uf00d", gRunStatus, gRunLabel);
         if (scene->runTab == nullptr) {
@@ -2870,11 +2946,23 @@ static void syncTabViews(Scene *scene) {
                                         strlen(scene->runTabText));
         }
         if (scene->runTab != nullptr) {
-            size_t cells = TerminalText_measure(scene->runTab);
             size_t available = width > used ? width - used : 0u;
+            if (gTabCount < gTabFirst || available < 5u) {
+                gRunTabWidth = 0u;
+                (void) TerminalText_setText(scene->runTab, "", 0u);
+                (void) TerminalText_setBrackets(scene->runTab, 0u, 0u);
+                (void) TerminalPanel_setAnchor(scene->header, scene->runTabId,
+                                               TerminalAnchor_2(TERMINAL_ANCHOR_BAND_LEFT, 0u));
+                return;
+            }
+            (void) TerminalText_setBrackets(scene->runTab, '[', ']');
+            size_t cells = TerminalText_measure(scene->runTab);
             if (cells > available && available >= 5u) {
-                copyCellsEllipsis(scene->runTabText, available - 2u,
+                copyCellsEllipsis(scene->runTabText, available - 4u,
                                   scene->runTabShown, sizeof scene->runTabShown);
+                size_t shownLength = strlen(scene->runTabShown);
+                (void) snprintf(scene->runTabShown + shownLength,
+                                sizeof scene->runTabShown - shownLength, " \uf00d");
                 (void) TerminalText_setText(scene->runTab, scene->runTabShown,
                                             strlen(scene->runTabShown));
                 cells = TerminalText_measure(scene->runTab);
@@ -2892,6 +2980,18 @@ static void syncTabViews(Scene *scene) {
     } else {
         gRunTabWidth = 0u;
     }
+}
+
+// Wheel navigation advances whole tabs, keeping close controls attached to their
+// labels. The final tab is still reachable even when one title exceeds the bar.
+static void tabScrollBy(bool forward) {
+    size_t total = gTabCount + (gRunTabVisible ? 1u : 0u);
+    if (forward && gTabFirst + 1u < total)
+        ++gTabFirst;
+    else if (!forward && gTabFirst > 0u)
+        --gTabFirst;
+    gTabReveal = false;
+    syncTabViews(gScene);
 }
 
 static bool tabClose(size_t index) {
@@ -2916,6 +3016,9 @@ static bool tabClose(size_t index) {
     gTabs[gTabCount] = (EditorTab) {0};
     if (index < gActiveTabIndex)
         --gActiveTabIndex;
+    if (index < gTabFirst)
+        --gTabFirst;
+    gTabReveal = true;
     syncTabViews(gScene);
     return true;
 }
@@ -2932,6 +3035,8 @@ static bool tabPointerPress(size_t x, size_t y, TerminalPointerButton button) {
         if (index == gActiveTabIndex)
         {
             gRunSelected = false;
+            gTabReveal = true;
+            syncTabViews(gScene);
             return true;
         }
         TerminalTreeNodeId node = railRevealPath((*tab).path);
@@ -2955,6 +3060,7 @@ static bool tabPointerPress(size_t x, size_t y, TerminalPointerButton button) {
             return true;
         }
         gRunSelected = true;
+        gTabReveal = true;
         if (gScene != nullptr)
             syncTabViews(gScene);
         return true;
@@ -2966,7 +3072,9 @@ static bool editorPlaceCaret(FileText *file, size_t x, size_t y, size_t top, siz
                              size_t codeLeft, const Scene *scene) {
     if (file == nullptr || scene == nullptr)
         return false;
-    size_t first = editorFirstRow() + (scene->markdownFile ? 2u : 1u);
+    // Source rows begin at the editor anchor. Controls overlay those rows; they
+    // do not reserve an extra row in either plain or Markdown Code mode.
+    size_t first = editorFirstRow();
     if (scene->preview || y < first || x < codeLeft)
         return false;
     size_t line = top + y - first;
@@ -3173,7 +3281,9 @@ static size_t railIndent(TerminalTreeRow row) {
     // Preserve room for a disclosure marker, icon and useful filename at depth.
     size_t deepest = 6u;
     size_t levels = row.depth + 1u;
-    return levels > deepest ? deepest : levels;
+    // Two cells per nesting level keep parent/child structure legible; bounded
+    // indentation still leaves filename room in a deeply nested tree.
+    return (levels > deepest ? deepest : levels) * 2u;
 }
 
 static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width) {
@@ -3198,6 +3308,9 @@ static void railFormat(char *out, size_t size, TerminalTreeRow row, size_t width
     // its tail cannot be told apart from a row with a shorter name.
     size_t available = width > 2u ? width - 2u : 0u;
     size_t length = strlen(out);
+    size_t skip = bytesForCells(out, length, gRailColumn);
+    memmove(out, out + skip, length - skip + 1u);
+    length -= skip;
     if (cellsOf(out, length) > available) {
         size_t keep = available > 1u ? available - 1u : 0u;
         length = bytesForCells(out, length, keep);
@@ -3219,21 +3332,35 @@ static void sceneSyncRail(Scene *scene, size_t visible) {
     // The viewport is what the panel can actually SHOW, not the size of the row pool: a
     // viewport as tall as the pool would let nothing scroll, because everything would
     // already fit.
-    (void) TerminalTreeView_setViewportRows(gRail, visible);
+    // The pinned root lives in the chrome. The viewport reserves that tree row so
+    // scrolling and the last child still agree on the number of visible body rows.
+    (void) TerminalTreeView_setViewportRows(gRail, visible + 1u);
     // `first` and `shown` are the TREE's own coordinates; `visible` above is how many rows
     // the panel has to give it. Two different questions, so two different names.
     size_t first = TerminalTreeView_scrollRow(gRail);
     size_t shown = TerminalTreeView_visibleCount(gRail);
+    gRailMaxColumn = 0u;
+    for (size_t index = 1u; index < shown; ++index) {
+        TerminalTreeRow record = TerminalTreeView_rowAt(gRail, index);
+        size_t extent = railIndent(record) + 3u
+                      + cellsOf(fileIcon(record.label), strlen(fileIcon(record.label)))
+                      + cellsOf(record.label, strlen(record.label));
+        size_t available = scene->railWidth > 2u ? scene->railWidth - 2u : 0u;
+        if (extent > available && extent - available > gRailMaxColumn)
+            gRailMaxColumn = extent - available;
+    }
+    if (gRailColumn > gRailMaxColumn)
+        gRailColumn = gRailMaxColumn;
     for (size_t index = 0; index < scene->railRowCount; ++index) {
         TerminalText *row = scene->railRows[index];
         if (row == nullptr)
             continue;
-        if (first + index >= shown) {
+        if (first + index + 1u >= shown) {
             (void) TerminalText_setText(row, gEmptyLine, 0);
             (void) TerminalText_setBackgroundColor(row, TERMINAL_COLOR_DEFAULT);
             continue;
         }
-        TerminalTreeRow record = TerminalTreeView_rowAt(gRail, first + index);
+        TerminalTreeRow record = TerminalTreeView_rowAt(gRail, first + index + 1u);
         size_t contentWidth = scene->railWidth;
         railFormat(scene->railText[index], sizeof scene->railText[index], record,
                    contentWidth);
@@ -3265,18 +3392,45 @@ static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
     size_t width = TerminalCanvas_getWidth(canvas);
     size_t height = TerminalCanvas_getHeight(canvas);
     size_t railEnd = scene->railWidth < width ? scene->railWidth : width;
+    if (scene->railVisible && railEnd > 0u && TerminalTreeView_visibleCount(gRail) > 0u) {
+        TerminalTreeRow root = TerminalTreeView_rowAt(gRail, 0u);
+        char title[TUI_RAIL_TEXT];
+        char clipped[TUI_RAIL_TEXT];
+        (void) snprintf(title, sizeof title, " %s %s %s",
+                        root.expanded ? "⌄" : "›",
+                        gNerdIcons ? (root.expanded ? "\uf07c" : "\uf07b") : "[]",
+                        root.label);
+        copyCellsEllipsis(title, railEnd / 2u, clipped, sizeof clipped);
+        size_t titleCells = cellsOf(clipped, strlen(clipped));
+        TerminalCanvas_text(canvas, 0u, 0u, clipped, strlen(clipped),
+                            TerminalPen_3(TERMINAL_STYLE_NONE, COL_TEXT,
+                                          TERMINAL_COLOR_DEFAULT));
+        if (gNerdIcons && railEnd > 3u)
+            gFg[3u] = iconColor(TerminalCanvas_glyphAt(canvas, 3u, 0u));
+        if (gRailLocation[0] != '\0' && railEnd > titleCells + 1u) {
+            char location[PATH_MAX + 4u];
+            copyCellsEllipsis(gRailLocation, railEnd - titleCells - 1u,
+                              location, sizeof location);
+            TerminalCanvas_text(canvas, titleCells + 1u, 0u, location, strlen(location),
+                                TerminalPen_3(TERMINAL_STYLE_NONE, TERMINAL_RGB(0x88, 0x88, 0x88),
+                                              TERMINAL_COLOR_DEFAULT));
+        }
+    }
     size_t first = TerminalTreeView_scrollRow(gRail);
     size_t count = TerminalTreeView_visibleCount(gRail);
     for (size_t index = 0; index < scene->railRowCount && index + 2u < height
-                           && first + index < count; ++index) {
-        TerminalTreeRow row = TerminalTreeView_rowAt(gRail, first + index);
+                           && first + index + 1u < count; ++index) {
+        TerminalTreeRow row = TerminalTreeView_rowAt(gRail, first + index + 1u);
         size_t iconX = railIndent(row) + 2u;
         size_t y = index + 1u;
         RailEntry *entry = railEntryFor(row.id);
-        if (gNerdIcons && iconX < railEnd)
-            gFg[y * width + iconX] = iconColor(TerminalCanvas_glyphAt(canvas, iconX, y));
+        if (gNerdIcons && iconX >= gRailColumn && iconX - gRailColumn < railEnd) {
+            size_t x = iconX - gRailColumn;
+            gFg[y * width + x] = iconColor(TerminalCanvas_glyphAt(canvas, x, y));
+        }
         if (railEntryIgnored(entry)) {
             size_t nameX = iconX + 2u;
+            nameX = nameX > gRailColumn ? nameX - gRailColumn : 0u;
             for (size_t x = nameX; x < railEnd; ++x)
                 gFg[y * width + x] = TERMINAL_RGB(0xFF, 0x9A, 0x32);
         }
@@ -3308,9 +3462,9 @@ static void paintRailSplitter(const Scene *scene, TerminalCanvas *canvas, bool v
                                               TERMINAL_COLOR_DEFAULT));
         return;
     }
-    if (!visible || scene->railWidth == 0u || scene->railWidth > width)
+    if (!visible || scene->railWidth == 0u || scene->railWidth >= width)
         return;
-    size_t x = scene->railWidth - 1u;
+    size_t x = scene->railWidth;
     for (size_t y = middle - 1u; y <= middle + 1u && y + 1u < height; ++y)
         TerminalCanvas_text(canvas, x, y, "|", 1u,
                             TerminalPen_3(TERMINAL_STYLE_NONE,
@@ -4485,11 +4639,11 @@ static size_t editorVisibleRows(int height) {
 // is resolved by the tree from the viewport offset, so the rail's scroll is already
 // accounted for and a click past the last row is not a click on anything.
 static void railClick(size_t y) {
-    // The rail starts on the row under the chrome and is independent of the editor's
-    // first row, so a warning never shifts the file tree.
-    if (gRail == nullptr || y < 1u)
+    // The root occupies the chrome's rail slice; body offsets skip its tree row.
+    if (gRail == nullptr)
         return;
-    TerminalTreeNodeId id = TerminalTreeView_nodeAtOffset(gRail, y - 1u);
+    TerminalTreeNodeId id = y == 0u ? gRailRootNode
+                                  : TerminalTreeView_nodeAtOffset(gRail, y);
     if (id == TERMINAL_TREE_NO_NODE)
         return;
     if (TerminalTreeView_isFolder(gRail, id)) {
@@ -5235,21 +5389,33 @@ static int runTerminal(FileText *file) {
                 interaction.havePointer = true;
                 interaction.pointerX = event.x;
                 interaction.pointerY = event.y;
-                // The rail's seam is the last cell of the rail when it is visible. When
+                // The rail's seam is just beyond the last list cell when visible. When
                 // the rail is hidden there is no rail target at all; the editor owns the
                 // full width; the project root is the first tree row when visible.
                 size_t railEdge = scene.railVisible ? scene.railWidth : 0u;
-                size_t seam = railEdge > 0u ? railEdge - 1u : 0u;
+                size_t seam = railEdge;
                 interaction.dividerHovered = scene.railVisible && event.x == seam
                     && event.y > 0u && event.y + 1u < (size_t) height;
                 switch (event.kind) {
                     case TERMINAL_POINTER_WHEEL_UP:
                     case TERMINAL_POINTER_WHEEL_DOWN: {
                         bool down = event.kind == TERMINAL_POINTER_WHEEL_DOWN;
+                        if (event.y == 0u && event.x >= railEdge) {
+                            tabScrollBy(down);
+                            break;
+                        }
                         // A wheel over the RAIL scrolls the rail, not the editor: the
                         // pointer says which list the user means, so no mode is needed.
                         if (scene.railVisible && event.x < railEdge) {
-                            railScrollBy(down ? 1 : -1);
+                            if (event.shift || event.meta || event.ctrl) {
+                                if (down)
+                                    gRailColumn += gRailMaxColumn - gRailColumn < TUI_SCROLL_COLS
+                                        ? gRailMaxColumn - gRailColumn : TUI_SCROLL_COLS;
+                                else
+                                    gRailColumn -= gRailColumn < TUI_SCROLL_COLS
+                                        ? gRailColumn : TUI_SCROLL_COLS;
+                            } else
+                                railScrollBy(down ? 1 : -1);
                             break;
                         }
                         if (gRunSelected && event.x >= railEdge) {
@@ -5278,15 +5444,27 @@ static int runTerminal(FileText *file) {
                         break;
                     }
                     case TERMINAL_POINTER_WHEEL_LEFT:
+                    case TERMINAL_POINTER_WHEEL_RIGHT: {
+                        bool right = event.kind == TERMINAL_POINTER_WHEEL_RIGHT;
+                        if (event.y == 0u && event.x >= railEdge) {
+                            tabScrollBy(right);
+                            break;
+                        }
+                        if (scene.railVisible && event.x < railEdge) {
+                            if (right)
+                                gRailColumn += gRailMaxColumn - gRailColumn < TUI_SCROLL_COLS
+                                    ? gRailMaxColumn - gRailColumn : TUI_SCROLL_COLS;
+                            else
+                                gRailColumn -= gRailColumn < TUI_SCROLL_COLS
+                                    ? gRailColumn : TUI_SCROLL_COLS;
+                            break;
+                        }
                         if (gRunSelected)
                             break;
-                        glideImpulse(&glide, 0, -(long) TUI_SCROLL_COLS, maxTop, maxLeft);
+                        glideImpulse(&glide, 0, right ? (long) TUI_SCROLL_COLS
+                                                     : -(long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         break;
-                    case TERMINAL_POINTER_WHEEL_RIGHT:
-                        if (gRunSelected)
-                            break;
-                        glideImpulse(&glide, 0, (long) TUI_SCROLL_COLS, maxTop, maxLeft);
-                        break;
+                    }
                     case TERMINAL_POINTER_PRESS:
                     {
                         interaction.pressed = true;
@@ -5407,7 +5585,7 @@ static int runTerminal(FileText *file) {
                         }
                         interaction.grabbing = false;
                         interaction.dividerHovered = scene.railVisible
-                            && event.x == (scene.railWidth > 0u ? scene.railWidth - 1u : 0u);
+                            && event.x == scene.railWidth;
                         interaction.tracking = false;
                         interaction.pressed = false;
                         break;
@@ -5497,7 +5675,7 @@ static int runTerminal(FileText *file) {
                             sceneSetGripHover(&scene, collapsedGrip);
                         }
                         interaction.dividerHovered = scene.railVisible
-                            && event.x == (scene.railWidth > 0u ? scene.railWidth - 1u : 0u)
+                            && event.x == scene.railWidth
                             && event.y > 0u && event.y + 1u < (size_t) height;
                         if (scene.markdownFile && scene.preview)
                             sceneMarkdownUpdateHover(&scene, event.x, event.y,
@@ -5698,6 +5876,25 @@ int main(int argc, char **argv) {
     size_t rootLength = strlen(gRailRoot);
     while (rootLength > 1u && gRailRoot[rootLength - 1u] == '/')
         gRailRoot[--rootLength] = '\0';
+    char absoluteRoot[PATH_MAX];
+    if (realpath(gRailRoot, absoluteRoot) == nullptr) {
+        THROW("semicolon: cannot resolve project location %s", gRailRoot);
+        return 1;
+    }
+    if (gRailRoot[0] != '/') {
+        if (strlen(absoluteRoot) >= sizeof gRailRoot) {
+            THROW("semicolon: resolved project path exceeds %zu bytes", sizeof gRailRoot - 1u);
+            return 1;
+        }
+        memcpy(gRailRoot, absoluteRoot, strlen(absoluteRoot) + 1u);
+    }
+    const char *home = getenv("HOME");
+    size_t homeLength = home == nullptr ? 0u : strlen(home);
+    if (homeLength > 0u && strncmp(absoluteRoot, home, homeLength) == 0
+        && (absoluteRoot[homeLength] == '/' || absoluteRoot[homeLength] == '\0'))
+        (void) snprintf(gRailLocation, sizeof gRailLocation, "~%s", absoluteRoot + homeLength);
+    else
+        (void) snprintf(gRailLocation, sizeof gRailLocation, "%s", absoluteRoot);
     cacheLoad(gRailRoot);
     if (!fileGiven) {
         // The project's own session first, then its first file. A cached path that is no
