@@ -26,6 +26,19 @@ Patterns support comments, `!` negation, `*`/`?`/bracket globs, path components,
 and trailing-slash directory rules; full Git ignore semantics (including escaped
 trailing spaces and nested ignore files) are not claimed.
 
+The project folder stays pinned at the top of the file rail beside its grayscale
+canonical location (`~/...` inside HOME, otherwise an absolute path). Long names
+and paths show an ellipsis within the rail; children scroll below without moving
+the header or the editor's file tabs. Each tree level advances by two spaces;
+deep indentation is capped so filenames remain readable.
+
+Scrolling follows the pointer: over the file tabs, either wheel axis pans the
+strip by whole tabs; over the tree, up/down scrolls children and left/right pans
+long names. Modified vertical wheel events also pan the tree sideways. Over the
+source editor, the existing vertical/horizontal scrolling remains independent.
+Newly selected tabs reveal themselves; clipped titles retain a close control.
+These routes have scripted PTY evidence, not physical Ghostty or font approval.
+
 The file tree opens at 50 terminal cells by default. The visible filename space
 is smaller than that total because the tree also uses cells for indentation,
 disclosure markers and icons. Dragging its divider to
@@ -33,6 +46,9 @@ resize records that custom width; collapsing the tree leaves a persistent
 three-line grip at the far left, and clicking it reopens the tree at the
 remembered custom width or the 50-cell default. Older session files that only
 stored the former default width no longer force the tree to reopen narrow.
+
+The hover divider grip sits one cell beyond the file list's last cell, with its
+mouse target at the same position, so it does not cover list text or selection.
 
 The code view shows Run only for supported file formats; `.c` and `.m` files
 must contain a text-detected `main` definition. C files under this checkout's
