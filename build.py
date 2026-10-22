@@ -57,7 +57,7 @@ def build(output, compiler="clang"):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".semicolon-build-", dir=output.parent) as temp:
         artifact = Path(temp) / "semicolon-tui"
-        argv = [compiler, *flags, "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine),
+        argv = [compiler, *flags, "-I", str(ROOT), "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine),
                 str(entry), *(str(source) for source in sources(determinant, vexspoke, engine)),
                  curses_library, "-lm", "-o", str(artifact)]
         result = run(argv)
