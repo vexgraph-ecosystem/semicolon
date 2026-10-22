@@ -2,12 +2,16 @@
 """Explicit strict native build for the semicolon terminal shell.
 
 MODULE: build.py
-REGISTRY: build(output, compiler) resolves explicit dependency roots, compiles the
-real Determinant toolkit plus the R2 sources it borrows, and publishes the binary
+REGISTRY: sources(determinant, vexspoke, engine, language) lists the real toolkit,
+consumer bridge, C23 lexical dependencies and borrowed R2 units. run(argv, timeout)
+executes a bounded compiler child. build(output, compiler) resolves explicit
+dependency roots, compiles those sources, and publishes the binary
 by atomic replacement. No fetch, no installation, no program run, no tty use.
 Standalone consumers supply source roots through the SEMICOLON_*_SOURCE_DIR
 environment variables; the workspace paths are discovery defaults, not an
 ecosystem dependency. A missing header is a real build failure.
+SEMICOLON_LANGUAGE_SOURCE_DIR names the Language repository root; unlike the
+other source-root options, that owner has no src/ subdirectory.
 The compiler and the output parent are trusted; a failed compile preserves any
 existing output and reclaims its own temporary directory.
 """
@@ -26,10 +30,14 @@ def run(argv, timeout=180):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
-def sources(determinant, vexspoke, engine):
+def sources(determinant, vexspoke, engine, language):
     produced = sorted(determinant.glob("terminal/*.c"))
     produced += [vexspoke / "primitive/string.c", vexspoke / "atomic/spin.c",
-                 engine / "nio/mem.c"]
+                  engine / "nio/mem.c"]
+    produced += [ROOT / "src/editor/semicolon_syntax.c"]
+    produced += [language / name for name in (
+        "adapters/c/c23_lexer.c", "adapters/c/c23_lex_step.c", "syntax/role.c",
+        "analysis/syntax_span.c", "document/source_range.c", "text/bounded_text.c")]
     return produced
 
 
@@ -39,7 +47,9 @@ def build(output, compiler="clang"):
     vexspoke = Path(os.environ.get("SEMICOLON_VEXSPOKE_SOURCE_DIR",
                                    WORKSPACE / "suite/ecosystem/vexspoke/src"))
     engine = Path(os.environ.get("SEMICOLON_ENGINE_SOURCE_DIR",
-                                 WORKSPACE / "suite/ecosystem/relational-engine/src"))
+                                  WORKSPACE / "suite/ecosystem/relational-engine/src"))
+    language = Path(os.environ.get("SEMICOLON_LANGUAGE_SOURCE_DIR",
+                                    WORKSPACE / "suite/ecosystem/language"))
     entry = ROOT / "src/main/tui-main.c"
     if not entry.is_file():
         raise ValueError(f"missing entry point: {entry}")
@@ -57,8 +67,9 @@ def build(output, compiler="clang"):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".semicolon-build-", dir=output.parent) as temp:
         artifact = Path(temp) / "semicolon-tui"
-        argv = [compiler, *flags, "-I", str(ROOT), "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine),
-                str(entry), *(str(source) for source in sources(determinant, vexspoke, engine)),
+        argv = [compiler, *flags, "-I", str(ROOT), "-I", str(ROOT / "src"),
+                "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine), "-I", str(language),
+                str(entry), *(str(source) for source in sources(determinant, vexspoke, engine, language)),
                  curses_library, "-lm", "-o", str(artifact)]
         result = run(argv)
         if result.returncode:
