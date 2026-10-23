@@ -82,7 +82,8 @@ extern char **environ;
  * document snapshot is refreshed cold after edits, not during scrolling or cell
  * paint. It changes cell ink/weight only, never source bytes, caret coordinates,
  * glyphs or saved text. .c/.h explicitly select the initial C23-only host mode;
- * identifiers remain unclassified, with no diagnostic or hint integration yet. */
+ * identifiers are classified by Language's conservative C23Highlights pass, with
+ * no diagnostic or hint integration yet. */
 ;;OVERVIEW
 /** ============================================================================
  * MODULE: semicolon terminal entry (src/main/tui-main.c)
