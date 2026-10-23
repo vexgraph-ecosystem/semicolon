@@ -74,7 +74,10 @@ extern char **environ;
  * buffer; clicking source places the caret. Tabs close from their Nerd-font X or
  * middle-click. Markdown files have a rendered terminal preview and a source
  * toggle. Code view edits UTF-8 rows and attempts a staged save one second after
- * the last edit; a failure keeps the dirty buffer resident. The console is a
+ * the last edit; a failure keeps the dirty buffer resident. Every mutation is a
+ * bounded snapshot transaction: Ctrl-Z restores the pre-edit document, Ctrl-Y
+ * reapplies it, and a refused edit leaves both the text and the redo path intact.
+ * The console is a
  * separate centre-panel presentation, not source text: a fixed ring keeps the
  * last 10,000 bounded lines, and a finished child leaves a scrollable snapshot
  * until its tab closes. The rail and file buffers outlive that snapshot.
@@ -125,6 +128,18 @@ extern char **environ;
  *     char name[64] — breadcrumb display basename.
  *     SemicolonSyntax *syntax — owned copied C23 analysis, travels with the tab.
  *     bool syntaxPending, syntaxCurrent — refresh requested / matches live bytes.
+ *     FileHistory history — bounded snapshot undo/redo, owned with this buffer.
+ *   FileSnapshot (one owned document state): char **lineStorage, const char **lines,
+ *     size_t *lineLengths, *lineCapacities, uint8_t *lineEndings — full owned row
+ *     copies; size_t lineCount/lineCapacity — exact snapshot geometry; size_t
+ *     cursorLine/cursorByte — restored caret; uint64_t revision — document identity;
+ *     bool valid — capture completed (a refused capture owns nothing).
+ *   FileSnapshotStack: FileSnapshot *items, size_t count/capacity — growable stack,
+ *     capped at TUI_HISTORY_LIMIT with the oldest entry dropped.
+ *   FileHistory: FileSnapshotStack undo/redo — committed past and future states;
+ *     FileSnapshot pending; bool pendingValid — the pre-edit capture awaiting commit
+ *     or cancellation; uint64_t currentRevision/nextRevision/savedRevision — dirty
+ *     identity, so undo after save knows the text differs from disk.
  *   TuiRow:
  *     TerminalText *gutter — line number object.
  *     TerminalText *code — source text object.
@@ -225,6 +240,12 @@ extern char **environ;
  *   static bool fileLoad(FileText *, const char *)
  *   static void fileFree(FileText *)
  *   static bool fileSave(FileText *, const char *)   staged atomic replacement + conflict check
+ *   static FileSnapshot fileSnapshot(const FileText *) / void fileSnapshotFree(FileSnapshot *)
+ *   static bool fileSnapshotStackReserve(...) / void fileSnapshotStackPush/Clear/Free(...)
+ *   static bool fileHistoryBegin/Commit/Cancel(...) / void fileHistoryFree/Reset(...)
+ *   static void fileHistoryRestore(FileText *, FileSnapshot *) / bool fileUndo/fileRedo(...)
+ *   static bool editorChange(FileText *, bool (*)(FileText *)) / editorInsertText(...)
+ *   static bool editorInsertUtf8(FileText *, int) / size_t utf8SequenceLength(int)
  *   static bool fileReserveLines/fileAddLine/fileReserveLine(...)
  *   static bool fileInsertBytes/fileSplit/fileJoinPrevious/fileBackspace/fileDeleteForward(...)
  *   static void fileMoveLeft/fileMoveRight/fileMoveVertical(...)
@@ -326,8 +347,10 @@ extern char **environ;
  * Contracts:
  *   The interactive path REQUIRES a tty on stdin and stdout and refuses before
  *   ncurses otherwise. It selects the environment's LC_CTYPE before newterm and
- *   sends canvas cells through ncurses' wide-character API. Ctrl-C is the ONLY
- *   quit key - a letter key must not quit,
+ *   sends canvas cells through ncurses' wide-character API. Raw mode keeps Ctrl-Z
+ *   available to the editor as byte 26, so Ctrl-C is read explicitly as byte 3;
+ *   a real SIGINT/SIGTERM still requests the same ordinary save-then-exit. Ctrl-C
+ *   is the ONLY quit key - a letter key must not quit,
  *   because the terminal is a text editor and letters are text; the terminal is
  *   restored on every normal exit and on SIGINT/SIGTERM (SIGKILL or a crash
  *   cannot promise that).
@@ -370,6 +393,9 @@ extern char **environ;
 #define TUI_AUTOSAVE_DELAY_NS 1000000000ULL
 #define TUI_INITIAL_LINE_CAPACITY 64u
 #define TUI_INITIAL_TAB_CAPACITY 4u
+// A safety bound, not a promise that every edit is kept forever: the oldest snapshot
+// falls off when a document has been edited this many times without closing a tab.
+#define TUI_HISTORY_LIMIT 64u
 #define TUI_DEFAULT_LINE_CAPACITY 64u
 #define TUI_LINE_ENDING_NONE 0u
 #define TUI_LINE_ENDING_LF 1u
@@ -626,6 +652,43 @@ static bool isMarkdownFile(const char *name) {
 
 // ---------------------------------------------------------------- file text
 
+// A document snapshot is the undo/redo currency: every stored line is an owned copy,
+// so a history entry can never be invalidated by a later edit. The arrays mirror
+// FileText's row layout, and lineCapacity is exactly lineCount: the next structural
+// edit reserves a larger directory through the ordinary fileReserveLines path.
+typedef struct FileSnapshot {
+    char **lineStorage;
+    const char **lines;
+    size_t *lineLengths;
+    size_t *lineCapacities;
+    uint8_t *lineEndings;
+    size_t lineCount;
+    size_t lineCapacity;
+    size_t cursorLine;
+    size_t cursorByte;
+    uint64_t revision;
+    bool valid;
+} FileSnapshot;
+
+typedef struct FileSnapshotStack {
+    FileSnapshot *items;
+    size_t count;
+    size_t capacity;
+} FileSnapshotStack;
+
+// A bounded stack pair. pending is the pre-edit state captured by fileHistoryBegin;
+// it is committed only after the edit actually changes the document, so a refused
+// backspace at byte zero leaves both the text and the redo stack untouched.
+typedef struct FileHistory {
+    FileSnapshotStack undo;
+    FileSnapshotStack redo;
+    FileSnapshot pending;
+    bool pendingValid;
+    uint64_t currentRevision;
+    uint64_t nextRevision;
+    uint64_t savedRevision;
+} FileHistory;
+
 typedef struct FileText {
     char **lineStorage;      // individually owned editable UTF-8 lines
     size_t length;
@@ -649,6 +712,7 @@ typedef struct FileText {
     SemicolonSyntax *syntax;
     bool syntaxPending;
     bool syntaxCurrent;
+    FileHistory history;     // bounded snapshot undo/redo, owned with this buffer
 } FileText;
 
 // SLOT RECORD: EditorTab
@@ -1450,6 +1514,175 @@ static size_t bytesForCells(const char *bytes, size_t length, size_t cells) {
     return at;
 }
 
+static void fileSnapshotFree(FileSnapshot *snapshot) {
+    if (snapshot == nullptr)
+        return;
+    if ((*snapshot).lineStorage != nullptr) {
+        for (size_t i = 0; i < (*snapshot).lineCount; ++i)
+            free((*snapshot).lineStorage[i]);
+    }
+    free((*snapshot).lineStorage);
+    free((*snapshot).lines);
+    free((*snapshot).lineLengths);
+    free((*snapshot).lineCapacities);
+    free((*snapshot).lineEndings);
+    *snapshot = (FileSnapshot) {0};
+}
+
+// Copy every row and the caret. A snapshot is deliberately a full document: undo is a
+// cold user action, and an owned copy is the one representation that cannot alias a
+// line the next edit is about to realloc or move.
+static FileSnapshot fileSnapshot(const FileText *file) {
+    FileSnapshot snapshot = {0};
+    if (file == nullptr || (*file).lineCount == 0)
+        return snapshot;
+    size_t count = (*file).lineCount;
+    if (count > SIZE_MAX / sizeof(char *) || count > SIZE_MAX / sizeof(size_t)
+        || count > SIZE_MAX / sizeof(uint8_t))
+        return snapshot;
+    snapshot.lineStorage = calloc(count, sizeof *snapshot.lineStorage);
+    snapshot.lines = malloc(count * sizeof *snapshot.lines);
+    snapshot.lineLengths = malloc(count * sizeof *snapshot.lineLengths);
+    snapshot.lineCapacities = malloc(count * sizeof *snapshot.lineCapacities);
+    snapshot.lineEndings = malloc(count * sizeof *snapshot.lineEndings);
+    if (snapshot.lineStorage == nullptr || snapshot.lines == nullptr
+        || snapshot.lineLengths == nullptr || snapshot.lineCapacities == nullptr
+        || snapshot.lineEndings == nullptr) {
+        fileSnapshotFree(&snapshot);
+        return (FileSnapshot) {0};
+    }
+    snapshot.lineCount = count;
+    snapshot.lineCapacity = count;
+    snapshot.cursorLine = (*file).cursorLine;
+    snapshot.cursorByte = (*file).cursorByte;
+    snapshot.revision = (*file).history.currentRevision;
+    for (size_t i = 0; i < count; ++i) {
+        size_t length = (*file).lineLengths[i];
+        if (length == SIZE_MAX) {
+            fileSnapshotFree(&snapshot);
+            return (FileSnapshot) {0};
+        }
+        char *copy = malloc(length + 1u);
+        if (copy == nullptr) {
+            fileSnapshotFree(&snapshot);
+            return (FileSnapshot) {0};
+        }
+        if (length != 0)
+            memcpy(copy, (*file).lineStorage[i], length);
+        copy[length] = '\0';
+        snapshot.lineStorage[i] = copy;
+        snapshot.lines[i] = copy;
+        snapshot.lineLengths[i] = length;
+        snapshot.lineCapacities[i] = length + 1u;
+        snapshot.lineEndings[i] = (*file).lineEndings[i];
+    }
+    snapshot.valid = true;
+    return snapshot;
+}
+
+static void fileSnapshotStackClear(FileSnapshotStack *stack) {
+    if (stack == nullptr)
+        return;
+    for (size_t i = 0; i < (*stack).count; ++i)
+        fileSnapshotFree(&(*stack).items[i]);
+    (*stack).count = 0;
+}
+
+static void fileSnapshotStackFree(FileSnapshotStack *stack) {
+    if (stack == nullptr)
+        return;
+    fileSnapshotStackClear(stack);
+    free((*stack).items);
+    *stack = (FileSnapshotStack) {0};
+}
+
+static bool fileSnapshotStackReserve(FileSnapshotStack *stack, size_t needed) {
+    if (stack == nullptr || needed <= (*stack).capacity)
+        return true;
+    size_t next = (*stack).capacity == 0 ? 8u : (*stack).capacity;
+    while (next < needed) {
+        if (next > SIZE_MAX / 2u)
+            return false;
+        next *= 2u;
+    }
+    if (next > SIZE_MAX / sizeof(FileSnapshot))
+        return false;
+    FileSnapshot *grown = realloc((*stack).items, next * sizeof *grown);
+    if (grown == nullptr)
+        return false;
+    (*stack).items = grown;
+    (*stack).capacity = next;
+    return true;
+}
+
+// The caller reserves room first. A full history drops its oldest entry rather than
+// refusing the edit the user just made.
+static void fileSnapshotStackPush(FileSnapshotStack *stack, FileSnapshot snapshot) {
+    if (stack == nullptr) {
+        fileSnapshotFree(&snapshot);
+        return;
+    }
+    if ((*stack).count >= TUI_HISTORY_LIMIT) {
+        fileSnapshotFree(&(*stack).items[0]);
+        memmove((*stack).items, (*stack).items + 1u,
+                ((*stack).count - 1u) * sizeof *(*stack).items);
+        --(*stack).count;
+    }
+    (*stack).items[(*stack).count++] = snapshot;
+}
+
+static void fileHistoryFree(FileHistory *history) {
+    if (history == nullptr)
+        return;
+    fileSnapshotStackFree(&(*history).undo);
+    fileSnapshotStackFree(&(*history).redo);
+    fileSnapshotFree(&(*history).pending);
+    *history = (FileHistory) {0};
+}
+
+static void fileHistoryReset(FileHistory *history) {
+    fileHistoryFree(history);
+    (*history).currentRevision = 1u;
+    (*history).nextRevision = 1u;
+    (*history).savedRevision = 1u;
+}
+
+// Capture the pre-edit state and make sure the undo stack can accept it. The snapshot
+// is committed only after a real change, so a no-op keystroke never eats the redo path.
+static bool fileHistoryBegin(FileText *file) {
+    if (file == nullptr || (*file).history.pendingValid)
+        return false;
+    if ((*file).history.undo.count < TUI_HISTORY_LIMIT
+        && !fileSnapshotStackReserve(&(*file).history.undo,
+                                     (*file).history.undo.count + 1u))
+        return false;
+    FileSnapshot snapshot = fileSnapshot(file);
+    if (!snapshot.valid)
+        return false;
+    (*file).history.pending = snapshot;
+    (*file).history.pendingValid = true;
+    return true;
+}
+
+static void fileHistoryCommit(FileText *file) {
+    if (file == nullptr || !(*file).history.pendingValid)
+        return;
+    fileSnapshotStackPush(&(*file).history.undo, (*file).history.pending);
+    (*file).history.pending = (FileSnapshot) {0};
+    (*file).history.pendingValid = false;
+    fileSnapshotStackClear(&(*file).history.redo);
+    (*file).history.currentRevision = ++(*file).history.nextRevision;
+    (*file).dirty = (*file).history.currentRevision != (*file).history.savedRevision;
+}
+
+static void fileHistoryCancel(FileText *file) {
+    if (file == nullptr || !(*file).history.pendingValid)
+        return;
+    fileSnapshotFree(&(*file).history.pending);
+    (*file).history.pending = (FileSnapshot) {0};
+    (*file).history.pendingValid = false;
+}
+
 static void fileFree(FileText *file) {
     SemicolonSyntax_free((*file).syntax);
     for (size_t i = 0; i < file->lineCount; ++i)
@@ -1459,6 +1692,7 @@ static void fileFree(FileText *file) {
     free(file->lineLengths);
     free(file->lineCapacities);
     free(file->lineEndings);
+    fileHistoryFree(&(*file).history);
     *file = (FileText) {0};
 }
 
@@ -1664,6 +1898,7 @@ static bool fileLoad(FileText *file, const char *path) {
         (*file).syntax = SemicolonSyntax();
         (*file).syntaxPending = (*file).syntax != nullptr;
     }
+    fileHistoryReset(&(*file).history);
     return true;
 }
 
@@ -1722,6 +1957,72 @@ static void fileRefreshLengthAndWidth(FileText *file) {
             file->longestLine = i;
         }
     }
+}
+
+// Move a snapshot's owned rows into the live document. The snapshot is zeroed because
+// FileText now owns its arrays; freeing it again would double-free every line.
+static void fileHistoryRestore(FileText *file, FileSnapshot *snapshot) {
+    if (file == nullptr || snapshot == nullptr || !(*snapshot).valid)
+        return;
+    for (size_t i = 0; i < (*file).lineCount; ++i)
+        free((*file).lineStorage[i]);
+    free((*file).lineStorage);
+    free((*file).lines);
+    free((*file).lineLengths);
+    free((*file).lineCapacities);
+    free((*file).lineEndings);
+    (*file).lineStorage = (*snapshot).lineStorage;
+    (*file).lines = (*snapshot).lines;
+    (*file).lineLengths = (*snapshot).lineLengths;
+    (*file).lineCapacities = (*snapshot).lineCapacities;
+    (*file).lineEndings = (*snapshot).lineEndings;
+    (*file).lineCount = (*snapshot).lineCount;
+    (*file).lineCapacity = (*snapshot).lineCapacity;
+    (*file).cursorLine = (*snapshot).cursorLine;
+    (*file).cursorByte = (*snapshot).cursorByte;
+    (*file).history.currentRevision = (*snapshot).revision;
+    (*file).cursorVisible = true;
+    (*file).saveFailed = false;
+    (*file).lastEditNs = monotonicNowNs();
+    (*file).dirty = (*file).history.currentRevision != (*file).history.savedRevision;
+    *snapshot = (FileSnapshot) {0};
+    fileRefreshLengthAndWidth(file);
+}
+
+static bool fileUndo(FileText *file) {
+    if (file == nullptr || (*file).history.undo.count == 0)
+        return false;
+    if ((*file).history.redo.count < TUI_HISTORY_LIMIT
+        && !fileSnapshotStackReserve(&(*file).history.redo,
+                                     (*file).history.redo.count + 1u))
+        return false;
+    FileSnapshot current = fileSnapshot(file);
+    if (!current.valid)
+        return false;
+    FileSnapshot restore =
+        (*file).history.undo.items[--(*file).history.undo.count];
+    (*file).history.undo.items[(*file).history.undo.count] = (FileSnapshot) {0};
+    fileSnapshotStackPush(&(*file).history.redo, current);
+    fileHistoryRestore(file, &restore);
+    return true;
+}
+
+static bool fileRedo(FileText *file) {
+    if (file == nullptr || (*file).history.redo.count == 0)
+        return false;
+    if ((*file).history.undo.count < TUI_HISTORY_LIMIT
+        && !fileSnapshotStackReserve(&(*file).history.undo,
+                                     (*file).history.undo.count + 1u))
+        return false;
+    FileSnapshot current = fileSnapshot(file);
+    if (!current.valid)
+        return false;
+    FileSnapshot restore =
+        (*file).history.redo.items[--(*file).history.redo.count];
+    (*file).history.redo.items[(*file).history.redo.count] = (FileSnapshot) {0};
+    fileSnapshotStackPush(&(*file).history.undo, current);
+    fileHistoryRestore(file, &restore);
+    return true;
 }
 
 static void fileRefreshEditedWidth(FileText *file, size_t line, size_t oldWidth) {
@@ -1944,6 +2245,7 @@ static bool fileSave(FileText *file, const char *path) {
         return false;
     }
     file->baselineValid = true;
+    (*file).history.savedRevision = (*file).history.currentRevision;
     file->dirty = false;
     file->saveFailed = false;
     return true;
@@ -4651,7 +4953,78 @@ static void paintEditorCursor(TerminalCanvas *canvas, const FileText *file,
         canvas->styles[index] |= TERMINAL_STYLE_REVERSE;
 }
 
+// Every mutating key goes through one transaction: snapshot, change, then either
+// commit the pre-edit state or throw it away when the operation refused. A failed
+// snapshot refuses the edit before any source byte moves.
+static bool editorChange(FileText *file, bool (*operation)(FileText *)) {
+    if (operation == nullptr || !fileHistoryBegin(file))
+        return false;
+    if (!operation(file)) {
+        fileHistoryCancel(file);
+        return false;
+    }
+    fileHistoryCommit(file);
+    return true;
+}
+
+static bool editorInsertText(FileText *file, const char *bytes, size_t count) {
+    if (!fileHistoryBegin(file))
+        return false;
+    if (!fileInsertBytes(file, (*file).cursorLine, (*file).cursorByte, bytes, count)) {
+        fileHistoryCancel(file);
+        return false;
+    }
+    fileHistoryCommit(file);
+    return true;
+}
+
+static bool utf8Continuation(int key) {
+    return key >= 0x80 && key <= 0xBF;
+}
+
+static size_t utf8SequenceLength(int lead) {
+    if (lead >= 0xC2 && lead <= 0xDF)
+        return 2u;
+    if (lead >= 0xE0 && lead <= 0xEF)
+        return 3u;
+    if (lead >= 0xF0 && lead <= 0xF4)
+        return 4u;
+    return 1u;
+}
+
+// ncurses in this build hands over one BYTE at a time, not one scalar. A multibyte
+// UTF-8 character must therefore become one history transaction, or undo would leave
+// a truncated sequence behind. Gather the continuation bytes that are already queued;
+// an incomplete sequence is still inserted once rather than silently discarded.
+static bool editorInsertUtf8(FileText *file, int key) {
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char) key;
+    size_t length = utf8SequenceLength(key);
+    size_t got = 1u;
+    if (length > 1u) {
+        timeout(1);
+        while (got < length) {
+            int next = getch();
+            if (!utf8Continuation(next)) {
+                if (next != ERR)
+                    (void) ungetch(next);
+                break;
+            }
+            bytes[got++] = (unsigned char) next;
+        }
+        timeout(0);
+    }
+    (*file).cursorVisible = true;
+    return editorInsertText(file, (const char *) bytes, got);
+}
+
 static bool editorKey(FileText *file, int key) {
+    // Ctrl-Z / Ctrl-Y. The host runs raw() so the tty does not turn Ctrl-Z into
+    // SIGTSTP and discard the byte before ncurses can see it.
+    if (key == 26)
+        return fileUndo(file);
+    if (key == 25)
+        return fileRedo(file);
     if (key == KEY_LEFT) {
         fileMoveLeft(file);
         file->cursorVisible = true;
@@ -4687,25 +5060,29 @@ static bool editorKey(FileText *file, int key) {
     }
     if (key == KEY_BACKSPACE || key == 127 || key == 8) {
         file->cursorVisible = true;
-        return fileBackspace(file);
+        return editorChange(file, fileBackspace);
     }
     if (key == KEY_DC) {
         file->cursorVisible = true;
-        return fileDeleteForward(file);
+        return editorChange(file, fileDeleteForward);
     }
     if (key == '\n' || key == '\r') {
         file->cursorVisible = true;
-        return fileSplit(file);
+        return editorChange(file, fileSplit);
     }
     if (key == '\t') {
         static const char spaces[TUI_INDENT_SPACES] = { ' ', ' ', ' ', ' ' };
         file->cursorVisible = true;
-        return fileInsertBytes(file, line, file->cursorByte, spaces, sizeof spaces);
+        return editorInsertText(file, spaces, sizeof spaces);
     }
-    if ((key >= 32 && key != 127) || key >= 128) {
+    if (key >= 128 && key <= 255) {
+        file->cursorVisible = true;
+        return editorInsertUtf8(file, key);
+    }
+    if (key >= 32 && key != 127) {
         char byte = (char) key;
         file->cursorVisible = true;
-        return fileInsertBytes(file, line, file->cursorByte, &byte, 1u);
+        return editorInsertText(file, &byte, 1u);
     }
     return false;
 }
@@ -5116,7 +5493,11 @@ static int runTerminal(FileText *file) {
         start_color();
         use_default_colors();
     }
-    (void) cbreak();
+    // Raw mode, not cbreak: Ctrl-Z has to arrive as byte 26 so the editor can undo
+    // instead of the line discipline suspending the whole shell. Ctrl-C is therefore
+    // handled explicitly as byte 3 in the event loop; SIGINT still covers a real
+    // process signal sent by someone else.
+    (void) raw();
     (void) noecho();
     (void) nonl();
     (void) curs_set(0);
@@ -5299,9 +5680,13 @@ static int runTerminal(FileText *file) {
         size_t handled = 0;
         while (key != ERR && handled < TUI_EVENTS_PER_FRAME) {
             ++handled;
-            // Ctrl-C (SIGINT) is the only way out; there is deliberately no letter
-            // shortcut, because a keystroke is input and 'q' is a legitimate thing
-            // to want to type.
+            // Ctrl-C is the only way out; raw mode delivers it as byte 3 rather than
+            // SIGINT, and there is deliberately no letter shortcut because a keystroke
+            // is input and 'q' is a legitimate thing to want to type.
+            if (key == 3) {
+                gQuit = 1;
+                break;
+            }
 
             bool havePointer = false;
             bool captured = false;
