@@ -9,6 +9,7 @@
 #include "terminal/terminal_tree_view.h"
 #include "terminal/terminal_input.h"
 #include "terminal/terminal_markdown_view.h"
+#include "terminal/terminal_scroll_glide.h"
 #include "editor/semicolon_syntax.h"
 #include "icon/icon_catalog.h"
 #include "exception/throw.h"
@@ -160,8 +161,8 @@ extern char **environ;
  *   Interaction: TerminalInput input (mouse decoder); bool grabbing, tracking,
  *     pressed, havePointer (gesture state); size_t trackX, trackLeft, grabX,
  *     grabWidth, pointerX, pointerY (gesture origin and last pointer cell).
- *   ScrollGlide slot record: double rowShown, rowTarget, columnShown,
- *     columnTarget (fractional and target viewport offsets).
+ *   Scroll motion: borrowed from Determinant's TerminalScrollGlide
+ *     (terminal/terminal_scroll_glide.h); this host owns the file bounds.
  *   DirEntry slot record: char name[TUI_RAIL_TEXT] (sorted entry name);
  *     bool folder (directory classification).
   *   ScrollStep slot record: bool keyed (recognized navigation key);
@@ -230,7 +231,7 @@ extern char **environ;
  *   static uint64_t monotonicNowNs(void) / bool autosave(FileText *, const char *)
  *   static bool writeAll(int, const char *, size_t) / statMatches(stat, stat)
  *   static void setSaveStatus(Scene *, const FileText *)
- *   static void keepCursorVisible(FileText *, ScrollGlide *, ...) / paintEditorCursor(...)
+ *   static void keepCursorVisible(FileText *, TerminalScrollGlide *, ...) / paintEditorCursor(...)
  *   static void fileSyntaxRefresh(FileText *) — cold pending snapshot replacement;
  *     allocation refusal leaves source editable and disables stale ink until next edit.
  *   static void paintEditorSyntax(canvas,file,scene,top,left) — allocation-free
@@ -302,9 +303,8 @@ extern char **environ;
   *   static size_t railIndent(TerminalTreeRow, size_t)
   *   static void paintRailColors(Scene *, TerminalCanvas *, bool, size_t, size_t)
  *   static size_t maxScrollTop/maxScrollLeft(clampScroll/applyScroll)
- *   static bool glideActive(const ScrollGlide *)   a scroll is still in flight
- *   static void glideImpulse/glideHalt/glideClamp(const ScrollGlide *, ...)
- *   static double glideStep(double *shown, double target)   one frame of easing
+ *   TerminalScrollGlide_isActive/impulse/halt/clamp/step — borrowed scroll
+ *     motion from Determinant; this host supplies the current bounds.
  *   static size_t editorFirstRow/editorVisibleRows/codeLeftColumn/codeColumns
   *     codeLeftColumn includes the two-cell leading and trailing number gaps.
  *   static void sceneSetRailWidth(Scene *, size_t width)
@@ -411,14 +411,11 @@ extern char **environ;
 // into dozens of notches, so three each was a screen-and-a-half per flick.
 #define TUI_SCROLL_ROWS 1u
 #define TUI_SCROLL_COLS 1u
-// The frame interval that makes the glide 60fps, and the two numbers that give it
-// friction. Each frame covers TUI_SCROLL_EASE of the distance still to travel, so a
-// burst of notches arrives as a decelerating glide and settles; below
-// TUI_SCROLL_EPSILON of remaining distance it snaps, which is what stops the motion
-// instead of leaving it creeping toward a target forever.
+
+// The frame interval while a scroll is in flight. Friction and the snap threshold
+// belong to Determinant's TerminalScrollGlide, which owns the motion.
 #define TUI_FRAME_MS 16
-#define TUI_SCROLL_EASE 0.18
-#define TUI_SCROLL_EPSILON 0.4
+
 // Scroll-past padding: how far the view may travel BEYOND the last line and the
 // last column, so there is always somewhere to type at the bottom and at the right
 // edge instead of the caret being pinned against it.
@@ -742,6 +739,8 @@ static size_t editorVisibleRows(int height);
 static size_t railVisibleRows(int height);
 static size_t codeLeftColumn(size_t railWidth, size_t numberWidth);
 static size_t codeColumns(size_t railWidth, size_t numberWidth, int width);
+static size_t maxScrollTop(const FileText *file, size_t visible);
+static size_t maxScrollLeft(const FileText *file, size_t codeWidth);
 static const char *projectRootName(void);
 static char gOpenPath[1024];
 static bool parsePackedHex(const char *text, uint32_t *color);
@@ -1399,13 +1398,8 @@ typedef struct Interaction {
     bool mouseCaptureDetect;         // KEY_MOUSE fallback has not exposed its encoding yet
 } Interaction;
 
-// SLOT RECORD: ScrollGlide
-typedef struct ScrollGlide {
-    double rowShown;      // rows currently displayed, fractional
-    double rowTarget;     // rows headed for
-    double columnShown;
-    double columnTarget;
-} ScrollGlide;
+// Scroll motion lives in Determinant's TerminalScrollGlide; keepCursorVisible and
+// the frame loop borrow it and supply the file's current bounds.
 
 static void onSignal(int signalNumber) {
     (void) signalNumber;
@@ -4618,22 +4612,25 @@ static void paintEditorSyntax(TerminalCanvas *canvas, const FileText *file,
     TerminalPanel_paint((*scene).codeActions, &code);
 }
 
-static void keepCursorVisible(const FileText *file, ScrollGlide *glide,
+static void keepCursorVisible(const FileText *file, TerminalScrollGlide *glide,
                               size_t visible, size_t columns, const Scene *scene) {
     size_t codeWidth = codeColumns(scene->railWidth, scene->numberWidth, (int) columns);
     if (visible == 0 || codeWidth == 0 || file->lineCount == 0)
         return;
-    size_t top = glide->rowTarget > 0.0 ? (size_t) glide->rowTarget : 0u;
-    if (file->cursorLine < top)
-        glide->rowTarget = (double) file->cursorLine;
-    else if (file->cursorLine >= top + visible)
-        glide->rowTarget = (double) (file->cursorLine - visible + 1u);
+    size_t maxTop = maxScrollTop(file, visible);
+    size_t maxLeft = maxScrollLeft(file, codeWidth);
+    size_t rowTarget = (size_t) TerminalScrollGlide_getRowTarget(glide);
+    if (file->cursorLine < rowTarget)
+        rowTarget = file->cursorLine;
+    else if (file->cursorLine >= rowTarget + visible)
+        rowTarget = file->cursorLine - visible + 1u;
     size_t cursorCells = cellsOf(file->lines[file->cursorLine], file->cursorByte);
-    size_t left = glide->columnTarget > 0.0 ? (size_t) glide->columnTarget : 0u;
-    if (cursorCells < left)
-        glide->columnTarget = (double) cursorCells;
-    else if (cursorCells >= left + codeWidth)
-        glide->columnTarget = (double) (cursorCells - codeWidth + 1u);
+    size_t columnTarget = (size_t) TerminalScrollGlide_getColumnTarget(glide);
+    if (cursorCells < columnTarget)
+        columnTarget = cursorCells;
+    else if (cursorCells >= columnTarget + codeWidth)
+        columnTarget = cursorCells - codeWidth + 1u;
+    TerminalScrollGlide_setTarget(glide, rowTarget, columnTarget, maxTop, maxLeft);
 }
 
 static void paintEditorCursor(TerminalCanvas *canvas, const FileText *file,
@@ -4954,66 +4951,6 @@ static size_t applyScroll(size_t value, int delta, size_t maximum) {
     return clampScroll(value + (size_t) delta, maximum);
 }
 
-// A scroll with MOMENTUM, per axis: a position (`shown`), where it is heading
-// (`target`), and the easing between them.
-//
-// A queue that is spent a fixed step at a time is a conveyor belt - it runs at constant
-// speed until it empties, so there is no friction and nothing to stop. This instead
-// covers a fraction of the remaining distance every frame, which decelerates the closer
-// it gets, and `glideHalt` is what a press does: it drops the target onto the position
-// and the motion is over at once.
-//
-static double clampDouble(double value, double minimum, double maximum) {
-    if (value < minimum)
-        return minimum;
-    if (value > maximum)
-        return maximum;
-    return value;
-}
-
-static double glideGap(double shown, double target) {
-    double difference = target - shown;
-    return difference < 0.0 ? -difference : difference;
-}
-
-// Still travelling? Drives the frame cadence: 60fps while true, a long sleep once false,
-// so a settled view costs nothing at all.
-static bool glideActive(const ScrollGlide *glide) {
-    return glideGap((*glide).rowShown, (*glide).rowTarget) >= TUI_SCROLL_EPSILON
-        || glideGap((*glide).columnShown, (*glide).columnTarget) >= TUI_SCROLL_EPSILON;
-}
-
-// Input only ever moves the TARGET. Clamping it here means the glide can never aim past
-// a bound and grind against it.
-static void glideImpulse(ScrollGlide *glide, long rows, long columns,
-                         size_t maxTop, size_t maxLeft) {
-    (*glide).rowTarget = clampDouble((*glide).rowTarget + (double) rows, 0.0, (double) maxTop);
-    (*glide).columnTarget = clampDouble((*glide).columnTarget + (double) columns, 0.0, (double) maxLeft);
-}
-
-// Stop where we are: a press does this, which is why a running scroll can be caught.
-static void glideHalt(ScrollGlide *glide) {
-    (*glide).rowTarget = (*glide).rowShown;
-    (*glide).columnTarget = (*glide).columnShown;
-}
-
-static void glideClamp(ScrollGlide *glide, size_t maxTop, size_t maxLeft) {
-    (*glide).rowTarget = clampDouble((*glide).rowTarget, 0.0, (double) maxTop);
-    (*glide).rowShown = clampDouble((*glide).rowShown, 0.0, (double) maxTop);
-    (*glide).columnTarget = clampDouble((*glide).columnTarget, 0.0, (double) maxLeft);
-    (*glide).columnShown = clampDouble((*glide).columnShown, 0.0, (double) maxLeft);
-}
-
-// Cover TUI_SCROLL_EASE of what is left, and snap once the rest is imperceptible.
-static double glideStep(double *shown, double target) {
-    if (glideGap(*shown, target) < TUI_SCROLL_EPSILON) {
-        *shown = target;
-        return target;
-    }
-    *shown += (target - *shown) * TUI_SCROLL_EASE;
-    return *shown;
-}
-
 ;;TEST
 static int dumpFrame(int width, int height, FileText *file) {
     if (width < 1 || height < 1 || width > TUI_MAX_W || height > TUI_MAX_H) {
@@ -5251,7 +5188,7 @@ static int runTerminal(FileText *file) {
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
     ok = ok && TerminalSurface_setFrame(&surface, frameBracket, nullptr);
-    ScrollGlide glide = {0};
+    TerminalScrollGlide glide = TerminalScrollGlide();
     int knownRows = height;
     int knownColumns = width;
     if (!ok)
@@ -5306,7 +5243,7 @@ static int runTerminal(FileText *file) {
         size_t codeRight = width > 0 ? (size_t) width - 2u : 0;
         size_t maxTop = maxScrollTop(file, visible);
         size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, scene.numberWidth, width));
-        glideClamp(&glide, maxTop, maxLeft);
+        TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
         if (visible == 0 || codeRight <= codeLeft) {
             erase();
             mvaddstr(0, 0, "terminal too small");
@@ -5324,7 +5261,7 @@ static int runTerminal(FileText *file) {
         // exposes.
         // 60fps while a scroll is in flight, and a long sleep when nothing is moving.
         // Present-on-demand is preserved: an idle shell still emits nothing at all.
-        int waitMs = glideActive(&glide) ? TUI_FRAME_MS : TUI_POLL_MS;
+        int waitMs = TerminalScrollGlide_isActive(&glide) ? TUI_FRAME_MS : TUI_POLL_MS;
         if (gRunPid > 0 && waitMs > 50)
             waitMs = 50;
         if (file->dirty && !file->saveFailed) {
@@ -5463,7 +5400,7 @@ static int runTerminal(FileText *file) {
                         sceneMarkdownClearFeedback(&scene);
                     }
                 } else if (key == KEY_PPAGE || key == KEY_NPAGE) {
-                    glideImpulse(&glide, step.rows, step.columns, maxTop, maxLeft);
+                    TerminalScrollGlide_impulse(&glide, step.rows, step.columns, maxTop, maxLeft);
                 } else if (!gRunSelected && !scene.preview && editorKey(file, key)) {
                     keepCursorVisible(file, &glide, visible, (size_t) width, &scene);
                 }
@@ -5523,9 +5460,9 @@ static int runTerminal(FileText *file) {
                         // over which modifier they forward, so all three count.
                         long amount = down ? 1 : -1;
                         if (event.shift || event.meta || event.ctrl)
-                            glideImpulse(&glide, 0, amount * (long) TUI_SCROLL_COLS, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, 0, amount * (long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         else
-                            glideImpulse(&glide, amount * (long) TUI_SCROLL_ROWS, 0, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, amount * (long) TUI_SCROLL_ROWS, 0, maxTop, maxLeft);
                         break;
                     }
                     case TERMINAL_POINTER_WHEEL_LEFT:
@@ -5546,7 +5483,7 @@ static int runTerminal(FileText *file) {
                         }
                         if (gRunSelected)
                             break;
-                        glideImpulse(&glide, 0, right ? (long) TUI_SCROLL_COLS
+                        TerminalScrollGlide_impulse(&glide, 0, right ? (long) TUI_SCROLL_COLS
                                                      : -(long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         break;
                     }
@@ -5555,7 +5492,7 @@ static int runTerminal(FileText *file) {
                         interaction.pressed = true;
                         // CATCH IT: a press ends any scroll in flight, which is what makes
                         // momentum safe to have - you can always stop it by touching.
-                        glideHalt(&glide);
+                        TerminalScrollGlide_halt(&glide);
                         if (runControlHit(&scene, event.x, event.y, (size_t) width)) {
                             if (gRunPid > 0)
                                 runStop();
@@ -5597,7 +5534,7 @@ static int runTerminal(FileText *file) {
                                 maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                          scene.numberWidth,
                                                                          columns));
-                                glideClamp(&glide, maxTop, maxLeft);
+                                TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                             }
                             break;
                         }
@@ -5615,12 +5552,14 @@ static int runTerminal(FileText *file) {
                         if (event.y + 1u >= (size_t) height - 1u) {
                             interaction.tracking = true;
                             interaction.trackX = event.x;
-                            interaction.trackLeft = (size_t) (glide.columnShown + 0.5);
+                            interaction.trackLeft = TerminalScrollGlide_getPosition(&glide).column;
                             break;
                         }
+                        TerminalScrollGlidePosition pointerPosition =
+                            TerminalScrollGlide_getPosition(&glide);
                         if (!gRunSelected && editorPlaceCaret(file, event.x, event.y,
-                                             (size_t) (glide.rowShown + 0.5),
-                                             (size_t) (glide.columnShown + 0.5),
+                                             pointerPosition.row,
+                                             pointerPosition.column,
                                              codeLeft, &scene))
                             break;
                         // Three cells of tolerance, and the rail follows the pointer
@@ -5647,7 +5586,7 @@ static int runTerminal(FileText *file) {
                             maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                      scene.numberWidth,
                                                                      columns));
-                            glideClamp(&glide, maxTop, maxLeft);
+                            TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                         }
                         if (wasDivider && !moved) {
                             uint64_t now = monotonicNowNs();
@@ -5662,7 +5601,7 @@ static int runTerminal(FileText *file) {
                                 maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                          scene.numberWidth,
                                                                          columns));
-                                glideClamp(&glide, maxTop, maxLeft);
+                                TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                             } else {
                                 interaction.haveLastDividerClick = true;
                                 interaction.lastDividerClickNs = now;
@@ -5691,7 +5630,7 @@ static int runTerminal(FileText *file) {
                                     maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                              scene.numberWidth,
                                                                              columns));
-                                    glideClamp(&glide, maxTop, maxLeft);
+                                    TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                                 }
                             }
                             break;
@@ -5702,11 +5641,10 @@ static int runTerminal(FileText *file) {
                             // wherever the press landed; a drag has to move the content
                             // by as much as the finger moved, so the point under the
                             // finger stays under the finger.
-                            double wanted = (double) applyScroll(interaction.trackLeft,
-                                                                 (int) event.x - (int) interaction.trackX,
-                                                                 maxLeft);
-                            glide.columnShown = wanted;
-                            glide.columnTarget = wanted;
+                            size_t wanted = applyScroll(interaction.trackLeft,
+                                                        (int) event.x - (int) interaction.trackX,
+                                                        maxLeft);
+                            TerminalScrollGlide_setColumnPosition(&glide, wanted, maxLeft);
                             break;
                         }
                         if (interaction.grabbing) {
@@ -5721,7 +5659,7 @@ static int runTerminal(FileText *file) {
                                 maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                          scene.numberWidth,
                                                                          columns));
-                                glideClamp(&glide, maxTop, maxLeft);
+                                TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                             } else if (wanted >= (long) TUI_RAIL_MIN
                                 && wanted <= (long) columns - (long) TUI_RAIL_MARGIN) {
                                 if (!scene.railVisible)
@@ -5733,7 +5671,7 @@ static int runTerminal(FileText *file) {
                                 maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth,
                                                                          scene.numberWidth,
                                                                          columns));
-                                glideClamp(&glide, maxTop, maxLeft);
+                                TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
                             }
                         }
                         // Edge autoscroll belongs to a DRAG, not to hovering: acting
@@ -5742,13 +5680,13 @@ static int runTerminal(FileText *file) {
                         // Both bottom rows belong to the tracking line, so the vertical
                         // edge zone sits two rows above them.
                         if (event.y == editorFirstRow())
-                            glideImpulse(&glide, -1, 0, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, -1, 0, maxTop, maxLeft);
                         else if (event.y == height - 3u)
-                            glideImpulse(&glide, 1, 0, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, 1, 0, maxTop, maxLeft);
                         if (event.x <= codeLeft)
-                            glideImpulse(&glide, 0, -1, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, 0, -1, maxTop, maxLeft);
                         else if (event.x >= codeRight)
-                            glideImpulse(&glide, 0, 1, maxTop, maxLeft);
+                            TerminalScrollGlide_impulse(&glide, 0, 1, maxTop, maxLeft);
                         break;
                     }
                     case TERMINAL_POINTER_MOVE:
@@ -5809,14 +5747,12 @@ static int runTerminal(FileText *file) {
                 if (cursorCells >= codeWidth)
                     columnTarget = cursorCells - codeWidth + 1u;
             }
-            glide.rowShown = (double) rowTarget;
-            glide.rowTarget = (double) rowTarget;
-            glide.columnShown = (double) columnTarget;
-            glide.columnTarget = (double) columnTarget;
+            TerminalScrollGlide_setPosition(&glide, rowTarget, columnTarget, maxTop, maxLeft);
             gResetView = false;
         }
-        size_t scrollTop = (size_t) (glideStep(&glide.rowShown, glide.rowTarget) + 0.5);
-        size_t scrollLeft = (size_t) (glideStep(&glide.columnShown, glide.columnTarget) + 0.5);
+        TerminalScrollGlidePosition scrollPosition = TerminalScrollGlide_step(&glide);
+        size_t scrollTop = scrollPosition.row;
+        size_t scrollLeft = scrollPosition.column;
         fileSyntaxRefresh(file);
         sceneSyncRows(&scene, file, scrollTop, scrollLeft, visible);
         if (scene.editorPanelVisible == gRunSelected) {
