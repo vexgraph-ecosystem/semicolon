@@ -61,8 +61,10 @@ Scrolling follows the pointer: over the file tabs, either wheel axis pans the
 strip by whole tabs; over the tree, up/down scrolls children and left/right pans
 long names. Modified vertical wheel events also pan the tree sideways. Over the
 source editor, the existing vertical/horizontal scrolling remains independent.
-Newly selected tabs reveal themselves; clipped titles retain a close control.
-These routes have scripted PTY evidence, not physical Ghostty or font approval.
+The motion itself is Determinant's `TerminalScrollGlide`; Semicolon supplies the
+document bounds and paints at the whole-cell position it returns. Newly selected
+tabs reveal themselves; clipped titles retain a close control. These routes have
+scripted PTY evidence, not physical Ghostty or font approval.
 
 The file tree opens at 50 terminal cells by default. The visible filename space
 is smaller than that total because the tree also uses cells for indentation,
@@ -153,7 +155,7 @@ What crosses the levels *today* is narrower than the final R6 design:
 | Owner | Working Semicolon contact | Not yet integrated |
 | :--- | :--- | :--- |
 | Relational Engine + Vexspoke (R2) | The shell build links engine native Memory and Vexspoke CPU primitives. | Live storage residency or schema migration through Hotcwap. |
-| Determinant (R3) | Terminal panels, cells, caller-fed input and Markdown presentation. | Complete editor language services or physical-terminal visual approval. |
+| Determinant (R3) | Terminal panels, cells, caller-fed input, Markdown presentation and scroll motion. | Complete editor language services or physical-terminal visual approval. |
 | Language (R3) | Its public C23Lexer is linked into SemicolonSyntax for live `.c`/`.h` lexical ink and bold brackets; host-owned row snapshots preserve multiline context. | Generic adapter registry/project/index integration, semantic classification, parameter inlays, parser and LSP remain unwired. |
 | Hotcwap (R1), Graphvex (R3), Darling/Harness/Sesh (R4) | The workspace `b` graph may build their owners and tests, but invoking `b` does not link them into this TUI. | Supervised reload, GPU GUI, widgets, agent and session workflows. |
 | Primeagen (R5) | Independent standalone application. | Optional registered workflow; no reverse dependency. |
