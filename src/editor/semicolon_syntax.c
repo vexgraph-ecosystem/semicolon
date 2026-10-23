@@ -1,5 +1,5 @@
 #include "editor/semicolon_syntax.h"
-#include "adapters/c/c23_lexer.h"
+#include "adapters/c/c23_highlights.h"
 #include "annotation/definition.h"
 #include "annotation/overview.h"
 #include "exception/throw.h"
@@ -7,13 +7,14 @@
 #include <string.h>
 
 ;;DEFINITION
-/** SemicolonSyntax is the R6 consumer bridge between Language's C23 lexer and
- * Determinant pens. It copies editor rows into one immutable normalized snapshot
- * so multiline comments are classified as a document, never independent lines.
- * Only cold document replacement lexes/allocates. Hot byte projections binary
- * search flat ordered spans; scroll and caret movement need no new analysis.
- * Palette choices belong here, not inside either R3 owner. This is lexical
- * coloring, not parsing, diagnostics, symbol resolution or inlay generation. */
+/** SemicolonSyntax is the R6 consumer bridge between Language's conservative C23
+ * highlight pass and Determinant pens. It copies editor rows into one immutable
+ * normalized snapshot so multiline comments are classified as a document, never
+ * independent lines. Only cold document replacement analyses/allocates. Hot byte
+ * projections binary search Language's ordered spans; scroll and caret movement
+ * need no new analysis. Palette choices belong here, not inside either R3 owner.
+ * Language's function/type/variable/macro and preprocessor-directive distinction
+ * is a local lexical heuristic, not parsing, diagnostics or symbol resolution. */
 
 ;;OVERVIEW
 /** ============================================================================
@@ -23,8 +24,7 @@
  *   size_t length                 source bytes, excluding NUL
  *   size_t *starts                owned line-start offsets plus end sentinel
  *   size_t lineCount              initialized row count
- *   SyntaxSpan *spans             owned ordered Language span values
- *   size_t spanCount              initialized span count
+ *   C23Highlights *highlights     owned ordered Language semantic-ish spans
  *   TerminalPen pens[SYNTAX_ROLE_IDENTIFIER + 1u] current role palette
  *   size_t refusals               storage refusals in this owner's lifetime
  * FUNCTION REGISTRY
@@ -56,8 +56,7 @@ struct SemicolonSyntax {
     size_t length;
     size_t *starts;
     size_t lineCount;
-    SyntaxSpan *spans;
-    size_t spanCount;
+    C23Highlights *highlights;
     TerminalPen pens[SYNTAX_ROLE_IDENTIFIER + 1u];
     size_t refusals;
 };
@@ -65,9 +64,13 @@ struct SemicolonSyntax {
 // Defaults initialize configurable pens, never override a consumer's current pen.
 #define SYNTAX_TEXT_DEFAULT TERMINAL_RGB(0xF0, 0xF0, 0xF0)
 #define SYNTAX_KEYWORD_DEFAULT TERMINAL_RGB(0x00, 0x80, 0x00)
+#define SYNTAX_TYPE_DEFAULT TERMINAL_RGB(0x4E, 0xC9, 0xB0)
+#define SYNTAX_FUNCTION_DEFAULT TERMINAL_RGB(0x4F, 0xC1, 0xFF)
+#define SYNTAX_VARIABLE_DEFAULT TERMINAL_RGB(0x9C, 0xDC, 0xFE)
+#define SYNTAX_MACRO_DEFAULT TERMINAL_RGB(0xDC, 0xDC, 0xAA)
 #define SYNTAX_LITERAL_DEFAULT TERMINAL_RGB(0xA0, 0xF5, 0xA0)
-#define SYNTAX_COMMENT_DEFAULT TERMINAL_RGB(0x60, 0x85, 0x6B)
-#define SYNTAX_SPAN_INITIAL_CAPACITY 64u
+#define SYNTAX_COMMENT_DEFAULT TERMINAL_RGB(0x80, 0x80, 0x80)
+#define SYNTAX_DOC_COMMENT_DEFAULT TERMINAL_RGB(0x6A, 0x99, 0x55)
 
 static bool refuse(SemicolonSyntax *self, size_t request) {
     if ((*self).refusals == 0u)
@@ -88,11 +91,24 @@ SemicolonSyntax *SemicolonSyntax_0(void) {
     for (size_t role = 0u; role <= SYNTAX_ROLE_IDENTIFIER; ++role)
         (*self).pens[role] = TerminalPen(TERMINAL_STYLE_NONE, SYNTAX_TEXT_DEFAULT);
     (*self).pens[SYNTAX_ROLE_KEYWORD] = TerminalPen(0u, SYNTAX_KEYWORD_DEFAULT);
+    (*self).pens[SYNTAX_ROLE_TYPE] = TerminalPen(0u, SYNTAX_TYPE_DEFAULT);
+    (*self).pens[SYNTAX_ROLE_TYPE_PARAMETER] = (*self).pens[SYNTAX_ROLE_TYPE];
+    (*self).pens[SYNTAX_ROLE_TYPE_ARGUMENT] = (*self).pens[SYNTAX_ROLE_TYPE];
+    (*self).pens[SYNTAX_ROLE_FUNCTION] = TerminalPen(0u, SYNTAX_FUNCTION_DEFAULT);
+    (*self).pens[SYNTAX_ROLE_METHOD] = (*self).pens[SYNTAX_ROLE_FUNCTION];
+    (*self).pens[SYNTAX_ROLE_CONSTRUCTOR] = (*self).pens[SYNTAX_ROLE_FUNCTION];
+    (*self).pens[SYNTAX_ROLE_VARIABLE] = TerminalPen(0u, SYNTAX_VARIABLE_DEFAULT);
+    (*self).pens[SYNTAX_ROLE_PARAMETER] = (*self).pens[SYNTAX_ROLE_VARIABLE];
+    (*self).pens[SYNTAX_ROLE_FIELD] = (*self).pens[SYNTAX_ROLE_VARIABLE];
+    (*self).pens[SYNTAX_ROLE_MEMBER] = (*self).pens[SYNTAX_ROLE_VARIABLE];
+    (*self).pens[SYNTAX_ROLE_MACRO] = TerminalPen(TERMINAL_STYLE_BOLD, SYNTAX_MACRO_DEFAULT);
+    (*self).pens[SYNTAX_ROLE_MACRO_INVOCATION] = (*self).pens[SYNTAX_ROLE_MACRO];
+    (*self).pens[SYNTAX_ROLE_CONSTANT] = (*self).pens[SYNTAX_ROLE_MACRO];
     (*self).pens[SYNTAX_ROLE_STRING] = TerminalPen(0u, SYNTAX_LITERAL_DEFAULT);
     (*self).pens[SYNTAX_ROLE_CHARACTER] = (*self).pens[SYNTAX_ROLE_STRING];
     (*self).pens[SYNTAX_ROLE_NUMBER] = (*self).pens[SYNTAX_ROLE_STRING];
     (*self).pens[SYNTAX_ROLE_COMMENT] = TerminalPen(0u, SYNTAX_COMMENT_DEFAULT);
-    (*self).pens[SYNTAX_ROLE_DOC_COMMENT] = (*self).pens[SYNTAX_ROLE_COMMENT];
+    (*self).pens[SYNTAX_ROLE_DOC_COMMENT] = TerminalPen(0u, SYNTAX_DOC_COMMENT_DEFAULT);
     (*self).pens[SYNTAX_ROLE_BRACKET].style = TERMINAL_STYLE_BOLD;
     return self;
 }
@@ -100,9 +116,9 @@ SemicolonSyntax *SemicolonSyntax_0(void) {
 void SemicolonSyntax_free(SemicolonSyntax *self) {
     if (self == nullptr)
         return;
+    C23Highlights_free((*self).highlights);
     free((*self).source);
     free((*self).starts);
-    free((*self).spans);
     free(self);
 }
 
@@ -152,11 +168,8 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
     }
     starts[count] = at;
     source[at] = '\0';
-    C23Lexer *lexer = C23Lexer(1u, source, length);
-    SyntaxSpan *spans = nullptr;
-    size_t used = 0u;
-    size_t capacity = 0u;
-    if (lexer == nullptr) {
+    C23Highlights *highlights = C23Highlights(1u, source, length);
+    if (highlights == nullptr) {
         free(source);
         free(starts);
         if ((*self).refusals != SIZE_MAX)
@@ -164,47 +177,14 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
         // The Language owner already diagnosed its failed construction.
         return false;
     }
-    bool success = true;
-    size_t refusedRequest = 0u;
-    {
-        C23LexStep step = C23Lexer_next(lexer);
-        while (step.hasSpan) {
-            if (used == capacity) {
-                size_t next = capacity == 0u ? SYNTAX_SPAN_INITIAL_CAPACITY : capacity * 2u;
-                if (next < capacity || next > SIZE_MAX / sizeof *spans) {
-                    refusedRequest = SIZE_MAX;
-                    success = false;
-                    break;
-                }
-                SyntaxSpan *grown = realloc(spans, next * sizeof *spans);
-                if (grown == nullptr) {
-                    refusedRequest = next * sizeof *spans;
-                    success = false;
-                    break;
-                }
-                spans = grown;
-                capacity = next;
-            }
-            spans[used++] = step.span;
-            step = C23Lexer_next(lexer);
-        }
-    }
-    C23Lexer_free(lexer);
-    if (!success) {
-        free(source);
-        free(starts);
-        free(spans);
-        return refuse(self, refusedRequest);
-    }
+    C23Highlights_free((*self).highlights);
     free((*self).source);
     free((*self).starts);
-    free((*self).spans);
     (*self).source = source;
     (*self).length = length;
     (*self).starts = starts;
     (*self).lineCount = count;
-    (*self).spans = spans;
-    (*self).spanCount = used;
+    (*self).highlights = highlights;
     return true;
 }
 
@@ -230,20 +210,10 @@ TerminalPen SemicolonSyntax_penAt(const SemicolonSyntax *self, size_t line, size
     if (byte >= end - start - 1u)
         return (*self).pens[SYNTAX_ROLE_IDENTIFIER];
     size_t offset = start + byte;
-    size_t low = 0u;
-    size_t high = (*self).spanCount;
-    while (low < high) {
-        size_t middle = low + (high - low) / 2u;
-        SyntaxSpan span = (*self).spans[middle];
-        SourceRange range = span.range;
-        if (offset < range.startByte)
-            high = middle;
-        else if (offset >= range.endByte)
-            low = middle + 1u;
-        else
-            return (*self).pens[span.role];
-    }
-    return (*self).pens[SYNTAX_ROLE_IDENTIFIER];
+    SyntaxRole role = C23Highlights_roleAt((*self).highlights, offset);
+    if (!SyntaxRole_isValid(role))
+        return (*self).pens[SYNTAX_ROLE_IDENTIFIER];
+    return (*self).pens[role];
 }
 
 size_t SemicolonSyntax_getLineCount(const SemicolonSyntax *self) {
@@ -251,7 +221,7 @@ size_t SemicolonSyntax_getLineCount(const SemicolonSyntax *self) {
 }
 
 size_t SemicolonSyntax_getSpanCount(const SemicolonSyntax *self) {
-    return self == nullptr ? 0u : (*self).spanCount;
+    return self == nullptr ? 0u : C23Highlights_getCount((*self).highlights);
 }
 
 size_t SemicolonSyntax_exhaustionCount(const SemicolonSyntax *self) {
@@ -262,16 +232,18 @@ TerminalProjection SemicolonSyntax_toString(const SemicolonSyntax *self) {
     if (self == nullptr)
         return TerminalProjection_format("nullptr");
     return TerminalProjection_format("SemicolonSyntax(lines=%zu, spans=%zu)",
-                                     (*self).lineCount, (*self).spanCount);
+                                     (*self).lineCount,
+                                     C23Highlights_getCount((*self).highlights));
 }
 
 TerminalProjection SemicolonSyntax_toStringStruct(const SemicolonSyntax *self) {
     if (self == nullptr)
         return TerminalProjection_format("nullptr");
     TerminalProjection projection = TerminalProjection_format(
-        "SemicolonSyntax { source=%p, length=%zu, starts=%p, lineCount=%zu, spans=%p, spanCount=%zu, pens=[",
+        "SemicolonSyntax { source=%p, length=%zu, starts=%p, lineCount=%zu, highlights=%p, spanCount=%zu, pens=[",
         (void*) (*self).source, (*self).length, (void*) (*self).starts,
-        (*self).lineCount, (void*) (*self).spans, (*self).spanCount);
+        (*self).lineCount, (void*) (*self).highlights,
+        C23Highlights_getCount((*self).highlights));
     for (size_t role = 0u; role <= SYNTAX_ROLE_IDENTIFIER; ++role) {
         TerminalPen pen = (*self).pens[role];
         TerminalProjection next = TerminalProjection_format(

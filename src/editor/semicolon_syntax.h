@@ -16,7 +16,8 @@ bool SemicolonSyntax_setLines(SemicolonSyntax *self, const char *const *lines,
                               const size_t *lengths, size_t count);
 // Language selection is an explicit initial C23-only host policy for .c/.h.
 bool SemicolonSyntax_acceptsPath(const char *path);
-// Configurable presentation, never classification inferred from spelling.
+// Configurable presentation. Classification comes from Language's conservative
+// lexical highlight pass; the palette stays consumer-owned.
 bool SemicolonSyntax_setPen(SemicolonSyntax *self, SyntaxRole role, TerminalPen pen);
 TerminalPen SemicolonSyntax_getPen(const SemicolonSyntax *self, SyntaxRole role);
 TerminalPen SemicolonSyntax_penAt(const SemicolonSyntax *self, size_t line, size_t byte);

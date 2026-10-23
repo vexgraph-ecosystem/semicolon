@@ -18,21 +18,28 @@ open in a rendered preview with a source view available. Code view supports
 basic text editing and attempts to save after one idle second; failed saves keep
 the edited buffer available and show an error state.
 
-C23 lexical coloring now consumes the real Language lexer through
-`src/editor/semicolon_syntax.{h,c}`. The initial host policy selects C23 for
-lowercase `.c` and `.h` files, not C++ or Objective-C. Keywords are dark green,
-strings/characters/numbers light green, comments muted green, and brackets bold
-white; these are screenshot-inspired defaults, not an exact imported theme.
-The bridge's role pens have a validated configuration API, but no theme settings
+C23 lexical coloring now consumes Language's conservative `C23Highlights` pass
+through `src/editor/semicolon_syntax.{h,c}`. The initial host policy selects C23
+for lowercase `.c` and `.h` files, not C++ or Objective-C. Keywords are dark
+green; user types are teal; functions are blue; variables, parameters and members
+are cyan; macros/constants are pale yellow and bold; preprocessor markers and
+directive names such as `#include` and `#define` share that macro pen; strings,
+characters and numbers are light green; regular comments are gray and
+documentation comments are muted green; brackets are bold white. These are
+screenshot-inspired defaults, not an exact imported theme. Function/type/variable/macro roles come from local
+spelling and neighboring-token heuristics, not a parser or symbol resolver, so a
+capitalized variable can read as a type and an all-caps local as a macro. The
+bridge's role pens have a validated configuration API, but no theme settings
 screen or persistent syntax palette exists yet. Each tab owns a copied complete
 analysis snapshot; edits request cold refresh, while scrolling and caret movement
 reuse it. A failed refresh keeps editing available without stale highlighting.
 Coloring changes ink/weight only, never source, saved bytes or caret positions.
-Identifiers remain plain: function/parameter/macro classification, italic comments,
-parameter inlays, diagnostics, completion and cross-file semantics are not wired.
-The live presenter currently maps RGB to the terminal palette, not exact truecolor.
-`python3 tests/semicolon/editor/run.py` owns strict C23, ASan/UBSan, injected
-allocation-failure recovery and editor-cell/PTY proof; appearance remains yours.
+Italic documentation comments, parameter inlays, diagnostics, completion and
+cross-file semantics are not wired. The live presenter currently maps RGB to the
+terminal palette, not exact truecolor. The host terminal owns its font and
+ligature features; Semicolon sets neither. `python3 tests/semicolon/editor/run.py`
+owns strict C23, ASan/UBSan, injected allocation-failure recovery and
+editor-cell/PTY proof; appearance remains yours.
 
 The tree shows `.gitignore`, `.gitkeep`, and the `.github` directory while
 keeping other dot entries such as `.idea` and `.vscode` hidden. It reads the
