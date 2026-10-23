@@ -16,7 +16,8 @@ switchable tabs; tabs close with their Nerd-font X or middle-click, and clicking
 the source view places the caret. Markdown files
 open in a rendered preview with a source view available. Code view supports
 basic text editing and attempts to save after one idle second; failed saves keep
-the edited buffer available and show an error state.
+the edited buffer available and show an error state. Each document has a bounded
+snapshot history: Ctrl-Z undoes, Ctrl-Y redoes, and Ctrl-C saves then quits.
 
 C23 lexical coloring now consumes Language's conservative `C23Highlights` pass
 through `src/editor/semicolon_syntax.{h,c}`. The initial host policy selects C23
@@ -182,6 +183,10 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 ## Layout
 
 - `src/main/tui-main.c` — current terminal shell and basic editor.
+- Shared terminal widgets (panels, text, tree/list/text/Markdown/code views,
+  input, surface and scroll motion) live in Determinant; this app keeps the tty
+  host, document buffer, tab policy, scene composition, rail filesystem adapter,
+  run console and syntax bridge.
 - `src/editor/semicolon_syntax.{h,c}` — copied C23 lexical snapshot and configurable role-to-pen consumer bridge.
 - `src/tui/tui_example.txt` — the hand-made terminal design and its notes.
 - `semicolon`, `build.py`, `install-command.sh` — launcher, explicit build, and
@@ -192,7 +197,8 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 
 The current shell is an initial file browser and editor, not a complete IDE or
 the finished TUI. The GUI and its Darling integration are not implemented.
-Editing is intentionally basic: there is no selection or undo history. Syntax
+Editing is intentionally basic: undo/redo keeps the last 64 document snapshots,
+and there is still no selection support. Syntax
 coloring is the documented C23 lexical subset, not full semantic highlighting.
 Whole-document refresh is synchronous cold work, not incremental analysis or a
 large-project latency guarantee; malformed/unsupported lexical spans remain plain.
