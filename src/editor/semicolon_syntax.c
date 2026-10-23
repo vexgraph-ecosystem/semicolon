@@ -13,8 +13,9 @@
  * independent lines. Only cold document replacement analyses/allocates. Hot byte
  * projections binary search Language's ordered spans; scroll and caret movement
  * need no new analysis. Palette choices belong here, not inside either R3 owner.
- * Language's function/type/variable/macro and preprocessor-directive distinction
- * is a local lexical heuristic, not parsing, diagnostics or symbol resolution. */
+ * Language's function/type/variable/macro and preprocessor-directive distinction,
+ * including the string-role header path after #include, is a local lexical
+ * heuristic, not parsing, diagnostics or symbol resolution. */
 
 ;;OVERVIEW
 /** ============================================================================
