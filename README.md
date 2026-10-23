@@ -23,9 +23,11 @@ through `src/editor/semicolon_syntax.{h,c}`. The initial host policy selects C23
 for lowercase `.c` and `.h` files, not C++ or Objective-C. Keywords are dark
 green; user types are teal; functions are blue; variables, parameters and members
 are cyan; macros/constants are pale yellow and bold; preprocessor markers and
-directive names such as `#include` and `#define` share that macro pen; strings,
-characters and numbers are light green; regular comments are gray and
-documentation comments are muted green; brackets are bold white. These are
+directive names such as `#include` and `#define` share that macro pen; the header
+path after `#include` uses the string green for both `"..."` and `<...>`, while
+ordinary `<`/`>` operators are not string-colored; strings, characters and numbers are
+light green; regular comments are gray and documentation comments are muted
+green; brackets are bold white. These are
 screenshot-inspired defaults, not an exact imported theme. Function/type/variable/macro roles come from local
 spelling and neighboring-token heuristics, not a parser or symbol resolver, so a
 capitalized variable can read as a type and an all-caps local as a macro. The
