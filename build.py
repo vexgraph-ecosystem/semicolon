@@ -36,7 +36,8 @@ def sources(determinant, vexspoke, engine, language):
                   engine / "nio/mem.c"]
     produced += [ROOT / "src/editor/semicolon_syntax.c"]
     produced += [language / name for name in (
-        "adapters/c/c23_lexer.c", "adapters/c/c23_lex_step.c", "syntax/role.c",
+        "adapters/c/c23_highlights.c", "adapters/c/c23_lexer.c",
+        "adapters/c/c23_lex_step.c", "syntax/role.c",
         "analysis/syntax_span.c", "document/source_range.c", "text/bounded_text.c")]
     return produced
 
