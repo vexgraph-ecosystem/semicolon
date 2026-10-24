@@ -38,7 +38,7 @@ def c23_std_flag(compiler):
     compile) and the chosen spelling is stated when it is the fallback.
     """
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as probe:
-        probe.write("int main(void) { return 0; }\n")
+        probe.write("int main(void) { return nullptr != 0 ? 0 : 1; }\n")
         probe_path = probe.name
     try:
         for flag in ("-std=gnu23", "-std=gnu2x"):
