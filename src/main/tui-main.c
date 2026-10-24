@@ -2177,14 +2177,18 @@ static bool writeAll(int descriptor, const char *bytes, size_t length) {
     return true;
 }
 
+static struct timespec statModified(const struct stat *info) {
+#if defined(__APPLE__)
+    return info->st_mtimespec;
+#else
+    return info->st_mtim;
+#endif
+}
+
 static bool statMatches(const struct stat *left, const struct stat *right) {
     return left->st_dev == right->st_dev && left->st_ino == right->st_ino
         && left->st_size == right->st_size && left->st_mtime == right->st_mtime
-#if defined(__APPLE__)
-        && left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
-#else
-        && left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
-#endif
+        && statModified(left).tv_nsec == statModified(right).tv_nsec;
 }
 
 static bool fileSave(FileText *file, const char *path) {
@@ -2739,7 +2743,7 @@ static void ignorePatternsReload(void) {
     bool exists = stat(path, &info) == 0 && S_ISREG(info.st_mode);
     if ((exists && !gIgnoreFromOpen && gIgnoreStatValid && strcmp(path, gIgnorePath) == 0
          && info.st_mtime == gIgnoreModified.tv_sec
-         && info.st_mtimespec.tv_nsec == gIgnoreModified.tv_nsec)
+         && statModified(&info).tv_nsec == gIgnoreModified.tv_nsec)
         || (!exists && !gIgnoreStatValid && strcmp(path, gIgnorePath) == 0))
         return;
     ignorePatternsClear();
@@ -2748,7 +2752,7 @@ static void ignorePatternsReload(void) {
     gIgnoreStatValid = exists;
     if (!exists)
         return;
-    gIgnoreModified = info.st_mtimespec;
+    gIgnoreModified = statModified(&info);
     gOpenIgnoreHash = 0u;
     FILE *file = fopen(path, "rb");
     if (file == nullptr)
