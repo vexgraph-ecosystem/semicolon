@@ -5413,7 +5413,10 @@ static int runInputProbe(void) {
         THROW("semicolon --input-probe requires a terminal");
         return 1;
     }
-    if (setlocale(LC_CTYPE, "") == nullptr) {
+    if (setlocale(LC_CTYPE, "") == nullptr
+        && setlocale(LC_CTYPE, "UTF-8") == nullptr
+        && setlocale(LC_CTYPE, "en_US.UTF-8") == nullptr
+        && setlocale(LC_CTYPE, "C.UTF-8") == nullptr) {
         THROW("semicolon: cannot select the environment character locale");
         return 1;
     }
@@ -5518,7 +5521,10 @@ static int runTerminal(FileText *file) {
         THROW("semicolon requires terminal stdin and stdout (use --dump for a plain render)");
         return 1;
     }
-    if (setlocale(LC_CTYPE, "") == nullptr) {
+    if (setlocale(LC_CTYPE, "") == nullptr
+        && setlocale(LC_CTYPE, "UTF-8") == nullptr
+        && setlocale(LC_CTYPE, "en_US.UTF-8") == nullptr
+        && setlocale(LC_CTYPE, "C.UTF-8") == nullptr) {
         THROW("semicolon: cannot select the environment character locale");
         return 1;
     }
