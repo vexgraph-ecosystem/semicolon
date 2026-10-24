@@ -5599,9 +5599,8 @@ static int runTerminal(FileText *file) {
     // The project, one level at a time, then the open file revealed down it.
     railBuild(gRailRoot);
     TerminalTreeNodeId opening = railRevealPath(gOpenPath);
-    if (opening != TERMINAL_TREE_NO_NODE) {
+    if (opening != TERMINAL_TREE_NO_NODE)
         (void) TerminalTreeView_setSelected(gRail, opening);
-    }
     bool ok = scene.root != nullptr;
     Interaction interaction = { .input = TerminalInput_0() };
     TerminalSurface surface = TerminalSurface_0();
