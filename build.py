@@ -38,7 +38,7 @@ def c23_std_flag(compiler):
     compile) and the chosen spelling is stated when it is the fallback.
     """
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as probe:
-        probe.write("int main(void) { return nullptr != 0 ? 0 : 1; }\n")
+        probe.write("#include <stddef.h>\nint main(void) { void *p = nullptr; return p != 0; }\n")
         probe_path = probe.name
     try:
         for flag in ("-std=gnu23", "-std=gnu2x"):
@@ -66,7 +66,9 @@ def sources(determinant, vexspoke, engine, language):
     return produced
 
 
-def build(output, compiler="clang"):
+def build(output, compiler=None):
+    if compiler is None:
+        compiler = os.environ.get("CC", "clang")
     determinant = Path(os.environ.get("SEMICOLON_DETERMINANT_SOURCE_DIR",
                                       WORKSPACE / "suite/ecosystem/determinant/src"))
     vexspoke = Path(os.environ.get("SEMICOLON_VEXSPOKE_SOURCE_DIR",
