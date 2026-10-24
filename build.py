@@ -30,6 +30,30 @@ def run(argv, timeout=180):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
+def c23_std_flag(compiler):
+    """Pick the newest C23 spelling this compiler accepts, probing once.
+
+    Apple clang before 16 accepts `-std=gnu2x` but rejects `-std=gnu23`; newer
+    LLVM and GCC accept both. The probe is cold (one trivial syntax-only
+    compile) and the chosen spelling is stated when it is the fallback.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as probe:
+        probe.write("int main(void) { return 0; }\n")
+        probe_path = probe.name
+    try:
+        for flag in ("-std=gnu23", "-std=gnu2x"):
+            result = run([compiler, flag, "-fsyntax-only", probe_path], timeout=60)
+            if result.returncode == 0:
+                if flag != "-std=gnu23":
+                    print(f"semicolon build: compiler rejects -std=gnu23; "
+                          f"using {flag}", file=sys.stderr)
+                return flag
+    finally:
+        Path(probe_path).unlink(missing_ok=True)
+    raise SystemExit("semicolon build: compiler accepts neither -std=gnu23 "
+                     "nor -std=gnu2x")
+
+
 def sources(determinant, vexspoke, engine, language):
     produced = sorted(determinant.glob("terminal/*.c"))
     produced += [vexspoke / "primitive/string.c", vexspoke / "atomic/spin.c",
@@ -54,7 +78,7 @@ def build(output, compiler="clang"):
     entry = ROOT / "src/main/tui-main.c"
     if not entry.is_file():
         raise ValueError(f"missing entry point: {entry}")
-    flags = ["-std=gnu23", "-Wall", "-Wextra", "-Werror", "-O2"]
+    flags = [c23_std_flag(compiler), "-Wall", "-Wextra", "-Werror", "-O2"]
     curses_library = "-lncurses"
     if sys.platform == "darwin":
         flags += ["-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0"]
