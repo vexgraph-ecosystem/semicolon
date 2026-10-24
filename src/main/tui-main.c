@@ -940,7 +940,6 @@ static const char *projectRootName(void) {
 }
 
 static TerminalTreeNodeId gRailRootNode;
-static TerminalTreeNodeId gRailOpenNode;
 static char gOpenPath[1024];
 static FileText *gOpenFile;         // the editor's file, owned by runTerminal
 static Scene *gScene;               // the live scene, or null outside an interactive run
@@ -3155,7 +3154,6 @@ static bool openFile(const char *path, TerminalTreeNodeId node) {
     gActiveTabIndex = target;
     gTabReveal = true;
     (void) snprintf(gOpenPath, sizeof gOpenPath, "%s", path);
-    gRailOpenNode = node;
     if (gRail != nullptr) {
         (void) TerminalTreeView_setSelected(gRail, node);
         (void) TerminalTreeView_reveal(gRail, node);
@@ -5602,7 +5600,6 @@ static int runTerminal(FileText *file) {
     railBuild(gRailRoot);
     TerminalTreeNodeId opening = railRevealPath(gOpenPath);
     if (opening != TERMINAL_TREE_NO_NODE) {
-        gRailOpenNode = opening;
         (void) TerminalTreeView_setSelected(gRail, opening);
     }
     bool ok = scene.root != nullptr;
