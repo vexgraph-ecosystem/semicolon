@@ -1,15 +1,15 @@
 #define _XOPEN_SOURCE_EXTENDED 1
-#include "terminal/terminal_panel.h"
-#include "terminal/terminal_text.h"
-#include "terminal/terminal_anchor.h"
-#include "terminal/terminal_canvas.h"
-#include "terminal/terminal_color.h"
-#include "terminal/terminal_style.h"
-#include "terminal/terminal_surface.h"
-#include "terminal/terminal_tree_view.h"
-#include "terminal/terminal_input.h"
-#include "terminal/terminal_markdown_view.h"
-#include "terminal/terminal_scroll_glide.h"
+#include "ui/panel/terminal_panel.h"
+#include "ui/text/terminal_text.h"
+#include "ui/panel/terminal_anchor.h"
+#include "ui/surface/terminal_canvas.h"
+#include "format/terminal_color.h"
+#include "format/terminal_style.h"
+#include "ui/surface/terminal_surface.h"
+#include "ui/tree/terminal_tree_view.h"
+#include "events/terminal_input.h"
+#include "ui/markdown/terminal_markdown_view.h"
+#include "ui/scroll/terminal_scroll_glide.h"
 #include "editor/semicolon_syntax.h"
 #include "icon/icon_catalog.h"
 #include "exception/throw.h"
@@ -177,7 +177,7 @@ extern char **environ;
  *     pressed, havePointer (gesture state); size_t trackX, trackLeft, grabX,
  *     grabWidth, pointerX, pointerY (gesture origin and last pointer cell).
  *   Scroll motion: borrowed from Determinant's TerminalScrollGlide
- *     (terminal/terminal_scroll_glide.h); this host owns the file bounds.
+ *     (ui/scroll/terminal_scroll_glide.h); this host owns the file bounds.
  *   DirEntry slot record: char name[TUI_RAIL_TEXT] (sorted entry name);
  *     bool folder (directory classification).
  *   ScrollStep slot record: bool keyed (recognized navigation key);

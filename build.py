@@ -55,7 +55,9 @@ def c23_std_flag(compiler):
 
 
 def sources(determinant, vexspoke, engine, language):
-    produced = sorted(determinant.glob("terminal/*.c"))
+    produced = sorted(determinant.glob("ui/*/*.c"))
+    produced += sorted(determinant.glob("events/*.c"))
+    produced += sorted(determinant.glob("format/*.c"))
     produced += [vexspoke / "primitive/string.c", vexspoke / "atomic/spin.c",
                   engine / "nio/mem.c"]
     produced += [ROOT / "src/editor/semicolon_syntax.c"]

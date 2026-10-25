@@ -1,7 +1,7 @@
 #ifndef SEMICOLON_EDITOR_SEMICOLON_SYNTAX_H
 #define SEMICOLON_EDITOR_SEMICOLON_SYNTAX_H
 
-#include "terminal/terminal_canvas.h"
+#include "ui/surface/terminal_canvas.h"
 #include "syntax/role.h"
 
 typedef struct SemicolonSyntax SemicolonSyntax;
