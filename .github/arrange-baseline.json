@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "note": "Ratchet baseline: CI fails only when a file/rule count grows.",
+  "total": 2761,
+  "counts": {
+    "src/editor/semicolon_syntax.c::Semantic Consistency Law (Control flow: header space)": 15,
+    "src/editor/semicolon_syntax.c::Semantic Consistency Law (Control flow: statement separation)": 81,
+    "src/main/tui-main.c::Semantic Consistency Law (Control flow: header space)": 459,
+    "src/main/tui-main.c::Semantic Consistency Law (Control flow: single-statement braces)": 1,
+    "src/main/tui-main.c::Semantic Consistency Law (Control flow: statement separation)": 2205
+  }
+}
