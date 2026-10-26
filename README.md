@@ -107,6 +107,15 @@ accent color. Set `SEMICOLON_ACCENT=#RRGGBB` or pass `--accent #RRGGBB` to
 change the accent; an interactive run saves the chosen color with that project's
 session settings. Nerd Font glyph appearance depends on the terminal font.
 
+A fenced block carries a copy glyph on its first row's right edge. A press copies
+the block's source through the R2 engine's real clipboard bridge (NSPasteboard on
+macOS, the engine stub elsewhere) and the glyph becomes a check until the feedback
+window closes; no OSC 52 escape or extra heap buffer is involved. A link press
+copies the target and says so instead of handing an untrusted URI to a desktop
+opener. Preview headings use a distinct pen per level, callouts render as a
+severity-colored bar with an indented body, and tables honour the delimiter row's
+alignment.
+
 Run `./semicolon icons` for the supported filename icon catalog. It lists the
 mapped extension families, Nerd Font glyphs and their RGB colors using ANSI
 true-color output. The catalog is broad, not universal: unlisted extensions use

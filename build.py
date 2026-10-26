@@ -3,7 +3,9 @@
 
 MODULE: build.py
 REGISTRY: sources(determinant, vexspoke, engine, language) lists the real toolkit,
-consumer bridge, C23 lexical dependencies and borrowed R2 units. run(argv, timeout)
+consumer bridge, C23 lexical dependencies and borrowed R2 units, including the
+engine's platform clipboard seam (NSPasteboard/AppKit on macOS, the in-process
+stub elsewhere). run(argv, timeout)
 executes a bounded compiler child. build(output, compiler) resolves explicit
 dependency roots, compiles those sources, and publishes the binary
 by atomic replacement. No fetch, no installation, no program run, no tty use.
@@ -60,6 +62,10 @@ def sources(determinant, vexspoke, engine, language):
     produced += sorted(determinant.glob("format/*.c"))
     produced += [vexspoke / "primitive/string.c", vexspoke / "atomic/spin.c",
                   engine / "nio/mem.c"]
+    # The real system clipboard is an R2 engine seam: NSPasteboard on macOS, the
+    # in-process stub elsewhere. A preview never reaches the pasteboard itself.
+    produced += [engine / ("io/clipboard_mac.m" if sys.platform == "darwin"
+                          else "io/clipboard_stub.c")]
     produced += [ROOT / "src/editor/semicolon_syntax.c"]
     produced += [language / name for name in (
         "adapters/c/c23_highlights.c", "adapters/c/c23_lexer.c",
@@ -84,8 +90,12 @@ def build(output, compiler=None):
         raise ValueError(f"missing entry point: {entry}")
     flags = [c23_std_flag(compiler), "-Wall", "-Wextra", "-Werror", "-O2"]
     curses_library = "-lncurses"
+    platform_libraries = []
     if sys.platform == "darwin":
         flags += ["-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0"]
+        # The clipboard seam is Objective-C with ARC, and NSPasteboard lives in AppKit.
+        flags += ["-fobjc-arc"]
+        platform_libraries = ["-framework", "AppKit"]
     else:
         # Linux commonly splits the wide-character ABI into ncursesw; Darwin's
         # system ncurses exports the same wide API from -lncurses.
@@ -99,7 +109,7 @@ def build(output, compiler=None):
         argv = [compiler, *flags, "-I", str(ROOT), "-I", str(ROOT / "src"),
                 "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine), "-I", str(language),
                 str(entry), *(str(source) for source in sources(determinant, vexspoke, engine, language)),
-                 curses_library, "-lm", "-o", str(artifact)]
+                 curses_library, *platform_libraries, "-lm", "-o", str(artifact)]
         result = run(argv)
         if result.returncode:
             raise ValueError(result.stderr.strip() or "compile failed")

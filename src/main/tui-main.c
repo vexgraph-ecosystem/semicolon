@@ -10,6 +10,9 @@
 #include "events/terminal_input.h"
 #include "ui/markdown/terminal_markdown_view.h"
 #include "ui/scroll/terminal_scroll_glide.h"
+#include "io/clipboard.h"
+#include "nio/mem.h"
+#include "oop/type.h"
 #include "editor/semicolon_syntax.h"
 #include "icon/icon_catalog.h"
 #include "exception/throw.h"
@@ -170,8 +173,8 @@ extern char **environ;
  *     TerminalMarkdownView *markdown — borrowed-source renderer instance.
  *     bool markdownFile, preview — file kind and active presentation mode.
  *     size_t codeModeWidth, previewModeWidth, markdownModeGap — control geometry.
- *     TerminalMarkdownCodeBlock hoverBlock — shaded block under the pointer.
- *     bool hoverCopy — pointer rests on that block's Copy chip.
+ *     size_t copiedBlock; uint64_t copiedUntilNs — the fence whose check glyph
+ *       is showing, and when that feedback lapses.
  *     char markdownNotice[48]; uint64_t markdownNoticeUntilNs — transient copy notice.
  *   RailEntry slot record: char label[TUI_RAIL_TEXT] (tree-borrowed name);
  *     char path[1024] (opened path); TerminalTreeNodeId parent (tree parent);
@@ -309,13 +312,11 @@ extern char **environ;
  *   static MarkdownContent sceneMarkdownContent(...) the one content rect shared by
  *     render, hover and copy, so the three cannot drift apart
  *   static void sceneMarkdownClearFeedback/ClearNotice/SetNotice(...) transient state
- *   static void sceneMarkdownUpdateHover(...) map a pointer cell to a shaded block
- *     and its top-right Copy chip; Scroll/Resize/mode/open clear it
- *   static bool sceneMarkdownCopyClick(...) recompute hover, then copy its block
- *   static bool sceneMarkdownCopyBlock(...) newline-join a bounded source block and
- *     write OSC 52; an over-cap block refuses with a visible notice
- *   static Base64Text base64Encode(...) owned clipboard text, freed by the caller
- *   static void sceneMarkdownPaintChip/PaintNotice(...) cold overlays on that rect
+ *   static bool sceneMarkdownCellAt(...) map a pointer cell to a DOCUMENT row/cell
+ *   static void sceneMarkdownUpdateHover(...) move the view's link highlight
+ *   static bool sceneMarkdownPress(...) resolve the action, write the REAL clipboard
+ *   static bool sceneMarkdownCopyBlock/CopyLink(...) bounded copy through R2 io
+ *   static void sceneMarkdownPaintNotice(...) cold overlay on the content rect
  *   static void cacheLoad/cacheSave(void)   the project's session, kept outside the tree
  *   static TerminalPanel *buildRail(Scene *, size_t rowCount)
  *   static TerminalPanel *buildEditor(Scene *, size_t)
@@ -413,12 +414,14 @@ extern char **environ;
 #define TUI_MARKDOWN_DIVIDER_OFFSET 1u
 #define TUI_MARKDOWN_CONTENT_OFFSET 3u
 
-// A hovered fenced block grows a Copy chip at its top-right. The source cap keeps the
-// OSC 52 escape bounded: a clipboard write is a cold user action, but a terminal still
-// deserves a sequence it can actually swallow.
-#define TUI_MARKDOWN_COPY_LABEL "[copy]"
+// A fenced block carries a copy glyph on its first row. The clipboard write is the
+// R2 engine's real pasteboard bridge, and the source cap bounds the one engine buffer
+// the projection needs; an over-cap block refuses instead of truncating.
 #define TUI_MARKDOWN_COPY_MAX_BYTES 65536u
+#define TUI_MARKDOWN_LINK_MAX_BYTES 4096u
+#define TUI_MARKDOWN_NO_BLOCK ((size_t) -1)
 #define TUI_MARKDOWN_NOTICE_NS 1500000000ULL
+#define TUI_MARKDOWN_COPIED_NS 1500000000ULL
 #define TUI_RUN_CHIP_CELLS 8u
 #define TUI_CONSOLE_MAX_LINES 10000u
 #define TUI_CONSOLE_LINE_BYTES 2048u
@@ -804,11 +807,11 @@ typedef struct Scene {
     size_t codeModeWidth;
     size_t previewModeWidth;
     size_t markdownModeGap;
-    // The code block under the pointer and whether the pointer rests on its Copy chip.
-    // Both are cleared whenever the content moves, so a chip can never be pressed at a
-    // stale coordinate.
-    TerminalMarkdownCodeBlock hoverBlock;
-    bool hoverCopy;
+    // The fence whose check glyph is showing, and when that feedback lapses. The
+    // view owns the glyph; this is the application's timer, cleared whenever the
+    // content moves so a check can never describe a block the reader scrolled away.
+    size_t copiedBlock;
+    uint64_t copiedUntilNs;
     char markdownNotice[48];
     uint64_t markdownNoticeUntilNs;
 } Scene;
@@ -834,7 +837,7 @@ static void runStop(void);
 static void runPaint(TerminalCanvas *canvas, const Scene *scene, size_t width, size_t height);
 
 // Defined beside the Markdown renderer; declared here because opening a file resets the
-// transient chip and notice before those helpers exist in the translation unit.
+// transient hover, check and notice before those helpers exist in the translation unit.
 static void sceneMarkdownClearFeedback(Scene *scene);
 static void sceneMarkdownSetNotice(Scene *scene, const char *text);
 // Defined beside the scene builders; setSaveStatus reports a refused save through it.
@@ -4407,43 +4410,6 @@ static MarkdownContent sceneMarkdownContent(size_t railWidth, size_t canvasWidth
     return content;
 }
 
-// VALUE RECORD: Base64Text (owned text; the caller releases it with free).
-// The clipboard escape needs the base64 text between its prefix and its terminator, so
-// the text is returned as one owned value rather than written into a caller destination.
-typedef struct Base64Text {
-    char *text;
-    size_t length;
-} Base64Text;
-
-static Base64Text base64Encode(const unsigned char *bytes, size_t length) {
-    static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    Base64Text encoded = {0};
-    if (bytes == nullptr || length == 0u)
-        return encoded;
-    size_t capacity = ((length + 2u) / 3u) * 4u;
-    char *text = malloc(capacity + 1u);
-    if (text == nullptr)
-        return encoded;
-    size_t at = 0u;
-    for (size_t index = 0u; index < length; index += 3u) {
-        size_t remaining = length - index;
-        uint32_t chunk = (uint32_t) bytes[index] << 16;
-        if (remaining > 1u)
-            chunk |= (uint32_t) bytes[index + 1u] << 8;
-        if (remaining > 2u)
-            chunk |= (uint32_t) bytes[index + 2u];
-        text[at++] = alphabet[(chunk >> 18) & 0x3Fu];
-        text[at++] = alphabet[(chunk >> 12) & 0x3Fu];
-        text[at++] = remaining > 1u ? alphabet[(chunk >> 6) & 0x3Fu] : '=';
-        text[at++] = remaining > 2u ? alphabet[chunk & 0x3Fu] : '=';
-    }
-    text[at] = '\0';
-    encoded.text = text;
-    encoded.length = at;
-    return encoded;
-}
-
 static void sceneMarkdownClearNotice(Scene *scene) {
     if (scene == nullptr)
         return;
@@ -4451,11 +4417,21 @@ static void sceneMarkdownClearNotice(Scene *scene) {
     (*scene).markdownNoticeUntilNs = 0u;
 }
 
+static void sceneMarkdownClearCopied(Scene *scene) {
+    if (scene == nullptr)
+        return;
+    if ((*scene).markdown != nullptr && (*scene).copiedBlock != TUI_MARKDOWN_NO_BLOCK)
+        (void) TerminalMarkdownView_setCopied((*scene).markdown, (*scene).copiedBlock, false);
+    (*scene).copiedBlock = TUI_MARKDOWN_NO_BLOCK;
+    (*scene).copiedUntilNs = 0u;
+}
+
 static void sceneMarkdownClearFeedback(Scene *scene) {
     if (scene == nullptr)
         return;
-    (*scene).hoverBlock = (TerminalMarkdownCodeBlock) {0};
-    (*scene).hoverCopy = false;
+    sceneMarkdownClearCopied(scene);
+    if ((*scene).markdown != nullptr)
+        TerminalMarkdownView_clearHover((*scene).markdown);
     sceneMarkdownClearNotice(scene);
 }
 
@@ -4466,141 +4442,134 @@ static void sceneMarkdownSetNotice(Scene *scene, const char *text) {
     (*scene).markdownNoticeUntilNs = monotonicNowNs() + TUI_MARKDOWN_NOTICE_NS;
 }
 
-// Map a pointer cell onto the shaded code block under it and, when it rests on that
-// block's first visible row's rightmost cells, onto the Copy chip. The hover is
-// recomputed from the same content rectangle the renderer paints, so scrolling, a rail
-// drag, a resize or a mode switch invalidates it instead of leaving a stale coordinate.
-static void sceneMarkdownUpdateHover(Scene *scene, size_t pointerX, size_t pointerY,
-                                     size_t canvasWidth, size_t canvasHeight) {
-    if (scene == nullptr)
-        return;
-    (*scene).hoverBlock = (TerminalMarkdownCodeBlock) {0};
-    (*scene).hoverCopy = false;
-    if (!(*scene).markdownFile || !(*scene).preview || (*scene).markdown == nullptr)
-        return;
+// Translate a pointer cell into the DOCUMENT row/cell the view indexes. Both the hover
+// and the press resolve through the same content rectangle the renderer paints, so a
+// rail drag, a resize, a scroll or a mode switch cannot leave a stale coordinate.
+static bool sceneMarkdownCellAt(Scene *scene, size_t pointerX, size_t pointerY,
+                                size_t canvasWidth, size_t canvasHeight,
+                                size_t *row, size_t *column) {
+    if (scene == nullptr || (*scene).markdown == nullptr
+        || !(*scene).markdownFile || !(*scene).preview)
+        return false;
     MarkdownContent content = sceneMarkdownContent((*scene).railWidth, canvasWidth, canvasHeight);
     if (content.width == 0u || content.height == 0u)
-        return;
+        return false;
     if (pointerX < content.x || pointerX >= content.x + content.width
         || pointerY < content.y || pointerY >= content.y + content.height)
-        return;
-    size_t scroll = TerminalMarkdownView_getScroll((*scene).markdown);
-    TerminalMarkdownCodeBlock block =
-        TerminalMarkdownView_codeBlockAt((*scene).markdown, scroll + (pointerY - content.y));
-    if (!block.valid)
-        return;
-    (*scene).hoverBlock = block;
-    size_t labelLength = strlen(TUI_MARKDOWN_COPY_LABEL);
-    if (content.width < labelLength)
-        return;
-    size_t firstVisible = block.firstRow > scroll ? block.firstRow - scroll : 0u;
-    size_t chipRow = content.y + firstVisible;
-    size_t chipStart = content.x + content.width - labelLength;
-    (*scene).hoverCopy = pointerY == chipRow && pointerX >= chipStart
-                      && pointerX < content.x + content.width;
+        return false;
+    if (row != nullptr)
+        *row = TerminalMarkdownView_getScroll((*scene).markdown) + (pointerY - content.y);
+    if (column != nullptr)
+        *column = pointerX - content.x;
+    return true;
 }
 
-// Copy the hovered block as one newline-terminated source text, capped before any
-// allocation or escape is written. A refusal is a visible notice, never a truncated
-// clipboard or an unbounded OSC 52 sequence.
-static bool sceneMarkdownCopyBlock(Scene *scene, TerminalMarkdownCodeBlock block) {
-    if (scene == nullptr || (*scene).markdown == nullptr || !block.valid)
-        return false;
-    size_t total = 0u;
-    for (size_t line = 0u; line < block.sourceLineCount; ++line) {
-        TerminalMarkdownCodeLine row =
-            TerminalMarkdownView_codeBlockLine((*scene).markdown, block, line);
-        if (!row.valid) {
-            sceneMarkdownSetNotice(scene, "Code block changed; copy cancelled");
-            return false;
-        }
-        if (total > TUI_MARKDOWN_COPY_MAX_BYTES
-            || row.length + 1u > TUI_MARKDOWN_COPY_MAX_BYTES - total) {
-            sceneMarkdownSetNotice(scene, "Code block too large to copy");
-            return false;
-        }
-        total += row.length + 1u;
+// The view owns the link-highlight state; the application only says where the pointer
+// is. Leaving the content rect clears it, which is what keeps a highlight from
+// surviving a rail drag or a mode switch.
+static void sceneMarkdownUpdateHover(Scene *scene, size_t pointerX, size_t pointerY,
+                                     size_t canvasWidth, size_t canvasHeight) {
+    if (scene == nullptr || (*scene).markdown == nullptr)
+        return;
+    size_t row = 0u;
+    size_t column = 0u;
+    if (!sceneMarkdownCellAt(scene, pointerX, pointerY, canvasWidth, canvasHeight,
+                             &row, &column)) {
+        TerminalMarkdownView_clearHover((*scene).markdown);
+        return;
     }
-    if (total == 0u) {
-        sceneMarkdownSetNotice(scene, "Code block is empty");
+    (void) TerminalMarkdownView_setHover((*scene).markdown, row, column);
+}
+
+// Copy a fence through the REAL clipboard. The view projects the newline-separated
+// source into ONE engine block, the R2 io seam writes it to the pasteboard, and the view
+// paints the check for that same block until the feedback window closes. No OSC 52, no
+// base64 and no second heap; an over-cap block refuses instead of truncating.
+static bool sceneMarkdownCopyBlock(Scene *scene, size_t block) {
+    if (scene == nullptr || (*scene).markdown == nullptr)
         return false;
-    }
-    char *joined = malloc(total);
-    if (joined == nullptr) {
+    char *text = Memory_alloc(TYPE_BYTE_ARRAY, TUI_MARKDOWN_COPY_MAX_BYTES);
+    if (text == nullptr) {
         sceneMarkdownSetNotice(scene, "Copy failed: no memory");
         return false;
     }
-    size_t at = 0u;
-    for (size_t line = 0u; line < block.sourceLineCount; ++line) {
-        TerminalMarkdownCodeLine row =
-            TerminalMarkdownView_codeBlockLine((*scene).markdown, block, line);
-        if (!row.valid) {
-            free(joined);
-            sceneMarkdownSetNotice(scene, "Code block changed; copy cancelled");
-            return false;
-        }
-        memcpy(joined + at, row.text, row.length);
-        at += row.length;
-        joined[at++] = '\n';
-    }
-    Base64Text encoded = base64Encode((const unsigned char*) joined, total);
-    free(joined);
-    if (encoded.text == nullptr) {
-        sceneMarkdownSetNotice(scene, "Copy failed: no memory");
+    size_t written = 0u;
+    bool projected = TerminalMarkdownView_copyBlock((*scene).markdown, block, text,
+                                                    TUI_MARKDOWN_COPY_MAX_BYTES, &written);
+    if (!projected || written == 0u) {
+        Memory_free(text);
+        sceneMarkdownSetNotice(scene, projected ? "Code block is empty"
+                                                : "Code block too large to copy");
         return false;
     }
-    bool written = writeAll(STDOUT_FILENO, "\x1b]52;c;", 7u)
-                && writeAll(STDOUT_FILENO, encoded.text, encoded.length)
-                && writeAll(STDOUT_FILENO, "\x07", 1u);
-    free(encoded.text);
-    if (!written) {
+    bool stored = Clipboard_setText(text);
+    Memory_free(text);
+    if (!stored) {
         sceneMarkdownSetNotice(scene, "Copy failed: clipboard write");
         return false;
     }
+    sceneMarkdownClearCopied(scene);
+    (void) TerminalMarkdownView_setCopied((*scene).markdown, block, true);
+    (*scene).copiedBlock = block;
+    (*scene).copiedUntilNs = monotonicNowNs() + TUI_MARKDOWN_COPIED_NS;
     sceneMarkdownSetNotice(scene, "Copied to clipboard");
     return true;
 }
 
-// Recompute the hover from the press coordinates, then copy only when the press landed
-// on the Copy chip. True means the press was a Markdown interaction even when the copy
-// itself refused, so the click cannot fall through and start a divider drag.
-static bool sceneMarkdownCopyClick(Scene *scene, size_t pointerX, size_t pointerY,
-                                   size_t canvasWidth, size_t canvasHeight) {
-    sceneMarkdownUpdateHover(scene, pointerX, pointerY, canvasWidth, canvasHeight);
-    if (scene == nullptr)
+// A preview can describe untrusted text, so a link press copies its target and says so
+// rather than handing an arbitrary URI to a desktop opener. Control bytes are refused;
+// the pasteboard ABI needs a NUL-terminated copy, which the engine allocator owns.
+static bool sceneMarkdownCopyLink(Scene *scene, TerminalMarkdownAction action) {
+    if (scene == nullptr || action.target == nullptr || action.targetLength == 0u
+        || action.targetLength >= TUI_MARKDOWN_LINK_MAX_BYTES)
         return false;
-    TerminalMarkdownCodeBlock hoverBlock = (*scene).hoverBlock;
-    if (!(*scene).hoverCopy || !hoverBlock.valid)
+    for (size_t index = 0u; index < action.targetLength; ++index)
+        if ((unsigned char) action.target[index] < 0x20u)
+            return false;
+    char *target = Memory_alloc(TYPE_BYTE_ARRAY, action.targetLength + 1u);
+    if (target == nullptr) {
+        sceneMarkdownSetNotice(scene, "Copy failed: no memory");
         return false;
-    (void) sceneMarkdownCopyBlock(scene, hoverBlock);
-    return true;
+    }
+    memcpy(target, action.target, action.targetLength);
+    target[action.targetLength] = '\0';
+    bool stored = Clipboard_setText(target);
+    Memory_free(target);
+    sceneMarkdownSetNotice(scene, stored ? "Link copied to clipboard"
+                                         : "Copy failed: clipboard write");
+    return stored;
+}
+
+// Resolve a press against the view's action table. True means the press was a Markdown
+// interaction even when the action refused, so it cannot fall through and start a divider
+// drag. The view retains no handler: this tier performs the clipboard write.
+static bool sceneMarkdownPress(Scene *scene, size_t pointerX, size_t pointerY,
+                               size_t canvasWidth, size_t canvasHeight) {
+    if (scene == nullptr || (*scene).markdown == nullptr)
+        return false;
+    size_t row = 0u;
+    size_t column = 0u;
+    if (!sceneMarkdownCellAt(scene, pointerX, pointerY, canvasWidth, canvasHeight,
+                             &row, &column))
+        return false;
+    TerminalMarkdownAction action =
+        TerminalMarkdownView_actionAt((*scene).markdown, row, column);
+    switch (action.kind) {
+        case TERMINAL_MARKDOWN_ACTION_COPY_CODE:
+            (void) sceneMarkdownCopyBlock(scene, action.block);
+            return true;
+        case TERMINAL_MARKDOWN_ACTION_LINK:
+            (void) sceneMarkdownCopyLink(scene, action);
+            return true;
+        case TERMINAL_MARKDOWN_ACTION_NONE:
+        default:
+            return false;
+    }
 }
 
 static TerminalPen sceneMarkdownOverlayPen(void) {
     return TerminalPen_3(TERMINAL_STYLE_BOLD, TERMINAL_RGB(0x1A, 0x1A, 0x1A),
                          TERMINAL_RGB(0xE6, 0xE6, 0xE6));
-}
-
-// The chip rides the rightmost cells of the block's first visible row. It is painted
-// after the document, so the shaded band never hides it.
-static void sceneMarkdownPaintChip(Scene *scene, TerminalCanvas *content) {
-    if (scene == nullptr || content == nullptr)
-        return;
-    TerminalMarkdownCodeBlock hoverBlock = (*scene).hoverBlock;
-    if (!hoverBlock.valid)
-        return;
-    size_t width = TerminalCanvas_getWidth(content);
-    size_t height = TerminalCanvas_getHeight(content);
-    size_t labelLength = strlen(TUI_MARKDOWN_COPY_LABEL);
-    if (width < labelLength || height == 0u)
-        return;
-    size_t scroll = TerminalMarkdownView_getScroll((*scene).markdown);
-    size_t firstVisible = hoverBlock.firstRow > scroll
-                        ? hoverBlock.firstRow - scroll : 0u;
-    if (firstVisible >= height)
-        return;
-    TerminalCanvas_text(content, width - labelLength, firstVisible, TUI_MARKDOWN_COPY_LABEL,
-                        labelLength, sceneMarkdownOverlayPen());
 }
 
 // The notice sits on the content rectangle's bottom-right cell. A dynamic notice that
@@ -4635,7 +4604,6 @@ static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t rai
                                                TerminalCanvas_getHeight(&content));
     TerminalCanvas_fill(&content, ' ', TerminalPen());
     TerminalMarkdownView_render((*scene).markdown, &content);
-    sceneMarkdownPaintChip(scene, &content);
     sceneMarkdownPaintNotice(scene, &content);
 }
 
@@ -5703,12 +5671,14 @@ static int runTerminal(FileText *file) {
             if (waitMs < 1)
                 waitMs = 1;
         }
-        // A live copy notice is the only other timed paint: wake exactly when it must
-        // disappear instead of spinning or lingering until the next input event.
-        if (scene.markdownNotice[0] != '\0') {
+        // A live copy notice or check glyph is the only other timed paint: wake exactly
+        // when it must disappear instead of spinning or lingering until the next input.
+        uint64_t feedbackUntil = scene.markdownNoticeUntilNs;
+        if (scene.copiedBlock != TUI_MARKDOWN_NO_BLOCK && scene.copiedUntilNs > feedbackUntil)
+            feedbackUntil = scene.copiedUntilNs;
+        if (feedbackUntil != 0u) {
             uint64_t now = monotonicNowNs();
-            uint64_t remaining = now < scene.markdownNoticeUntilNs
-                               ? scene.markdownNoticeUntilNs - now : 0u;
+            uint64_t remaining = now < feedbackUntil ? feedbackUntil - now : 0u;
             int deadlineMs = (int) ((remaining + 999999u) / 1000000u);
             if (deadlineMs < waitMs)
                 waitMs = deadlineMs;
@@ -5938,12 +5908,12 @@ static int runTerminal(FileText *file) {
                             break;
                         if (gRunSelected)
                             break;
-                        // A press on a fenced block's Copy chip is handled before the
-                        // divider and tracking-line targets; content rows never overlap
-                        // those, and a refused copy still consumes the click.
+                        // A press on a link or a fence's copy glyph is handled before
+                        // the divider and tracking-line targets; content rows never
+                        // overlap those, and a refused action still consumes the click.
                         if (scene.markdownFile && scene.preview
-                            && sceneMarkdownCopyClick(&scene, event.x, event.y,
-                                                      (size_t) width, (size_t) height))
+                            && sceneMarkdownPress(&scene, event.x, event.y,
+                                                  (size_t) width, (size_t) height))
                             break;
                         // Markdown mode controls share the second row.
                         if (scene.markdownFile
@@ -6143,11 +6113,14 @@ static int runTerminal(FileText *file) {
             key = handled < TUI_EVENTS_PER_FRAME ? getch() : ERR;
         }
 
-        // A notice is feedback, not retained state: once its window closes it is gone
-        // before the frame paints, so no later present can resurrect it.
+        // A notice or a check glyph is feedback, not retained state: once its window
+        // closes it is gone before the frame paints, so no later present resurrects it.
         if (scene.markdownNotice[0] != '\0'
             && monotonicNowNs() >= scene.markdownNoticeUntilNs)
             sceneMarkdownClearNotice(&scene);
+        if (scene.copiedBlock != TUI_MARKDOWN_NO_BLOCK
+            && monotonicNowNs() >= scene.copiedUntilNs)
+            sceneMarkdownClearCopied(&scene);
 
         runPoll();
         TerminalCanvas back = TerminalCanvas(gCells, gStyles, gFg, gBg, (size_t) width, (size_t) height);
