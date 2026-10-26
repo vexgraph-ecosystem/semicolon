@@ -101,11 +101,14 @@ extern char **environ;
  *   gLineChip[16]                   the status bar's line-position text buffer.
  *   gSaveLabel[16]                  saved/dirty/error status text.
  *   gPairs[]                        registered ncurses colour pairs.
- *   gRailLocation[PATH_MAX + 2] — canonical project location, HOME abbreviated
- *     only on a complete path-component match; painted gray beside the pinned root.
- *   gConsoleLines[10000][2048], gConsoleLengths[10000] — bounded line ring;
- *     head/count/top/follow track retained and viewed output independently of
- *     editor scroll, omitted/clipped counts make both limits observable.
+ *   gRailLocation[PATH_MAX + 2] —   canonical project location, HOME abbreviated
+ *                                   only on a complete path-component match; painted gray beside the pinned root.
+ *   gConsoleLines[10000][2048],
+ *   gConsoleLengths[10000]        — bounded line ring;
+ *                                   head/count/top/follow track retained
+ *                                   and viewed output independently of
+ *                                   editor scroll, omitted/clipped counts make both
+ *                                   limits observable.
  *   gRunPid/gRunOutputFd — supervised child and nonblocking pipe; a finished
  *     child may still have pipe bytes to drain before the console is retired.
  *   gRunStatus/gRunOutcome — bounded, retained waitpid result for the tab and
@@ -490,11 +493,11 @@ static const char *gDeviceBgSource = "the built-in fallback";
 
 static volatile sig_atomic_t gQuit;
 static uint32_t gCells[TUI_MAX_W * TUI_MAX_H];
-static uint8_t gStyles[TUI_MAX_W * TUI_MAX_H];
+static uint16_t gStyles[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFg[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gBg[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontCells[TUI_MAX_W * TUI_MAX_H];
-static uint8_t gFrontStyles[TUI_MAX_W * TUI_MAX_H];
+static uint16_t gFrontStyles[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontFg[TUI_MAX_W * TUI_MAX_H];
 static uint32_t gFrontBg[TUI_MAX_W * TUI_MAX_H];
 static char gGutter[TUI_MAX_ROWS][16];
@@ -4802,7 +4805,7 @@ static short pairFor(uint32_t fg, uint32_t bg) {
     return pair;
 }
 
-static attr_t attrsFor(uint8_t style) {
+static attr_t attrsFor(uint16_t style) {
     attr_t attrs = A_NORMAL;
     if (style & TERMINAL_STYLE_BOLD)
         attrs |= A_BOLD;
@@ -4810,6 +4813,8 @@ static attr_t attrsFor(uint8_t style) {
         attrs |= A_DIM;
     if (style & TERMINAL_STYLE_UNDERLINE)
         attrs |= A_UNDERLINE;
+    if (style & TERMINAL_STYLE_ITALIC)
+        attrs |= A_ITALIC;
     if (style & TERMINAL_STYLE_REVERSE)
         attrs |= A_REVERSE;
     return attrs;
@@ -4824,7 +4829,7 @@ static bool blitRun(void *context, TerminalRun run) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
         if (glyph == 0)
             continue;                                  // wide glyph continuation
-        uint8_t style = run.styles != nullptr ? run.styles[i] : 0;
+        uint16_t style = run.styles != nullptr ? run.styles[i] : 0;
         uint32_t fg = run.fg != nullptr ? run.fg[i] : TERMINAL_COLOR_DEFAULT;
         uint32_t bg = run.bg != nullptr ? run.bg[i] : TERMINAL_COLOR_DEFAULT;
         attr_t attrs = attrsFor(style);
