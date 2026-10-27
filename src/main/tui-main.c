@@ -5014,15 +5014,17 @@ static void presenterEnter(void) {
     gOutLength = 0u;
     gOutFailed = false;
     presenterForget();
-    // `CSI r` releases any scroll region the terminal was left with (ncurses sets one
-    // at init): the host addresses every cell absolutely, so a margin can only turn a
-    // future scroll into a wrong one.
+    // `CSI r` releases any scroll region the device was left with (a previous
+    // program, or a terminal that never restored one): the host addresses every cell
+    // absolutely, so a margin can only turn a future scroll into a wrong one.
     presenterText("\033[?1049h\033[?7l\033[?25l\033[H\033[2J\033[r");
     presenterFlush();
 }
 
 static void presenterLeave(void) {
-    presenterText("\033[?7h\033[?25h\033[?1049l");
+    // The pen is reset before the screen is handed back, so a host without an
+    // alternate screen does not leave the user's shell in our last colour.
+    presenterText("\033[0m\033[?7h\033[?25h\033[?1049l");
     presenterFlush();
     presenterForget();
     (void) fflush(stdout);
@@ -5755,9 +5757,18 @@ static int runTerminal(FileText *file) {
     // touched, which is the one situation where getch would paint a screen we own.
     (void) signal(SIGWINCH, SIG_IGN);
 
-    int height = 0;
-    int width = 0;
-    getmaxyx(stdscr, height, width);
+    // The grid size is the tty's, read directly: ncurses caches a size it only
+    // refreshes on its own resize path, and this host decides its geometry itself.
+    struct winsize startSize;
+    int rawRows = 24;
+    int rawColumns = 80;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &startSize) == 0 && startSize.ws_row > 0
+        && startSize.ws_col > 0) {
+        rawRows = (int) startSize.ws_row;
+        rawColumns = (int) startSize.ws_col;
+    }
+    int height = rawRows;
+    int width = rawColumns;
     if (width > TUI_MAX_W)
         width = TUI_MAX_W;
     if (height > TUI_MAX_H)
@@ -5788,8 +5799,10 @@ static int runTerminal(FileText *file) {
     TerminalSurface surface = TerminalSurface_0();
     ok = ok && TerminalSurface_setFrame(&surface, frameBracket, nullptr);
     TerminalScrollGlide glide = TerminalScrollGlide();
-    int knownRows = height;
-    int knownColumns = width;
+    // The UNCLAMPED tty size, so a terminal wider than the grid does not look like a
+    // resize on every single pass.
+    int knownRows = rawRows;
+    int knownColumns = rawColumns;
     if (!ok)
         THROW("semicolon: scene construction failed");
 
