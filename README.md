@@ -200,7 +200,7 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 - `src/tui/tui_example.txt` — the hand-made terminal design and its notes.
 - `semicolon`, `build.py`, `install-command.sh` — launcher, explicit build, and
   optional per-user `semicolon`/`smc` command links.
-- Shared tests are in `../../tests/semicolon/`.
+- Shared tests are in `../../../tests/semicolon/`.
 
 ## Scope and Limitations
 

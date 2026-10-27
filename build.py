@@ -19,6 +19,8 @@ existing output and reclaims its own temporary directory.
 """
 import argparse
 import os
+import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -39,12 +41,13 @@ def c23_std_flag(compiler):
     LLVM and GCC accept both. The probe is cold (one trivial syntax-only
     compile) and the chosen spelling is stated when it is the fallback.
     """
+    compiler_cmd = shlex.split(compiler) if isinstance(compiler, str) else list(compiler)
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as probe:
         probe.write("#include <stddef.h>\nint main(void) { void *p = nullptr; return p != 0; }\n")
         probe_path = probe.name
     try:
         for flag in ("-std=gnu23", "-std=gnu2x"):
-            result = run([compiler, flag, "-fsyntax-only", probe_path], timeout=60)
+            result = run([*compiler_cmd, flag, "-fsyntax-only", probe_path], timeout=60)
             if result.returncode == 0:
                 if flag != "-std=gnu23":
                     print(f"semicolon build: compiler rejects -std=gnu23; "
@@ -88,28 +91,37 @@ def build(output, compiler=None):
     entry = ROOT / "src/main/tui-main.c"
     if not entry.is_file():
         raise ValueError(f"missing entry point: {entry}")
+    compiler_cmd = shlex.split(compiler) if isinstance(compiler, str) else list(compiler)
     flags = [c23_std_flag(compiler), "-Wall", "-Wextra", "-Werror", "-O2"]
-    curses_library = "-lncurses"
+    curses_libraries = ["-lncurses"]
     platform_libraries = []
     if sys.platform == "darwin":
-        flags += ["-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0"]
+        has_arch = any(arg in ("-arch", "-target") or arg.startswith(("--target=", "-target=")) for arg in compiler_cmd)
+        if not has_arch:
+            if platform.machine() == "arm64":
+                flags += ["-arch", "arm64", "-mcpu=apple-m1", "-mmacosx-version-min=14.0"]
+            else:
+                flags += ["-arch", "x86_64", "-mmacosx-version-min=13.0"]
         # The clipboard seam is Objective-C with ARC, and NSPasteboard lives in AppKit.
         flags += ["-fobjc-arc"]
         platform_libraries = ["-framework", "AppKit"]
+    elif sys.platform == "win32":
+        curses_libraries = []
+        platform_libraries = ["-luser32", "-lkernel32"]
     else:
         # Linux commonly splits the wide-character ABI into ncursesw; Darwin's
         # system ncurses exports the same wide API from -lncurses.
-        curses_library = "-lncursesw"
+        curses_libraries = ["-lncursesw"]
     output = Path(output).absolute()
     if output.is_symlink() or output.is_dir():
         raise ValueError("invalid build output")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".semicolon-build-", dir=output.parent) as temp:
-        artifact = Path(temp) / "semicolon-tui"
-        argv = [compiler, *flags, "-I", str(ROOT), "-I", str(ROOT / "src"),
+        artifact = Path(temp) / ("semicolon-tui.exe" if sys.platform == "win32" else "semicolon-tui")
+        argv = [*compiler_cmd, *flags, "-I", str(ROOT), "-I", str(ROOT / "src"),
                 "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine), "-I", str(language),
                 str(entry), *(str(source) for source in sources(determinant, vexspoke, engine, language)),
-                 curses_library, *platform_libraries, "-lm", "-o", str(artifact)]
+                *curses_libraries, *platform_libraries, "-lm", "-o", str(artifact)]
         result = run(argv)
         if result.returncode:
             raise ValueError(result.stderr.strip() or "compile failed")
