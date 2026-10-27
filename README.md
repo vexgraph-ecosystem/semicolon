@@ -191,7 +191,12 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 
 ## Layout
 
-- `src/main/tui-main.c` — current terminal shell and basic editor.
+- `src/main/tui-main.c` — current terminal shell and basic editor. It composes
+  the whole cell grid through Determinant's surface, then writes only the cells
+  that changed, itself, as absolutely addressed ANSI inside one synchronized
+  output transaction. ncurses supplies the keyboard decoder and termios only, so
+  the terminal is never asked to reinterpret a frame as scroll, repeat or erase
+  hints.
 - Shared terminal widgets (panels, text, tree/list/text/Markdown/code views,
   input, surface and scroll motion) live in Determinant; this app keeps the tty
   host, document buffer, tab policy, scene composition, rail filesystem adapter,
@@ -225,4 +230,6 @@ CommonMark implementation.
 Saving uses staged replacement and ordinary file-conflict checks. It is not a
 crash-durable journal or a hostile-writer sandbox. A failed save preserves edits
 while the process remains alive; there is no recovery journal after termination.
-The only platform with current executed shell evidence is macOS arm64.
+The only platform with current executed shell evidence is macOS arm64. Interactive
+rendering is proven under a scripted pty; physical-terminal appearance and the
+Ghostty window itself remain the user's visual check.

@@ -103,7 +103,8 @@ extern char **environ;
  *   gGutter[TUI_MAX_ROWS][16]       per-row line-number text buffers.
  *   gLineChip[16]                   the status bar's line-position text buffer.
  *   gSaveLabel[16]                  saved/dirty/error status text.
- *   gPairs[]                        registered ncurses colour pairs.
+ *   gOut/gOutLength/gOutFailed       the frame byte buffer (one synchronized write).
+ *   gCursorColumn/gCursorRow/gPen    the device's tracked cursor and pen.
  *   gRailLocation[PATH_MAX + 2] —   canonical project location, HOME abbreviated
  *                                   only on a complete path-component match; painted gray beside the pinned root.
  *   gConsoleLines[10000][2048],
@@ -336,13 +337,17 @@ extern char **environ;
  *   static void resolveDeviceBackground(void)   what a fade fades TO
  *   static bool queryDeviceBackground(uint32_t *) / parseDeviceBackground
  *   static bool parsePackedHex(const char *, uint32_t *)
- *   static short colorIndex(uint32_t) / pairFor(fg, bg) / attrsFor(style)
- *   static bool blitRun(void *, TerminalRun)   wide-character ncurses output
+ *   static short colorIndex(uint32_t)   packed colour -> 256-cube/basic index
+ *   static void presenterEnter/Leave/Forget/InvalidateFront(void)
+ *     the host's cold device transaction and the front-mirror invalidation
+ *   static void presenterMessage(const char *)  one plain line on a blank grid
+ *   static bool blitRun(void *, TerminalRun)   absolute ANSI: CUP + SGR + UTF-8
  *   static void drawChrome(canvas, width, height, railWidth, markdownPreview,
  *     dividerHovered)  paint the single-column preview seam or the code-mode grip
  *   static void handlePointer(Scene *, Interaction *, int width, int height)
  *   static int dumpFrame(int, int, FileText *)
  *   static void frameBracket(void *, TerminalPresentPhase)  the frame transaction
+ *     (synchronized output + one buffered write, no ncurses refresh)
  *   static int runInputProbe(void)   DEBUG: print what the terminal sends
  *   static int runBackgroundProbe(void)   DEBUG: what is this terminal's background?
  *   static int runTerminal(FileText *)
@@ -350,8 +355,9 @@ extern char **environ;
  *   int main(int, char **)   --help / --dump [WxH] / --file PATH / interactive.
  * Contracts:
  *   The interactive path REQUIRES a tty on stdin and stdout and refuses before
- *   ncurses otherwise. It selects the environment's LC_CTYPE before newterm and
- *   sends canvas cells through ncurses' wide-character API. Raw mode keeps Ctrl-Z
+ *   ncurses otherwise. It selects the environment's LC_CTYPE before newterm, uses
+ *   ncurses for the keyboard and termios only, and writes canvas cells itself as
+ *   absolutely addressed ANSI inside one synchronized-output transaction. Raw mode keeps Ctrl-Z
  *   available to the editor as byte 26, so Ctrl-C is read explicitly as byte 3;
  *   a real SIGINT/SIGTERM still requests the same ordinary save-then-exit. Ctrl-C
  *   is the ONLY quit key - a letter key must not quit,
@@ -4355,8 +4361,10 @@ static bool sceneSetMarkdownMode(Scene *scene, bool preview) {
     (void) TerminalText_setForegroundColor((*scene).previewMode, preview ? COL_ACCENT : COL_MUTED);
     (void) TerminalText_setBackgroundColor((*scene).codeMode, preview ? TERMINAL_COLOR_DEFAULT : COL_SELECT);
     (void) TerminalText_setBackgroundColor((*scene).previewMode, preview ? COL_SELECT : TERMINAL_COLOR_DEFAULT);
-    if (preview)
+    if (preview) {
         (void) TerminalMarkdownView_setScroll((*scene).markdown, 0);
+        (void) TerminalMarkdownView_setScrollX((*scene).markdown, 0);
+    }
     sceneMarkdownClearFeedback(scene);
     return true;
 }
@@ -4444,7 +4452,9 @@ static void sceneMarkdownSetNotice(Scene *scene, const char *text) {
 
 // Translate a pointer cell into the DOCUMENT row/cell the view indexes. Both the hover
 // and the press resolve through the same content rectangle the renderer paints, so a
-// rail drag, a resize, a scroll or a mode switch cannot leave a stale coordinate.
+// rail drag, a resize, a scroll or a mode switch cannot leave a stale coordinate. A
+// table row carries its own horizontal pan; prose rows report zero, matching what the
+// renderer actually drew under the pointer.
 static bool sceneMarkdownCellAt(Scene *scene, size_t pointerX, size_t pointerY,
                                 size_t canvasWidth, size_t canvasHeight,
                                 size_t *row, size_t *column) {
@@ -4457,10 +4467,13 @@ static bool sceneMarkdownCellAt(Scene *scene, size_t pointerX, size_t pointerY,
     if (pointerX < content.x || pointerX >= content.x + content.width
         || pointerY < content.y || pointerY >= content.y + content.height)
         return false;
+    size_t documentRow = TerminalMarkdownView_getScroll((*scene).markdown)
+                       + (pointerY - content.y);
     if (row != nullptr)
-        *row = TerminalMarkdownView_getScroll((*scene).markdown) + (pointerY - content.y);
+        *row = documentRow;
     if (column != nullptr)
-        *column = pointerX - content.x;
+        *column = TerminalMarkdownView_rowScrollX((*scene).markdown, documentRow)
+                + (pointerX - content.x);
     return true;
 }
 
@@ -4607,17 +4620,23 @@ static void sceneRenderMarkdown(Scene *scene, TerminalCanvas *canvas, size_t rai
     sceneMarkdownPaintNotice(scene, &content);
 }
 
-// ---------------------------------------------------------------- ncurses side
-
-#define TUI_PAIR_MAX 96
-typedef struct TermPair {
-    uint32_t fg;
-    uint32_t bg;
-    short pair;
-} TermPair;
-static TermPair gPairs[TUI_PAIR_MAX];
-static size_t gPairCount;
-
+// ---------------------------------------------------------------- the presenter
+//
+// The host paints its OWN grid. A TerminalSurface hands over only the cells that
+// differ from the last frame, and this writer turns them into absolutely addressed
+// ANSI: a cursor position, one pen change, then the glyphs of that run. Nothing
+// here asks ncurses to interpret a frame, which is the whole point - ncurses may
+// express a one-row shift as DECSTBM plus `rin`, repeat `─` runs with `rep`, erase
+// with `ech`, or insert/delete lines, and a terminal that advertises one of those
+// and then handles it differently leaves the physical screen disagreeing with the
+// grid. The app composed the cells; the app writes them. The device decides
+// nothing.
+//
+// This is deferred rendering in the only form a cell terminal allows: the frame is
+// composed into the grid first, the diff against the last paint is collected
+// second, and the bytes are written once, inside a synchronized-output bracket,
+// third. A run is usually a whole row on a repaint, so a row costs one cursor move
+// and its glyphs instead of a per-cell ncurses call.
 static int hexDigitValue(char c) {
     if (c >= '0' && c <= '9')
         return c - '0';
@@ -4758,49 +4777,176 @@ static short colorIndex(uint32_t color) {
     return COLOR_WHITE;
 }
 
-static short pairFor(uint32_t fg, uint32_t bg) {
-    for (size_t i = 0; i < gPairCount; ++i)
-        if (gPairs[i].fg == fg && gPairs[i].bg == bg)
-            return gPairs[i].pair;
-    if (gPairCount + 1 >= (size_t) COLOR_PAIRS || gPairCount + 1 >= TUI_PAIR_MAX)
-        return 0;
-    short pair = (short) (gPairCount + 1);
-    init_pair(pair, colorIndex(fg), colorIndex(bg));
-    gPairs[gPairCount].fg = fg;
-    gPairs[gPairCount].bg = bg;
-    gPairs[gPairCount].pair = pair;
-    ++gPairCount;
-    return pair;
+// The bytes one frame is built in. A full 400x200 repaint of wide text is far
+// smaller than this, but a pathological frame may outgrow it: the buffer then
+// flushes INSIDE the synchronized-output bracket, which still publishes the frame
+// as one update, so the bound never changes what the device sees - only how many
+// write calls it takes.
+#define TUI_OUT_CAPACITY 262144u
+#define TUI_PEN_CAPACITY 64u
+
+static char gOut[TUI_OUT_CAPACITY];
+static size_t gOutLength;
+static bool gOutFailed;
+static size_t gCursorColumn = (size_t) -1;   // (size_t) -1 = the device cursor is unknown
+static size_t gCursorRow = (size_t) -1;
+static char gPen[TUI_PEN_CAPACITY];
+static size_t gPenLength;
+static bool gPenValid;
+static bool gDeviceColour;
+static size_t gPresentWidth;
+// A resize blanked the device outside the surface's knowledge, so the next present
+// must repaint every cell - even when the clamped geometry did not change (a
+// terminal growing past TUI_MAX_W is the case that would otherwise leave a blank
+// screen behind a diff that believes it is already there).
+static bool gRepaintAll;
+
+static void presenterFlush(void) {
+    if (gOutLength == 0u)
+        return;
+    if (!writeAll(STDOUT_FILENO, gOut, gOutLength))
+        gOutFailed = true;
+    gOutLength = 0u;
 }
 
-static attr_t attrsFor(uint16_t style) {
-    attr_t attrs = A_NORMAL;
-    if (style & TERMINAL_STYLE_BOLD)
-        attrs |= A_BOLD;
-    if (style & TERMINAL_STYLE_DIM || style & TERMINAL_STYLE_MUTED)
-        attrs |= A_DIM;
-    if (style & TERMINAL_STYLE_UNDERLINE)
-        attrs |= A_UNDERLINE;
-    if (style & TERMINAL_STYLE_ITALIC)
-        attrs |= A_ITALIC;
-    if (style & TERMINAL_STYLE_REVERSE)
-        attrs |= A_REVERSE;
-    return attrs;
+// Append without ever growing past the static buffer: a full buffer is written out
+// in place, so the frame costs a bounded amount of memory and no allocation at all.
+static void presenterAppend(const char *bytes, size_t length) {
+    while (length != 0u) {
+        size_t room = sizeof gOut - gOutLength;
+        if (room == 0u) {
+            presenterFlush();
+            room = sizeof gOut;
+        }
+        size_t count = length < room ? length : room;
+        memcpy(gOut + gOutLength, bytes, count);
+        gOutLength += count;
+        bytes += count;
+        length -= count;
+    }
 }
 
+static void presenterText(const char *text) {
+    presenterAppend(text, strlen(text));
+}
+
+static void presenterByte(char byte) {
+    presenterAppend(&byte, 1u);
+}
+
+// One colour parameter, prefixed with the separator it needs: `;38;5;N` for the
+// 256-cell cube, `;3N`/`;4N` for a basic eight-colour device. An unset colour is
+// written as nothing, so the reset at the front of the pen leaves the device's own
+// default in place.
+static size_t penColour(char *params, size_t capacity, size_t at, bool foreground,
+                        uint32_t colour) {
+    if (!gDeviceColour || !TERMINAL_COLOR_IS_SET(colour))
+        return at;
+    short index = colorIndex(colour);
+    if (index < 0)
+        return at;
+    int written;
+    if (COLORS >= 256)
+        written = snprintf(params + at, capacity - at, ";%d8;5;%d",
+                           foreground ? 3 : 4, (int) index);
+    else
+        written = snprintf(params + at, capacity - at, ";%d",
+                           (int) (foreground ? 30 : 40) + index);
+    if (written <= 0 || (size_t) written >= capacity - at)
+        return at;
+    return at + (size_t) written;
+}
+
+// A cell's pen as SGR parameters: `0` first, so no previous cell's weight,
+// decoration or colour survives into this one, then only what this cell sets.
+static size_t penParams(char *params, size_t capacity, uint16_t style, uint32_t fg,
+                        uint32_t bg) {
+    int written = snprintf(params, capacity, "0%s%s%s%s%s",
+                           (style & TERMINAL_STYLE_BOLD) ? ";1" : "",
+                           (style & (TERMINAL_STYLE_DIM | TERMINAL_STYLE_MUTED)) ? ";2" : "",
+                           (style & TERMINAL_STYLE_ITALIC) ? ";3" : "",
+                           (style & TERMINAL_STYLE_UNDERLINE) ? ";4" : "",
+                           (style & TERMINAL_STYLE_REVERSE) ? ";7" : "");
+    if (written <= 0)
+        return 0u;
+    size_t at = (size_t) written < capacity ? (size_t) written : capacity;
+    at = penColour(params, capacity, at, true, fg);
+    at = penColour(params, capacity, at, false, bg);
+    return at;
+}
+
+// A pen is emitted only when it differs from the one already on the device: a run
+// shares one pen most of the time, and a row of source text usually costs one SGR.
+static void presenterPen(uint16_t style, uint32_t fg, uint32_t bg) {
+    char params[TUI_PEN_CAPACITY];
+    size_t length = penParams(params, sizeof params, style, fg, bg);
+    if (gPenValid && length == gPenLength && memcmp(gPen, params, length) == 0)
+        return;
+    memcpy(gPen, params, length);
+    gPenLength = length;
+    gPenValid = true;
+    presenterText("\033[");
+    presenterAppend(params, length);
+    presenterByte('m');
+}
+
+// Absolute cursor addressing, and only when the cursor is not already there. A
+// repaint moves once per row; a one-cell hover costs one move inside the row.
+static void presenterMove(size_t column, size_t row) {
+    if (gCursorColumn == column && gCursorRow == row)
+        return;
+    char sequence[32];
+    int written = snprintf(sequence, sizeof sequence, "\033[%zu;%zuH", row + 1u, column + 1u);
+    if (written > 0)
+        presenterAppend(sequence, (size_t) written);
+    gCursorColumn = column;
+    gCursorRow = row;
+}
+
+static size_t utf8Encode(uint32_t glyph, char *bytes) {
+    if (glyph < 0x80u) {
+        bytes[0] = (char) glyph;
+        return 1u;
+    }
+    if (glyph < 0x800u) {
+        bytes[0] = (char) (0xC0u | (glyph >> 6));
+        bytes[1] = (char) (0x80u | (glyph & 0x3Fu));
+        return 2u;
+    }
+    if (glyph < 0x10000u) {
+        bytes[0] = (char) (0xE0u | (glyph >> 12));
+        bytes[1] = (char) (0x80u | ((glyph >> 6) & 0x3Fu));
+        bytes[2] = (char) (0x80u | (glyph & 0x3Fu));
+        return 3u;
+    }
+    bytes[0] = (char) (0xF0u | (glyph >> 18));
+    bytes[1] = (char) (0x80u | ((glyph >> 12) & 0x3Fu));
+    bytes[2] = (char) (0x80u | ((glyph >> 6) & 0x3Fu));
+    bytes[3] = (char) (0x80u | (glyph & 0x3Fu));
+    return 4u;
+}
+
+// The frame sink. A run is same-row cells; each cell is addressed absolutely, so a
+// wide glyph can never be split by a diff boundary and no cell depends on where the
+// previous one left the cursor.
 static bool blitRun(void *context, TerminalRun run) {
     (void) context;
-    bool haveAttrs = false;
-    attr_t currentAttrs = A_NORMAL;
-    short currentPair = 0;
     for (size_t i = 0; i < run.length; ++i) {
         uint32_t glyph = run.cells != nullptr ? run.cells[i] : ' ';
-        if (glyph == 0)
-            continue;                                  // wide glyph continuation
-        uint16_t style = run.styles != nullptr ? run.styles[i] : 0;
+        if (glyph == 0u) {
+            // The second cell of a wide glyph. Its first cell advanced the device two
+            // columns, so the track is right only when it already points past this
+            // cell; otherwise the first half was painted by an earlier run (or not at
+            // all) and where the device sits cannot be read from a continuation.
+            if (gCursorRow != run.y || gCursorColumn != run.x + i + 1u)
+                gCursorColumn = (size_t) -1;
+            continue;
+        }
+        if (glyph > 0x10FFFFu || (glyph >= 0xD800u && glyph <= 0xDFFFu))
+            glyph = '?';
+        uint16_t style = run.styles != nullptr ? run.styles[i] : 0u;
         uint32_t fg = run.fg != nullptr ? run.fg[i] : TERMINAL_COLOR_DEFAULT;
         uint32_t bg = run.bg != nullptr ? run.bg[i] : TERMINAL_COLOR_DEFAULT;
-        attr_t attrs = attrsFor(style);
         // Resolve the cell against the device before mapping it, because SGR sets ONE
         // colour and a fade has to be composed by US. The background plane goes over
         // the device background; the ink then goes over THAT.
@@ -4817,34 +4963,79 @@ static bool blitRun(void *context, TerminalRun run) {
         uint32_t cellFg = TERMINAL_COLOR_IS_SET(fg)
                               ? TerminalColor_over(fg, backdrop)
                               : TERMINAL_COLOR_DEFAULT;
-        short pair = pairFor(cellFg, cellBg);
-        // A run usually shares one pen, so set the attributes once and only touch
-        // them again at a boundary: one wattr_set per cell is pure overhead.
-        if (!haveAttrs || attrs != currentAttrs || pair != currentPair) {
-            wattr_set(stdscr, attrs, pair, nullptr);
-            currentAttrs = attrs;
-            currentPair = pair;
-            haveAttrs = true;
+        size_t column = run.x + i;
+        size_t width = TerminalCanvas_widthOf(glyph);
+        if (width == 0u)
+            width = 1u;
+        if (gPresentWidth != 0u && column + width > gPresentWidth) {
+            // A wide glyph with no room for its second cell is clipped to a blank
+            // rather than allowed to wrap the last column onto the next row.
+            glyph = ' ';
+            width = 1u;
         }
-        if (glyph > (uint32_t) WCHAR_MAX || (glyph >= 0xD800u && glyph <= 0xDFFFu))
-            glyph = '?';
-        wchar_t characters[CCHARW_MAX] = { (wchar_t) glyph, L'\0' };
-        cchar_t cell;
-        bool validCell = setcchar(&cell, characters, attrs, pair, nullptr) != ERR;
-        if (!validCell) {
-            characters[0] = L'?';
-            validCell = setcchar(&cell, characters, attrs, pair, nullptr) != ERR;
-        }
-        // ncurses reports ERR after drawing the terminal's bottom-right cell because
-        // advancing beyond that cell is impossible. The canvas run is still delivered.
-        int result = validCell
-                   ? mvwadd_wch(stdscr, (int) run.y, (int) (run.x + i), &cell)
-                   : ERR;
-        if (result == ERR && (glyph == 0x2304u || glyph == 0x203Au))
-            (void) mvwaddch(stdscr, (int) run.y, (int) (run.x + i),
-                            glyph == 0x2304u ? 'v' : '>');
+        presenterMove(column, run.y);
+        presenterPen(style, cellFg, cellBg);
+        char bytes[4];
+        size_t length = utf8Encode(glyph, bytes);
+        presenterAppend(bytes, length);
+        gCursorColumn = column + width;
+        gCursorRow = run.y;
     }
-    return true;
+    return !gOutFailed;
+}
+
+// Forget the device cursor and pen. Called whenever something outside a run moved
+// them - a clear, a resize, the first paint - never in the middle of one.
+static void presenterForget(void) {
+    gCursorColumn = (size_t) -1;
+    gCursorRow = (size_t) -1;
+    gPenLength = 0u;
+    gPenValid = false;
+}
+
+// Declare that the device holds nothing this grid describes: a value no canvas can
+// produce makes every cell differ, so the next present repaints the whole screen.
+// Used on the first bind, and again after a resize blanked the device behind the
+// surface's back.
+static void presenterInvalidateFront(void) {
+    for (size_t i = 0; i < TUI_MAX_W * TUI_MAX_H; ++i) {
+        gFrontCells[i] = 0xFFFFFFFFu;
+        gFrontStyles[i] = 0xFFFFu;
+        gFrontFg[i] = 0xFFFFFFFFu;
+        gFrontBg[i] = 0xFFFFFFFFu;
+    }
+}
+
+// The cold device transaction: take the alternate screen, stop the device from
+// wrapping the last column onto the next row, hide the cursor and start from a
+// blank grid. The host returns the screen, autowrap and the cursor on exit.
+static void presenterEnter(void) {
+    gDeviceColour = has_colors();
+    gOutLength = 0u;
+    gOutFailed = false;
+    presenterForget();
+    // `CSI r` releases any scroll region the terminal was left with (ncurses sets one
+    // at init): the host addresses every cell absolutely, so a margin can only turn a
+    // future scroll into a wrong one.
+    presenterText("\033[?1049h\033[?7l\033[?25l\033[H\033[2J\033[r");
+    presenterFlush();
+}
+
+static void presenterLeave(void) {
+    presenterText("\033[?7h\033[?25h\033[?1049l");
+    presenterFlush();
+    presenterForget();
+    (void) fflush(stdout);
+}
+
+// A blank screen with one line of plain text, outside any frame. Only the
+// too-small refusal uses it: there is no scene to compose at one cell wide.
+static void presenterMessage(const char *text) {
+    presenterForget();
+    presenterText("\033[H\033[2J");
+    presenterPen(TERMINAL_STYLE_NONE, TERMINAL_COLOR_DEFAULT, TERMINAL_COLOR_DEFAULT);
+    presenterText(text);
+    presenterFlush();
 }
 
 // Row 0 is the chrome (title, undo/redo and the tab strip together); the warning header,
@@ -5288,19 +5479,23 @@ static bool isMouseContinuation(const TerminalInput *input, int key) {
 // transaction: a divider drag or a resize repaints a great many cells, and without this
 // the device is free to show the middle of that work. Terminals that do not know the
 // mode ignore it, so this needs no probe and no capability gate.
+//
+// The whole frame is ONE write: the opening bracket, every changed run, and the
+// closing bracket sit in the same buffer, so the close can never arrive ahead of the
+// content it is supposed to bracket. The buffer is flushed even when a sink refused
+// part-way, because a device left inside a half-finished transaction is a device
+// left frozen.
 static void frameBracket(void *frameContext, TerminalPresentPhase phase) {
     (void) frameContext;
     if (phase == TERMINAL_PRESENT_BEGIN) {
-        (void) fputs("\033[?2026h", stdout);
+        // Anything ncurses itself still has buffered (the keypad-mode string is the
+        // one example) belongs to the device before our cells do.
         (void) fflush(stdout);
+        presenterText("\033[?2026h");
         return;
     }
-    // The cells are still sitting in ncurses' buffer, so they must be flushed BEFORE
-    // the transaction closes - otherwise the close arrives ahead of the content it is
-    // supposed to bracket, and the bracket means nothing.
-    (void) refresh();
-    (void) fputs("\033[?2026l", stdout);
-    (void) fflush(stdout);
+    presenterText("\033[?2026l");
+    presenterFlush();
 }
 
 static bool mouseReporting(bool enabled) {
@@ -5551,6 +5746,14 @@ static int runTerminal(FileText *file) {
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
     (void) mouseReporting(true);
+    // The device transaction is the host's from here on: the alternate screen,
+    // autowrap off, the cursor hidden and a blank grid. ncurses keeps the keyboard
+    // and the termios mode; it never sees a cell again.
+    presenterEnter();
+    // The size is read from the tty every pass, so ncurses has no reason to resize
+    // its own (never painted) window on a signal - and resizing it would mark it
+    // touched, which is the one situation where getch would paint a screen we own.
+    (void) signal(SIGWINCH, SIG_IGN);
 
     int height = 0;
     int width = 0;
@@ -5601,24 +5804,23 @@ static int runTerminal(FileText *file) {
                 break;
             }
         }
-        // ncurses caches the screen size and only refreshes it on resizeterm - and
-        // resizeterm(0, 0) is not accepted, while KEY_RESIZE is not guaranteed to
-        // arrive at all. So the size is read from the tty directly. It is applied
-        // ONLY when it actually changed: calling resizeterm unconditionally dirties
-        // the screen every pass and ncurses repaints forever, which is a busy loop
-        // disguised as housekeeping.
+        // The size is read from the tty directly. It is applied ONLY when it actually
+        // changed, and a resize is the host's own transaction: blank the device, forget
+        // where its cursor is, and let the geometry change below rebind the surface
+        // against a mirror that differs everywhere, so the whole grid is repainted.
         struct winsize terminalSize;
         if (ioctl(STDIN_FILENO, TIOCGWINSZ, &terminalSize) == 0 && terminalSize.ws_row > 0
             && terminalSize.ws_col > 0
             && ((int) terminalSize.ws_row != knownRows || (int) terminalSize.ws_col != knownColumns)) {
             knownRows = (int) terminalSize.ws_row;
             knownColumns = (int) terminalSize.ws_col;
-            (void) resizeterm(knownRows, knownColumns);
-            (void) clear();
+            gRepaintAll = true;
+            presenterForget();
+            presenterText("\033[H\033[2J\033[r");
+            presenterFlush();
         }
-        int rows = 0;
-        int columns = 0;
-        getmaxyx(stdscr, rows, columns);
+        int rows = knownRows;
+        int columns = knownColumns;
         if (columns > TUI_MAX_W)
             columns = TUI_MAX_W;
         if (rows > TUI_MAX_H)
@@ -5641,9 +5843,7 @@ static int runTerminal(FileText *file) {
         size_t maxLeft = maxScrollLeft(file, codeColumns(scene.railWidth, scene.numberWidth, width));
         TerminalScrollGlide_clamp(&glide, maxTop, maxLeft);
         if (visible == 0 || codeRight <= codeLeft) {
-            erase();
-            mvaddstr(0, 0, "terminal too small");
-            refresh();
+            presenterMessage("terminal too small");
             timeout(TUI_POLL_MS);
             (void) getch();
             continue;
@@ -5801,6 +6001,10 @@ static int runTerminal(FileText *file) {
                         (void) TerminalMarkdownView_scrollBy(scene.markdown, step.rows);
                         sceneMarkdownClearFeedback(&scene);
                     }
+                    if (step.columns != 0) {
+                        (void) TerminalMarkdownView_scrollXBy(scene.markdown, step.columns);
+                        sceneMarkdownClearFeedback(&scene);
+                    }
                 } else if (key == KEY_PPAGE || key == KEY_NPAGE) {
                     TerminalScrollGlide_impulse(&glide, step.rows, step.columns, maxTop, maxLeft);
                 } else if (!gRunSelected && !scene.preview && editorKey(file, key)) {
@@ -5847,7 +6051,12 @@ static int runTerminal(FileText *file) {
                             break;
                         }
                         if (scene.preview && event.x >= codeLeft) {
-                            (void) TerminalMarkdownView_scrollBy(scene.markdown, down ? 1 : -1);
+                            if (event.shift || event.meta || event.ctrl) {
+                                (void) TerminalMarkdownView_scrollXBy(scene.markdown,
+                                    down ? (long) TUI_SCROLL_COLS : -(long) TUI_SCROLL_COLS);
+                            } else {
+                                (void) TerminalMarkdownView_scrollBy(scene.markdown, down ? 1 : -1);
+                            }
                             sceneMarkdownClearFeedback(&scene);
                             break;
                         }
@@ -5885,6 +6094,12 @@ static int runTerminal(FileText *file) {
                         }
                         if (gRunSelected)
                             break;
+                        if (scene.preview && event.x >= codeLeft) {
+                            (void) TerminalMarkdownView_scrollXBy(scene.markdown,
+                                right ? (long) TUI_SCROLL_COLS : -(long) TUI_SCROLL_COLS);
+                            sceneMarkdownClearFeedback(&scene);
+                            break;
+                        }
                         TerminalScrollGlide_impulse(&glide, 0, right ? (long) TUI_SCROLL_COLS
                                                      : -(long) TUI_SCROLL_COLS, maxTop, maxLeft);
                         break;
@@ -6127,15 +6342,21 @@ static int runTerminal(FileText *file) {
         TerminalCanvas front = TerminalCanvas(gFrontCells, gFrontStyles, gFrontFg, gFrontBg,
                                              (size_t) width, (size_t) height);
         TerminalCanvas_fill(&back, ' ', TerminalPen());
-        if (!TerminalSurface_isBound(&surface)
+        bool needsBind = !TerminalSurface_isBound(&surface)
             || TerminalSurface_getBack(&surface).gridWidth != (size_t) width
-            || TerminalSurface_getBack(&surface).gridHeight != (size_t) height) {
-            TerminalCanvas_fill(&front, ' ', TerminalPen());
-            if (!TerminalSurface_bind(&surface, &back, &front, blitRun, nullptr)) {
-                ok = false;
-                break;
-            }
+            || TerminalSurface_getBack(&surface).gridHeight != (size_t) height;
+        if (needsBind || gRepaintAll) {
+            // A mirror that differs from every cell there is: the device behind it is
+            // brand new or was just cleared, so nothing it holds is still described by
+            // an old front grid.
+            presenterInvalidateFront();
+            gRepaintAll = false;
         }
+        if (needsBind && !TerminalSurface_bind(&surface, &back, &front, blitRun, nullptr)) {
+            ok = false;
+            break;
+        }
+        gPresentWidth = (size_t) width;
         // Cover a fraction of what is left. The position is a whole number of cells, so
         // the fractional glide is rounded at the moment it is drawn.
         // A newly opened file starts at its top-left, and the glide is dropped with it:
@@ -6184,14 +6405,12 @@ static int runTerminal(FileText *file) {
                          interaction.pointerX, interaction.pointerY);
         paintRailSplitter(&scene, &back,
                           interaction.dividerHovered || interaction.grabbing);
+        // The surface diffs this grid against the last one it handed over and writes
+        // only what changed, so a frame that types, hovers or ticks the clock costs a
+        // few runs and an idle frame costs nothing at all.
         TerminalPresentResult presented = TerminalSurface_present(&surface);
         if (!presented.ok)
             ok = false;
-        // A changed frame was already flushed inside the transaction by the bracket.
-        // A frame that changed nothing produced no transaction at all, so ncurses may
-        // still be holding a resize's clear() - one flush here covers that case.
-        if (ok && !presented.transactional)
-            ok = refresh() != ERR;
         if (!ok)
             break;
     }
@@ -6201,6 +6420,9 @@ static int runTerminal(FileText *file) {
     cacheSave();
     gScene = nullptr;
     gOpenFile = nullptr;
+    // Hand the device back in the order it was taken: autowrap, cursor, alternate
+    // screen. endwin still restores termios and the terminal modes around this.
+    presenterLeave();
     (void) curs_set(1);
     (void) endwin();
     (void) delscreen(screen);
