@@ -27,7 +27,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-WORKSPACE = ROOT.parents[2]
+WORKSPACE = ROOT.parents[1]
 
 
 def run(argv, timeout=180):
@@ -64,7 +64,7 @@ def sources(determinant, vexspoke, engine, language):
     produced += sorted(determinant.glob("events/*.c"))
     produced += sorted(determinant.glob("format/*.c"))
     produced += [vexspoke / "primitive/string.c", vexspoke / "atomic/spin.c",
-                  engine / "nio/mem.c"]
+                 vexspoke / "system/browser.c", engine / "nio/mem.c"]
     # The real system clipboard is an R2 engine seam: NSPasteboard on macOS, the
     # in-process stub elsewhere. A preview never reaches the pasteboard itself.
     produced += [engine / ("io/clipboard_mac.m" if sys.platform == "darwin"
@@ -77,20 +77,28 @@ def sources(determinant, vexspoke, engine, language):
     return produced
 
 
-def build(output, compiler=None):
+def build(output, compiler=None, entry=None, extra_sources=None):
     if compiler is None:
         compiler = os.environ.get("CC", "clang")
     determinant = Path(os.environ.get("SEMICOLON_DETERMINANT_SOURCE_DIR",
-                                      WORKSPACE / "suite/ecosystem/determinant/src"))
+                                      WORKSPACE / "vexgraph-ecosystem/determinant/src"))
     vexspoke = Path(os.environ.get("SEMICOLON_VEXSPOKE_SOURCE_DIR",
-                                   WORKSPACE / "suite/ecosystem/vexspoke/src"))
+                                   WORKSPACE / "vexgraph-ecosystem/vexspoke/src"))
     engine = Path(os.environ.get("SEMICOLON_ENGINE_SOURCE_DIR",
-                                  WORKSPACE / "suite/ecosystem/relational-engine/src"))
+                                  WORKSPACE / "vexgraph-ecosystem/relational-engine/src"))
     language = Path(os.environ.get("SEMICOLON_LANGUAGE_SOURCE_DIR",
-                                    WORKSPACE / "suite/ecosystem/language"))
-    entry = ROOT / "src/main/tui-main.c"
+                                    WORKSPACE / "vexgraph-ecosystem/language"))
+    # R0 owns the canonical platform identity header; every tier reaches it
+    # downward (the One File, All Platforms Law, home-is-the-floor clause).
+    lifetime = Path(os.environ.get("SEMICOLON_LIFETIME_SOURCE_DIR",
+                                    WORKSPACE / "vexgraph-ecosystem/lifetime/src"))
+    entry = Path(entry) if entry is not None else ROOT / "src/main/tui-main.c"
     if not entry.is_file():
         raise ValueError(f"missing entry point: {entry}")
+    extra_sources = [Path(source) for source in (extra_sources or [])]
+    for source in extra_sources:
+        if not source.is_file():
+            raise ValueError(f"missing additional source: {source}")
     compiler_cmd = shlex.split(compiler) if isinstance(compiler, str) else list(compiler)
     flags = [c23_std_flag(compiler), "-Wall", "-Wextra", "-Werror", "-O2"]
     curses_libraries = ["-lncurses"]
@@ -120,7 +128,9 @@ def build(output, compiler=None):
         artifact = Path(temp) / ("semicolon-tui.exe" if sys.platform == "win32" else "semicolon-tui")
         argv = [*compiler_cmd, *flags, "-I", str(ROOT), "-I", str(ROOT / "src"),
                 "-I", str(determinant), "-I", str(vexspoke), "-I", str(engine), "-I", str(language),
-                str(entry), *(str(source) for source in sources(determinant, vexspoke, engine, language)),
+                "-I", str(lifetime),
+                str(entry), *(str(source) for source in extra_sources),
+                *(str(source) for source in sources(determinant, vexspoke, engine, language)),
                 *curses_libraries, *platform_libraries, "-lm", "-o", str(artifact)]
         result = run(argv)
         if result.returncode:
@@ -133,9 +143,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / ".build/semicolon-tui")
     parser.add_argument("--compiler", default="clang")
+    parser.add_argument("--entry", type=Path, help="alternate application entry source")
+    parser.add_argument("--source", action="append", default=[],
+                        help="additional application source; may be repeated")
     args = parser.parse_args()
     try:
-        print(build(args.output, args.compiler))
+        print(build(args.output, args.compiler, args.entry, args.source))
     except (OSError, ValueError) as error:
         print(f"[vex] semicolon build: {error}", file=sys.stderr)
         raise SystemExit(1)
