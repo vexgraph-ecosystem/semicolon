@@ -20,6 +20,7 @@
 #include "annotation/overview.h"
 #include "annotation/test.h"
 #include "annotation/debug.h"
+#include "platform/platform.h"
 #include <locale.h>
 #include <limits.h>
 #include <wchar.h>
@@ -394,7 +395,7 @@ extern char **environ;
 #define TUI_RAIL_TEXT 96
 // Where a project's session lives, relative to the home directory. Machine-scoped and
 // outside the project on purpose: browsing a checkout must never write into it.
-#if defined(__APPLE__)
+#if defined(VEX_PLATFORM_APPLE)
 #define TUI_STATE_DIR "Library/Application Support/vexgraph/semicolon"
 #else
 #define TUI_STATE_DIR ".local/state/vexgraph/semicolon"
@@ -1216,7 +1217,7 @@ static bool runStart(const char *path, const FileText *file) {
         error = posix_spawn_file_actions_addclose(&actions, outputPipe[1]);
     if (error == 0)
         error = posix_spawn_file_actions_addclose(&actions, nullInput);
-#if defined(__APPLE__)
+#if defined(VEX_PLATFORM_APPLE)
     if (error == 0)
         error = posix_spawn_file_actions_addchdir_np(&actions, gRailRoot);
 #endif
@@ -2218,7 +2219,7 @@ static bool writeAll(int descriptor, const char *bytes, size_t length) {
 }
 
 static struct timespec statModified(const struct stat *info) {
-#if defined(__APPLE__)
+#if defined(VEX_PLATFORM_APPLE)
     return (*info).st_mtimespec;
 #else
     return (*info).st_mtim;
