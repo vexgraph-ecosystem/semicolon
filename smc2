@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+launcher=$0
+if [ "${launcher#*/}" = "$launcher" ]; then
+    launcher=$(command -v "$launcher") || exit 1
+fi
+while [ -L "$launcher" ]; do
+    target=$(readlink "$launcher") || exit 1
+    case "$target" in
+        /*) launcher=$target ;;
+        *) launcher=$(dirname -- "$launcher")/$target ;;
+    esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd) || exit 1
+binary=$root/.build/semicolon-tui-v2
+entry=$root/src/main/tui-v2.c
+determinant=${SEMICOLON_DETERMINANT_SOURCE_DIR:-$root/../../ecosystem/determinant/src}
+vexspoke=${SEMICOLON_VEXSPOKE_SOURCE_DIR:-$root/../../ecosystem/vexspoke/src}
+engine=${SEMICOLON_ENGINE_SOURCE_DIR:-$root/../../ecosystem/relational-engine/src}
+language=${SEMICOLON_LANGUAGE_SOURCE_DIR:-$root/../../ecosystem/language}
+rebuild=false
+if [ ! -x "$binary" ] || [ "$root/build.py" -nt "$binary" ] || [ "$entry" -nt "$binary" ]; then
+    rebuild=true
+elif find "$root/src/tui/v2" -type f \( -name '*.c' -o -name '*.h' \) \
+        -newer "$binary" -print -quit | grep -q .; then
+    rebuild=true
+elif find "$determinant" "$vexspoke" "$engine" "$language" -type f \
+        \( -name '*.c' -o -name '*.h' \) -newer "$binary" -print -quit | grep -q .; then
+    rebuild=true
+fi
+if [ "$rebuild" = true ]; then
+    printf '%s\n' 'smc2: building the isolated v2 layout preview...' >&2
+    python3 "$root/build.py" --entry "$entry" \
+        --source "$root/src/tui/v2/filetree.c" \
+        --source "$root/src/tui/v2/codecanvas.c" \
+        --source "$root/src/tui/v2/bottompart.c" \
+        --source "$root/src/tui/v2/mainpanel.c" \
+        --output "$binary" >&2 || exit 1
+fi
+exec "$binary" "$@"

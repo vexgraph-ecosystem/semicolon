@@ -10,7 +10,7 @@ The intended product has both a terminal UI (TUI) and a graphical UI (GUI).
 ## Current State
 
 Semicolon is an early R6 draft, not a finished IDE. Its runnable piece today is
-a terminal shell launched with `./semicolon`. It opens a project directory,
+a terminal shell launched with `semicolon`. It opens a project directory,
 shows its files, and can display a selected file in an editor. Open files have
 switchable tabs; tabs close with their Nerd-font X or middle-click, and clicking
 the source view places the caret. Markdown files
@@ -44,7 +44,7 @@ ligature features; Semicolon sets neither. `python3 tests/semicolon/editor/run.p
 owns strict C23, ASan/UBSan, injected allocation-failure recovery and
 editor-cell/PTY proof; appearance remains yours.
 
-The tree shows `.gitignore`, `.gitkeep`, and the `.github` directory while
+The tree shows `../../.gitignore`, `.gitkeep`, and the `.github` directory while
 keeping other dot entries such as `.idea` and `.vscode` hidden. It reads the
 project-root `.gitignore` as text and colors matching visible tree entries orange;
 this is independent of Git status and refreshes when the ignore file changes.
@@ -80,7 +80,7 @@ mouse target at the same position, so it does not cover list text or selection.
 
 The code view shows Run only for supported file formats; `.c` and `.m` files
 must contain a text-detected `main` definition. C files under this checkout's
-`tests/` tree route to its `tools/b run <absolute-source>` graph (registered
+`../../tests` tree route to its `tools/b run <absolute-source>` graph (registered
 targets or that graph's on-demand source resolution), not the standalone
 single-file compiler. External C/Objective-C files still use standalone
 `b run exec`; supported scripts/source extensions use standalone `b run instance`.
@@ -154,7 +154,7 @@ Semicolon is also the **dogfooding shell** for this workspace: open real vexgrap
 source with `smc`, edit it, and invoke supported Run targets without pretending
 that one source file knows its own include paths or link dependencies. `b` is
 the standalone **orchestration layer**, not an R tier: the workspace's
-`tools/b` runs its `tools/workspace.c` graph over independently owned libraries,
+`../../tools/b` runs its `tools/workspace.c` graph over independently owned libraries,
 tests and applications. For C files under the workspace `tests/` tree, Semicolon
 passes the absolute source to that graph; elsewhere it uses the generic
 standalone `b` route. It does not embed either builder or synthesize a JSON
@@ -171,13 +171,13 @@ What crosses the levels *today* is narrower than the final R6 design:
 | Primeagen (R5) | Independent standalone application. | Optional registered workflow; no reverse dependency. |
 | Semicolon (R6) | File browser/editor, separate bounded run console and user-triggered `b` child invocation. | Full superapp composition and GUI. |
 
-The [workspace README](../../../README.md) documents the build graph and its
+The [workspace README](../../README.md) documents the build graph and its
 proof boundary. Browsing a repo, seeing `b` output, or receiving `exit 0`
 does not prove a windowed app's behavior or a working Language integration.
 
 ## Running
 
-Run `./semicolon` from a project directory to open that project, or pass
+Run `semicolon` from a project directory to open that project, or pass
 `--root PATH` to select one explicitly. `--file PATH` opens a particular file;
 `--dump WxH` prints a frame for non-interactive inspection. The launcher builds
 the terminal shell on first use. It does not download dependencies or run the
@@ -188,6 +188,11 @@ links both `smc` and `semicolon` to the same launcher in `~/.local/bin`; run
 `smc` from any project directory if that bin directory is on `PATH`. Pass a bin
 directory to the installer to choose another location. It never overwrites an
 unrelated command, edits shell configuration, builds, or launches the UI.
+
+Run `smc2` from this checkout to build and view the isolated v2 layout preview.
+It uses separate FileTree, CodeCanvas, BottomPart and MainPanel modules composed
+with Determinant panels and anchors. The existing `smc` command continues to
+launch the current shell until the v2 preview is accepted and explicitly promoted.
 
 ## Layout
 
@@ -205,7 +210,7 @@ unrelated command, edits shell configuration, builds, or launches the UI.
 - `src/tui/tui_example.txt` — the hand-made terminal design and its notes.
 - `semicolon`, `build.py`, `install-command.sh` — launcher, explicit build, and
   optional per-user `semicolon`/`smc` command links.
-- Shared tests are in `../../../tests/semicolon/`.
+- Shared tests are in `../../tests/semicolon`.
 
 ## Scope and Limitations
 
@@ -217,7 +222,7 @@ coloring is the documented C23 lexical subset, not full semantic highlighting.
 Whole-document refresh is synchronous cold work, not incremental analysis or a
 large-project latency guarantee; malformed/unsupported lexical spans remain plain.
 Standalone builds may set `SEMICOLON_LANGUAGE_SOURCE_DIR` to the Language repository
-root (the directory containing `adapters/`, not a nonexistent `src/`). The launcher
+root (the directory containing `adapters/`, not a nonexistent `src`). The launcher
 watches that dependency's sources and headers for rebuilding, with no downloads.
 General build integration beyond the workspace C-test route,
 broader language services, agent workflows, and

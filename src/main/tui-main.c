@@ -3811,7 +3811,7 @@ static void paintRailColors(Scene *scene, TerminalCanvas *canvas,
             size_t nameX = iconX + 2u;
             nameX = nameX > gRailColumn ? nameX - gRailColumn : 0u;
             for (size_t x = nameX; x < railEnd; ++x)
-                gFg[y * width + x] = TERMINAL_RGB(0xFF, 0x9A, 0x32);
+                gFg[y * width + x] = TERMINAL_RGB(0xFF, 0xB8, 0x6C);
         }
     }
     // The tab strip is a literal row with bracketed labels; only private-use icon
